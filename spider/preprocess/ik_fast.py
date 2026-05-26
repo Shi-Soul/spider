@@ -308,6 +308,36 @@ def main(
                 mink.SE3(wxyz_xyz=np.array([1.0, 0.0, 0.0, 0.0, *pos]))
             )
 
+    # -- Phase 0: Warm-start the floating-base 6-DOF to the wrist target pose
+    # so the IK optimizer doesn't get stuck in a far-away local minimum (this
+    # matters for hands like sharpa where the default mesh orientation is
+    # 180° away from the MANO wrist convention). Each side's base joint
+    # group is named ``{side}_pos_{x,y,z}`` and ``{side}_rot_{x,y,z}``.
+    from scipy.spatial.transform import Rotation as _ScipyR
+    for side in ([s.split("_")[0] for s in wrist_sites]):
+        target_pos = qpos_ref[0, ref_idx[f"{side}_palm"], :3]
+        target_quat_wxyz = qpos_ref[0, ref_idx[f"{side}_palm"], 3:]
+        target_quat_xyzw = np.concatenate([target_quat_wxyz[1:], target_quat_wxyz[:1]])
+        target_euler = _ScipyR.from_quat(target_quat_xyzw).as_euler("xyz")
+        for axis, val in zip(("x", "y", "z"), target_pos):
+            j_name = f"{side}_pos_{axis}"
+            try:
+                jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, j_name)
+                if jid >= 0:
+                    data.qpos[model.jnt_qposadr[jid]] = float(val)
+            except Exception:
+                pass
+        for axis, val in zip(("x", "y", "z"), target_euler):
+            j_name = f"{side}_rot_{axis}"
+            try:
+                jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, j_name)
+                if jid >= 0:
+                    data.qpos[model.jnt_qposadr[jid]] = float(val)
+            except Exception:
+                pass
+    configuration.update(data.qpos)
+    posture_task.set_target(configuration.q.copy())
+
     # -- Phase 1: Initialize wrist (frame 0) --
     loguru.logger.info("Phase 1: Initializing wrist position...")
     set_object_qpos(0)
