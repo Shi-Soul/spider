@@ -20,6 +20,7 @@ from scipy.spatial.transform import Rotation as R
 
 from spider import ROOT
 from spider.io import get_all_tasks, get_processed_data_dir
+from spider.postprocess.add_auc import compute_add_auc3
 
 DEFAULT_REF_DT = 0.02
 DEFAULT_SIM_DT = 0.01
@@ -135,21 +136,30 @@ def compute_object_tracking_error(
             qpos_object_right_ref = qpos_ref[:, -14:-7]
             qpos_object_left_ref = qpos_ref[:, -7:]
 
-        pos_object_right_traj = qpos_object_right_traj[:, :3]
-        pos_object_left_traj = qpos_object_left_traj[:, :3]
-        pos_object_right_ref = qpos_object_right_ref[:, :3]
-        pos_object_left_ref = qpos_object_left_ref[:, :3]
+        pos_object_right_traj_raw = qpos_object_right_traj[:, :3]
+        pos_object_left_traj_raw = qpos_object_left_traj[:, :3]
+        pos_object_right_ref_raw = qpos_object_right_ref[:, :3]
+        pos_object_left_ref_raw = qpos_object_left_ref[:, :3]
 
-        pos_object_right_traj = pos_object_right_traj - pos_object_right_traj.mean(
+        # ADD-AUC3 uses raw world-frame positions (no mean-centering).
+        add_auc3_right = compute_add_auc3(
+            pos_object_right_traj_raw, pos_object_right_ref_raw
+        )
+        add_auc3_left = compute_add_auc3(
+            pos_object_left_traj_raw, pos_object_left_ref_raw
+        )
+
+        pos_object_right_traj = (
+            pos_object_right_traj_raw
+            - pos_object_right_traj_raw.mean(axis=0, keepdims=True)
+        )
+        pos_object_left_traj = pos_object_left_traj_raw - pos_object_left_traj_raw.mean(
             axis=0, keepdims=True
         )
-        pos_object_left_traj = pos_object_left_traj - pos_object_left_traj.mean(
+        pos_object_right_ref = pos_object_right_ref_raw - pos_object_right_ref_raw.mean(
             axis=0, keepdims=True
         )
-        pos_object_right_ref = pos_object_right_ref - pos_object_right_ref.mean(
-            axis=0, keepdims=True
-        )
-        pos_object_left_ref = pos_object_left_ref - pos_object_left_ref.mean(
+        pos_object_left_ref = pos_object_left_ref_raw - pos_object_left_ref_raw.mean(
             axis=0, keepdims=True
         )
 
@@ -194,12 +204,15 @@ def compute_object_tracking_error(
         if left_mask:
             obj_pos_err = pos_err_right
             obj_quat_err = quat_err_right
+            add_auc3_mean = add_auc3_right
         elif right_mask:
             obj_pos_err = pos_err_left
             obj_quat_err = quat_err_left
+            add_auc3_mean = add_auc3_left
         else:
             obj_pos_err = (pos_err_right + pos_err_left) / 2
             obj_quat_err = (quat_err_right + quat_err_left) / 2
+            add_auc3_mean = (add_auc3_right + add_auc3_left) / 2
     else:
         if use_act:
             qpos_object_traj = qpos_traj[:, -6:]
@@ -221,10 +234,16 @@ def compute_object_tracking_error(
         obj_pos_err = np.linalg.norm(pos_object_traj - pos_object_ref, axis=1).mean()
         obj_quat_err = np.linalg.norm(quat_sub(quat_traj, quat_ref), axis=1).mean()
 
+        # ADD-AUC3 uses raw world-frame positions (no mean-centering).
+        add_auc3_unimanual = compute_add_auc3(pos_object_traj, pos_object_ref)
+
         pos_err_right = obj_pos_err if embodiment_type == "right" else 0.0
         pos_err_left = obj_pos_err if embodiment_type == "left" else 0.0
         quat_err_right = obj_quat_err if embodiment_type == "right" else 0.0
         quat_err_left = obj_quat_err if embodiment_type == "left" else 0.0
+        add_auc3_right = add_auc3_unimanual if embodiment_type == "right" else 0.0
+        add_auc3_left = add_auc3_unimanual if embodiment_type == "left" else 0.0
+        add_auc3_mean = add_auc3_unimanual
 
     return {
         "obj_pos_err": obj_pos_err,
@@ -233,6 +252,9 @@ def compute_object_tracking_error(
         "pos_err_left": pos_err_left,
         "quat_err_right": quat_err_right,
         "quat_err_left": quat_err_left,
+        "add_auc3_right": add_auc3_right,
+        "add_auc3_left": add_auc3_left,
+        "add_auc3_mean": add_auc3_mean,
     }
 
 
@@ -424,6 +446,9 @@ def main(
             pos_err_left = errors["pos_err_left"]
             quat_err_right = errors["quat_err_right"]
             quat_err_left = errors["quat_err_left"]
+            add_auc3_right = errors["add_auc3_right"]
+            add_auc3_left = errors["add_auc3_left"]
+            add_auc3_mean = errors["add_auc3_mean"]
 
             # compute success
             success = (obj_pos_err <= pos_err_threshold) & (
@@ -448,6 +473,9 @@ def main(
                 "success": success,
                 "pos_err_threshold": pos_err_threshold,
                 "quat_err_threshold": quat_err_threshold,
+                "add_auc3_right": add_auc3_right,
+                "add_auc3_left": add_auc3_left,
+                "add_auc3_mean": add_auc3_mean,
             }
 
             # Convert to single-row dataframe
@@ -495,6 +523,9 @@ def main(
             "success",
             "pos_err_threshold",
             "quat_err_threshold",
+            "add_auc3_right",
+            "add_auc3_left",
+            "add_auc3_mean",
         ]
     ].copy()
 
