@@ -160,6 +160,12 @@ def main(
                 hull_verts = np.vstack([v for v, _ in hulls])
                 v_world = (R_obj @ hull_verts.T).T + obj_pos
                 obj_min_world_z = float(v_world[:, 2].min())
+                # xy of the lowest contact point -- the support cube must sit
+                # under this, not under the object root (which can be 20+ cm
+                # away from the actual contact surface for objects with
+                # off-center geometry like the arctic box).
+                near_floor_mask = v_world[:, 2] < obj_min_world_z + 1e-3
+                low_xy = v_world[near_floor_mask, :2].mean(axis=0)
                 hulls = flatten_base(
                     hulls,
                     R_world_local=R_obj,
@@ -170,8 +176,8 @@ def main(
                 plate_top_z = obj_min_world_z - floor_well_below_offset
                 task_info[f"{hand}_plate_top_world_z"] = float(plate_top_z)
                 task_info[f"{hand}_obj_first_frame_xy"] = [
-                    float(obj_pos[0]),
-                    float(obj_pos[1]),
+                    float(low_xy[0]),
+                    float(low_xy[1]),
                 ]
                 task_info["floor_well_below_offset"] = float(floor_well_below_offset)
                 scene_min_z = task_info.get("scene_lowest_world_z")

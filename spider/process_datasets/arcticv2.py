@@ -97,6 +97,9 @@ def _ensure_mano_assets_layout(mano_assets_root: str) -> str:
         dst = os.path.join(target, f"MANO_{side}.pkl")
         if os.path.exists(dst):
             continue
+        # remove a broken symlink left from a previous run before re-creating
+        if os.path.lexists(dst):
+            os.unlink(dst)
         src = None
         for d in candidates_dirs:
             cand = os.path.join(d, f"MANO_{side}.pkl")
@@ -344,13 +347,20 @@ def main(
     arctic_root = Path(os.path.abspath(os.path.expanduser(str(arctic_root))))
     dataset_dir = os.path.abspath(os.path.expanduser(dataset_dir))
     if mano_assets_root is None:
+        def _has_mano(d: Path) -> bool:
+            return any(
+                (d / sub / f"MANO_{side}.pkl").exists()
+                for side in ("RIGHT", "LEFT")
+                for sub in ("", "mano", "models", "mano/models")
+            )
+
         for c in (
             arctic_root / "unpack" / "body_models",
             arctic_root / "body_models",
             arctic_root / "unpack" / "body_models" / "mano",
             arctic_root / "body_models" / "mano",
         ):
-            if c.exists():
+            if c.exists() and _has_mano(c):
                 mano_assets_root = str(c)
                 break
         else:

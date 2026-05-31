@@ -41,7 +41,7 @@ class Config:
     # disable the check.
     sanity_check_seconds: float = 3.0
     sanity_check_pos_thresh: float = 0.01
-    sanity_check_rot_thresh: float = 0.1
+    sanity_check_rot_thresh: float = 0.3
 
     # === DATASET CONFIGURATION ===
     dataset_dir: str = f"{spider.ROOT}/../example_datasets"

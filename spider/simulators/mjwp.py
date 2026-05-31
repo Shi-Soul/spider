@@ -398,11 +398,16 @@ def _initial_state_sanity_check(
         return
 
     qpos0_np = qpos_ref[0].detach().cpu().numpy().astype(np.float64)
-    qvel0_np = qvel_ref[0].detach().cpu().numpy().astype(np.float64)
     ctrl0_np = ctrl_ref[0].detach().cpu().numpy().astype(np.float64)
 
     mj_data.qpos[:] = qpos0_np.copy()
-    mj_data.qvel[:] = qvel0_np.copy()
+    # Zero qvel: the sanity check tests whether the scene is in static
+    # equilibrium under gravity + contact with controls held. qvel_ref[0]
+    # is a finite-difference of the trajectory and propagates real motion
+    # (e.g., a teapot reference may carry several rad/s of angular velocity
+    # from the trajectory). That motion would integrate to drift even on
+    # a perfectly supported object, masking real failures.
+    mj_data.qvel[:] = 0.0
     mj_data.ctrl[:] = ctrl0_np.copy()
     mj_data.time = 0.0
     mujoco.mj_forward(mj_model, mj_data)
