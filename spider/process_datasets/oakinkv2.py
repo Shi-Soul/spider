@@ -465,6 +465,17 @@ def main(
     task_info["obj_first_frame_lowest_world_z"] = float(obj_verts_world_z_frame0)
     task_info["scene_lowest_world_z"] = scene_min_z
     task_info["object_descends_from_frame0"] = bool(object_descends)
+    task_info["right_obj_first_frame_xy"] = [
+        float(qpos_obj_right[0, 0]),
+        float(qpos_obj_right[0, 1]),
+    ]
+    task_info["left_obj_first_frame_xy"] = [
+        float(qpos_obj_left[0, 0]),
+        float(qpos_obj_left[0, 1]),
+    ]
+    task_info["needs_object_support"] = bool(
+        obj_verts_world_z_frame0 > scene_min_z + 0.02
+    )
     with open(task_info_path, "w") as f:
         json.dump(task_info, f, indent=2)
     loguru.logger.info(

@@ -15,9 +15,16 @@ import os
 
 import coacd
 import loguru
+import numpy as np
 import tyro
+from scipy.spatial.transform import Rotation as _ScipyR
 
 import spider
+from spider.preprocess._decompose_common import flatten_base
+
+
+def _R_from_quat(q_xyzw: np.ndarray) -> np.ndarray:
+    return _ScipyR.from_quat(q_xyzw).as_matrix()
 
 
 def main(
@@ -27,6 +34,8 @@ def main(
     embodiment_type: str = "bimanual",
     task: str = "pick_spoon_bowl",
     data_id: int = 0,
+    add_flat_base: bool = True,
+    floor_well_below_offset: float = 0.0,
 ):
     dataset_dir = os.path.abspath(dataset_dir)
     if embodiment_type == "right":
@@ -49,6 +58,25 @@ def main(
     with open(task_info_path) as f:
         task_info = json.load(f)
 
+    # Load first-frame object pose so a flat base can be aligned with the
+    # object's actual lowest world-frame point.
+    keypoints_path = f"{processed_dir}/trajectory_keypoints.npz"
+    first_obj_pose: dict[str, tuple[np.ndarray, np.ndarray] | None] = {
+        "right": None,
+        "left": None,
+    }
+    if os.path.exists(keypoints_path):
+        kp = np.load(keypoints_path)
+        for h in ("right", "left"):
+            key = f"qpos_obj_{h}"
+            if key in kp.files and len(kp[key]) > 0:
+                pos = kp[key][0, :3]
+                q_wxyz = kp[key][0, 3:]
+                if not (np.allclose(pos, 0) and np.allclose(q_wxyz, [1, 0, 0, 0])):
+                    q_xyzw = np.concatenate([q_wxyz[1:], q_wxyz[:1]])
+                    R_obj = np.asarray(_R_from_quat(q_xyzw))
+                    first_obj_pose[h] = (pos, R_obj)
+
     for hand in hands:
         if hand == "right":
             mesh_dir = task_info.get("right_object_mesh_dir")
@@ -69,9 +97,9 @@ def main(
         mesh = trimesh.load(
             input_file, force="mesh", process=False, skip_materials=True
         )
-        mesh = coacd.Mesh(mesh.vertices, mesh.faces)
+        coacd_mesh = coacd.Mesh(mesh.vertices, mesh.faces)
         result = coacd.run_coacd(
-            mesh,
+            coacd_mesh,
             threshold=0.07,
             max_convex_hull=16,
             preprocess_mode="auto",
@@ -89,10 +117,55 @@ def main(
             apx_mode="ch",
             seed=1,
         )
+
+        hulls = [
+            (np.asarray(vs), np.asarray(fs, dtype=int)) for (vs, fs) in result
+        ]
+
+        if add_flat_base:
+            pose = first_obj_pose.get(hand)
+            if pose is not None:
+                obj_pos, R_obj = pose
+                hull_verts = np.vstack([v for v, _ in hulls])
+                v_world = (R_obj @ hull_verts.T).T + obj_pos
+                obj_min_world_z = float(v_world[:, 2].min())
+                hulls = flatten_base(
+                    hulls,
+                    R_world_local=R_obj,
+                    obj_world_pos=obj_pos,
+                    floor_z=obj_min_world_z,
+                    well_below_offset=floor_well_below_offset,
+                )
+                plate_top_z = obj_min_world_z - floor_well_below_offset
+                task_info[f"{hand}_plate_top_world_z"] = float(plate_top_z)
+                task_info[f"{hand}_obj_first_frame_xy"] = [
+                    float(obj_pos[0]),
+                    float(obj_pos[1]),
+                ]
+                task_info["floor_well_below_offset"] = float(floor_well_below_offset)
+                scene_min_z = task_info.get("scene_lowest_world_z")
+                if scene_min_z is not None:
+                    task_info["needs_object_support"] = bool(
+                        obj_min_world_z > float(scene_min_z) + 0.02
+                    )
+                else:
+                    task_info["needs_object_support"] = True
+                loguru.logger.info(
+                    f"Added flat base for {hand} hand: plate top at world "
+                    f"z={plate_top_z:.4f} (well_below_offset="
+                    f"{floor_well_below_offset:.3f}m)."
+                )
+            else:
+                hulls = flatten_base(hulls)
+                loguru.logger.warning(
+                    f"No first-frame obj pose for {hand} hand; falling back to "
+                    "local-frame plate (object may not rest stably on floor)."
+                )
+
         # ensure output directory exists
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
-        for i, (vs, fs) in enumerate(result):
+        for i, (vs, fs) in enumerate(hulls):
             mesh_part = trimesh.Trimesh(vs, fs)
             part_filename = f"{output_dir}/{i}.obj"
             mesh_part.export(part_filename)
