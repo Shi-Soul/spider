@@ -121,6 +121,7 @@ def main(
     friction_scale: float = 1.0,
     show_viewer: bool = True,
     act_scene: bool = False,
+    add_object_support: bool = True,
 ):
     dataset_dir = os.path.abspath(dataset_dir)
     processed_dir = get_processed_data_dir(
@@ -573,6 +574,43 @@ def main(
     object_collision_names = right_object_collision_names + left_object_collision_names
     loguru.logger.info(f"Added {len(object_collision_names)} objects to model")
 
+    # Static support cubes: each cube is a worldbody geom with contype=0/
+    # conaffinity=0; collisions are scoped via explicit <pair> entries below
+    # (matching the convention used for floor/object pairs in this file).
+    support_cube_pairs: list[tuple[str, list[str]]] = []
+    if add_object_support and task_info.get("needs_object_support", False):
+        hand_to_collision_names = {
+            "right": right_object_collision_names,
+            "left": left_object_collision_names,
+        }
+        for hand_side, obj_collision_names in hand_to_collision_names.items():
+            if not obj_collision_names:
+                continue
+            plate_top_z = task_info.get(f"{hand_side}_plate_top_world_z")
+            xy = task_info.get(f"{hand_side}_obj_first_frame_xy")
+            if plate_top_z is None or xy is None:
+                continue
+            plate_top_z = float(plate_top_z)
+            cube_half_h = max((plate_top_z - floor_z) / 2.0, 1e-4)
+            cube_z = floor_z + cube_half_h
+            cube_name = f"obj_support_{hand_side}"
+            mj_spec.worldbody.add_geom(
+                name=cube_name,
+                type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=[0.025, 0.025, cube_half_h],
+                pos=[float(xy[0]), float(xy[1]), float(cube_z)],
+                contype=0,
+                conaffinity=0,
+                rgba=[0.6, 0.6, 0.6, 1.0],
+                group=3,
+            )
+            support_cube_pairs.append((cube_name, list(obj_collision_names)))
+            loguru.logger.info(
+                f"Added object support cube {cube_name} at "
+                f"({xy[0]:.3f}, {xy[1]:.3f}, {cube_z:.4f}) with "
+                f"half-height {cube_half_h:.4f}m."
+            )
+
     # add contact pairs
     default_solref = [0.02, 1]
     default_friction = [
@@ -805,6 +843,18 @@ def main(
     #             solref=default_solref,
     #             friction=default_friction,
     #         )
+
+    for cube_name, obj_collision_names in support_cube_pairs:
+        for obj_collision_name in obj_collision_names:
+            mj_spec.add_pair(
+                name=f"{cube_name}_{obj_collision_name}",
+                geomname1=cube_name,
+                geomname2=obj_collision_name,
+                solref=default_solref,
+                friction=default_friction,
+                condim=3,
+            )
+            contact_cnt += 1
 
     loguru.logger.info(f"Added {contact_cnt} contact pairs")
 
