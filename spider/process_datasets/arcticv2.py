@@ -344,7 +344,17 @@ def main(
     arctic_root = Path(os.path.abspath(os.path.expanduser(str(arctic_root))))
     dataset_dir = os.path.abspath(os.path.expanduser(dataset_dir))
     if mano_assets_root is None:
-        mano_assets_root = str(arctic_root / "unpack" / "body_models")
+        for c in (
+            arctic_root / "unpack" / "body_models",
+            arctic_root / "body_models",
+            arctic_root / "unpack" / "body_models" / "mano",
+            arctic_root / "body_models" / "mano",
+        ):
+            if c.exists():
+                mano_assets_root = str(c)
+                break
+        else:
+            mano_assets_root = str(arctic_root / "unpack" / "body_models")
 
     # Object-class filter (the 6 dexmachina objects).
     obj_name = sequence.split("_")[0]
@@ -479,7 +489,7 @@ def main(
     output_dir = get_processed_data_dir(
         dataset_dir=dataset_dir,
         dataset_name="arcticv2",
-        robot_type=robot_type,
+        robot_type="mano",
         embodiment_type=embodiment_type,
         task=task,
         data_id=data_id,
@@ -555,7 +565,7 @@ def main(
     task_info = {
         "task": task,
         "dataset_name": "arcticv2",
-        "robot_type": robot_type,
+        "robot_type": "mano",
         "embodiment_type": embodiment_type,
         "data_id": data_id,
         "right_object_mesh_dir": rel_mesh_dir,
@@ -595,7 +605,8 @@ def main(
     loguru.logger.info(
         f"Object frame-0 lowest world z = {obj_verts_world_z_frame0:+.3f} m; "
         f"scene lowest z = {scene_min_z:+.3f} m"
-        + (" (object descends -- skip support plate)" if object_descends else "")
+        + (" (object descends from frame 0)" if object_descends else " (object stays above frame-0 z)")
+        + ". Final needs_object_support is decided by decompose_fast/decompose."
     )
 
     if not show_viewer:

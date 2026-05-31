@@ -72,7 +72,12 @@ def main(
             if key in kp.files and len(kp[key]) > 0:
                 pos = kp[key][0, :3]
                 q_wxyz = kp[key][0, 3:]
-                if not (np.allclose(pos, 0) and np.allclose(q_wxyz, [1, 0, 0, 0])):
+                # skip placeholder (zero-pos identity-quat) and degenerate
+                # (zero-norm quat) entries -- the latter is what bimanual
+                # gigahand uses for the inactive hand.
+                placeholder = np.allclose(pos, 0) and np.allclose(q_wxyz, [1, 0, 0, 0])
+                degenerate = float(np.linalg.norm(q_wxyz)) < 1e-6
+                if not (placeholder or degenerate):
                     q_xyzw = np.concatenate([q_wxyz[1:], q_wxyz[:1]])
                     R_obj = np.asarray(_R_from_quat(q_xyzw))
                     first_obj_pose[h] = (pos, R_obj)
