@@ -1,0 +1,28 @@
+Expected artifact layout (populated after run.sh executes on amazon16):
+
+sandbox/sharpa_gigahand_teapot/
+  run.sh                                    # reproducible benchmark script
+  REPORT.md                                 # outcome summary
+  MANIFEST.txt                              # this file
+  xhand/
+    visualization_ik.mp4                    # IK preview (from spider/preprocess/ik.py --save-video)
+    visualization_ik.viser                  # if/when ik.py gains --save-viser
+    mjwp_fast_rollout.mp4                   # final retargeting rollout
+    run_seed0.log                           # mjwp_fast stdout/stderr
+  sharpa/
+    visualization_ik.mp4                    # IK is seed-independent -> single copy
+    visualization_ik.viser
+    seed0/  mjwp_fast_rollout.mp4   run.log
+    seed1/  mjwp_fast_rollout.mp4   run.log
+    seed2/  mjwp_fast_rollout.mp4   run.log
+    seed3/  mjwp_fast_rollout.mp4   run.log
+    seed4/  mjwp_fast_rollout.mp4   run.log
+
+Videos are NOT committed to git (large binaries). Only run.sh, REPORT.md,
+MANIFEST.txt, and *.log files should land in the repo.
+
+Where mjwp_fast videos actually land:
+  Check `recordings/` and `outputs/` after each run:
+    find . -name 'mjcpu_*.mp4' -newer <stamp>
+    find ./outputs -name '*.mp4' -newer <stamp>
+  Then copy into the seed dirs above.
