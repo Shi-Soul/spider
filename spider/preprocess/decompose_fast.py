@@ -62,6 +62,12 @@ def main(
     check_stability: bool = False,
     stability_max_drift: float = 0.005,
 ) -> None:
+    logger.warning(
+        "decompose_fast uses voxel-cluster convex hulls and does NOT capture "
+        "concavities (handles, mug interiors). For non-convex objects with "
+        "handles (teapot, mug, cup, kettle), prefer spider/preprocess/decompose.py "
+        "(CoACD-based) for better retargeting performance."
+    )
     dataset_path = Path(dataset_dir)
 
     if embodiment_type == "right":
