@@ -272,6 +272,286 @@ def _diff_qpos(
     return qpos_diff
 
 
+def _object_pose_slice(
+    qpos: np.ndarray, embodiment_type: str, nq_obj: int
+) -> tuple[
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+]:
+    """Extract object position(s) and orientation quaternion(s) from a qpos vector.
+
+    Mirrors the slicing in `_diff_qpos`. Returns
+    `(right_pos, right_quat, left_pos, left_quat)`. Quaternions are `None`
+    when the embodiment / nq_obj combination has no rotation DOF (e.g.,
+    contact-guidance which only actuates positions). Sides that don't apply
+    are returned as `None`.
+
+    Args:
+        qpos: 1D numpy array of qpos for a single environment.
+        embodiment_type: One of "bimanual", "right", "left", "humanoid_object".
+        nq_obj: object DOF count (matches `Config.nq_obj`).
+
+    Returns:
+        Tuple `(right_pos, right_quat, left_pos, left_quat)`.
+    """
+    qpos = np.asarray(qpos)
+    if embodiment_type == "bimanual":
+        if nq_obj == 12:
+            # contact_guidance: positions only, [right(3), left(3)]
+            right_pos = qpos[-12:-9].copy()
+            left_pos = qpos[-6:-3].copy()
+            return right_pos, None, left_pos, None
+        # nq_obj == 14: [right_pos(3), right_quat(4), left_pos(3), left_quat(4)]
+        right_pos = qpos[-14:-11].copy()
+        right_quat = qpos[-11:-7].copy()
+        left_pos = qpos[-7:-4].copy()
+        left_quat = qpos[-4:].copy()
+        return right_pos, right_quat, left_pos, left_quat
+    if embodiment_type in ["right", "left"]:
+        if nq_obj == 6:
+            pos = qpos[-6:-3].copy()
+            if embodiment_type == "right":
+                return pos, None, None, None
+            return None, None, pos, None
+        # nq_obj == 7: [pos(3), quat(4)]
+        pos = qpos[-7:-4].copy()
+        quat = qpos[-4:].copy()
+        if embodiment_type == "right":
+            return pos, quat, None, None
+        return None, None, pos, quat
+    if embodiment_type == "humanoid_object":
+        pos = qpos[-7:-4].copy()
+        quat = qpos[-4:].copy()
+        return pos, quat, None, None
+    # No object on this embodiment (humanoid only)
+    return None, None, None, None
+
+
+def _quat_angle(q0: np.ndarray, q1: np.ndarray) -> float:
+    """Return the rotation angle in radians between two unit quaternions.
+
+    Quaternions are in MuJoCo `[w, x, y, z]` order. Computes
+    `2 * acos(|<q0, q1>|)` for numerical stability and sign invariance.
+    """
+    q0 = np.asarray(q0, dtype=np.float64)
+    q1 = np.asarray(q1, dtype=np.float64)
+    n0 = np.linalg.norm(q0)
+    n1 = np.linalg.norm(q1)
+    if n0 < 1e-8 or n1 < 1e-8:
+        return 0.0
+    dot = float(np.clip(np.abs(np.dot(q0 / n0, q1 / n1)), 0.0, 1.0))
+    return float(2.0 * np.arccos(dot))
+
+
+def _initial_state_sanity_check(
+    mj_model: mujoco.MjModel,
+    mj_data: mujoco.MjData,
+    qpos_ref: torch.Tensor,
+    qvel_ref: torch.Tensor,
+    ctrl_ref: torch.Tensor,
+    config: Config,
+    save_video_dir: str | None = None,
+) -> None:
+    """Verify the initial scene is stable when controls are held at ctrl_ref[0].
+
+    Resets `mj_data` to the first reference frame, holds `ctrl_ref[0]` fixed,
+    and steps CPU MuJoCo for `config.sanity_check_seconds`. If the object
+    drifts past `config.sanity_check_pos_thresh` (meters) or rotates past
+    `config.sanity_check_rot_thresh` (radians), raises `RuntimeError` with
+    actionable hints. CPU-only — does not touch the warp/GPU path.
+
+    If `save_video_dir` is provided and `config.save_video` is enabled, an
+    MP4 of the rollout is saved to `<save_video_dir>/sanity_check_drift.mp4`
+    and its path is included in the error message.
+
+    Args:
+        mj_model: CPU MuJoCo model (already configured).
+        mj_data: CPU MuJoCo data buffer; will be mutated and left at the
+            final stepped state.
+        qpos_ref: Reference qpos tensor of shape `(T, nq)`.
+        qvel_ref: Reference qvel tensor of shape `(T, nv)`.
+        ctrl_ref: Reference ctrl tensor of shape `(T, nu)`.
+        config: SPIDER `Config` (uses `embodiment_type`, `nq_obj`,
+            `sanity_check_seconds`, `sanity_check_pos_thresh`,
+            `sanity_check_rot_thresh`, `save_video`).
+        save_video_dir: Optional output directory for the drift MP4.
+    """
+    seconds = float(config.sanity_check_seconds)
+    if seconds <= 0.0:
+        return
+
+    timestep = float(mj_model.opt.timestep)
+    if timestep <= 0.0:
+        loguru.logger.warning(
+            "sanity check skipped: invalid mj_model.opt.timestep={}", timestep
+        )
+        return
+    n_steps = int(seconds / timestep)
+    if n_steps <= 0:
+        loguru.logger.warning(
+            "sanity check skipped: sanity_check_seconds ({}) < timestep ({})",
+            seconds,
+            timestep,
+        )
+        return
+
+    qpos0_np = qpos_ref[0].detach().cpu().numpy().astype(np.float64)
+    qvel0_np = qvel_ref[0].detach().cpu().numpy().astype(np.float64)
+    ctrl0_np = ctrl_ref[0].detach().cpu().numpy().astype(np.float64)
+
+    mj_data.qpos[:] = qpos0_np.copy()
+    mj_data.qvel[:] = qvel0_np.copy()
+    mj_data.ctrl[:] = ctrl0_np.copy()
+    mj_data.time = 0.0
+    mujoco.mj_forward(mj_model, mj_data)
+
+    # Capture the post-forward initial state
+    right_pos_0, right_quat_0, left_pos_0, left_quat_0 = _object_pose_slice(
+        np.array(mj_data.qpos), config.embodiment_type, int(config.nq_obj)
+    )
+
+    # Optionally render
+    record_video = bool(save_video_dir) and bool(getattr(config, "save_video", False))
+    renderer = None
+    frames: list[np.ndarray] = []
+    render_every = 1
+    if record_video:
+        try:
+            mj_model.vis.global_.offwidth = 256
+            mj_model.vis.global_.offheight = 256
+            renderer = mujoco.Renderer(mj_model, height=256, width=256)
+            # ~30fps
+            target_fps = 30.0
+            render_every = max(int(round(1.0 / (target_fps * timestep))), 1)
+        except Exception as exc:
+            loguru.logger.warning("sanity check renderer setup failed: {}", exc)
+            renderer = None
+            record_video = False
+
+    loguru.logger.info(
+        "Running initial-state sanity check: holding ctrl_ref[0] for {:.2f}s ({} steps).",
+        seconds,
+        n_steps,
+    )
+
+    try:
+        for step_i in range(n_steps):
+            mj_data.ctrl[:] = ctrl0_np
+            mujoco.mj_step(mj_model, mj_data)
+            if renderer is not None and step_i % render_every == 0:
+                try:
+                    try:
+                        renderer.update_scene(mj_data, "front")
+                    except Exception:
+                        renderer.update_scene(mj_data, 0)
+                    frames.append(renderer.render())
+                except Exception as exc:
+                    loguru.logger.warning("sanity check render frame failed: {}", exc)
+                    renderer = None
+                    record_video = False
+    finally:
+        if renderer is not None:
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                renderer.close()
+
+    right_pos_t, right_quat_t, left_pos_t, left_quat_t = _object_pose_slice(
+        np.array(mj_data.qpos), config.embodiment_type, int(config.nq_obj)
+    )
+
+    drifts: list[tuple[str, float, float]] = []  # (label, value, threshold)
+    pos_thresh = float(config.sanity_check_pos_thresh)
+    rot_thresh = float(config.sanity_check_rot_thresh)
+
+    def _record_pos(label: str, p0: np.ndarray | None, p_t: np.ndarray | None) -> None:
+        if p0 is None or p_t is None:
+            return
+        d = float(np.linalg.norm(p_t - p0))
+        drifts.append((label, d, pos_thresh))
+
+    def _record_rot(label: str, q0: np.ndarray | None, q_t: np.ndarray | None) -> None:
+        if q0 is None or q_t is None:
+            return
+        d = _quat_angle(q0, q_t)
+        drifts.append((label, d, rot_thresh))
+
+    _record_pos("right object pos drift", right_pos_0, right_pos_t)
+    _record_rot("right object rot drift", right_quat_0, right_quat_t)
+    _record_pos("left object pos drift", left_pos_0, left_pos_t)
+    _record_rot("left object rot drift", left_quat_0, left_quat_t)
+
+    failures = [(label, val, thr) for (label, val, thr) in drifts if val > thr]
+
+    video_path: str | None = None
+    if record_video and frames:
+        import os
+
+        os.makedirs(save_video_dir, exist_ok=True)
+        video_path = os.path.join(save_video_dir, "sanity_check_drift.mp4")
+        try:
+            import imageio
+
+            imageio.mimsave(video_path, frames, fps=30)
+            loguru.logger.info("Saved sanity-check video to {}", video_path)
+        except Exception as exc:
+            loguru.logger.warning("Failed to save sanity-check video: {}", exc)
+            video_path = None
+
+    if not failures:
+        summary_parts = []
+        for label, val, _ in drifts:
+            unit = "cm" if "pos" in label else "rad"
+            shown = val * 100.0 if unit == "cm" else val
+            summary_parts.append(f"{label}={shown:.4f}{unit}")
+        loguru.logger.info(
+            "Sanity check passed ({} steps held at ctrl_ref[0]). {}",
+            n_steps,
+            "; ".join(summary_parts) if summary_parts else "no object DOFs to check",
+        )
+        return
+
+    # Build error message
+    detail_lines = []
+    for label, val, thr in drifts:
+        if "pos" in label:
+            detail_lines.append(
+                f"  - {label}: pos={val * 100.0:.3f}cm (threshold "
+                f"{thr * 100.0:.3f}cm) over {seconds:.2f}s with controls held at "
+                "ctrl_ref[0]"
+            )
+        else:
+            detail_lines.append(
+                f"  - {label}: rot={val:.4f}rad (threshold {thr:.4f}rad) over "
+                f"{seconds:.2f}s with controls held at ctrl_ref[0]"
+            )
+    hints = [
+        "  - If the object should rest on the floor: check the initial qpos "
+        "and scene XML — the object may be floating or intersecting another "
+        "body, causing it to fall or be pushed when physics starts.",
+        "  - If the object should be in the hand: the IK / preprocessing "
+        "produced an unstable grasp. Re-run preprocess/ik.py with a tighter "
+        "wrist target, verify contact_pos targets, or adjust scene margins.",
+    ]
+    msg_parts = [
+        "Initial-state sanity check FAILED: object drifted past thresholds "
+        f"after holding ctrl_ref[0] for {seconds:.2f}s ({n_steps} CPU "
+        "MuJoCo steps).",
+        "Drift detected:",
+        *detail_lines,
+        "Hints:",
+        *hints,
+    ]
+    if video_path:
+        msg_parts.append(f"Drift video saved to: {video_path}")
+    msg_parts.append(
+        "Disable this check by setting `sanity_check_seconds=0.0` in your config."
+    )
+    raise RuntimeError("\n".join(msg_parts))
+
+
 def get_reward(
     config: Config,
     env: MJWPEnv,

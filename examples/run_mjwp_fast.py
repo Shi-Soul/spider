@@ -50,6 +50,7 @@ from spider.optimizers.sampling_fast import (
 )
 from spider.postprocess.get_success_rate import compute_object_tracking_error
 from spider.simulators.mjwp import (
+    _initial_state_sanity_check,
     copy_sample_state,
     get_qpos,
     get_qvel,
@@ -237,6 +238,25 @@ def main(config: Config):
     mj_data.ctrl[:] = ctrl_ref[0].detach().cpu().numpy()
     mujoco.mj_step(mj_model, mj_data)
     mj_data.time = 0.0
+
+    # Initial-state stability sanity check (CPU MuJoCo only). Disabled when
+    # config.sanity_check_seconds <= 0.0.
+    if config.sanity_check_seconds > 0.0:
+        _initial_state_sanity_check(
+            mj_model,
+            mj_data,
+            qpos_ref,
+            qvel_ref,
+            ctrl_ref,
+            config,
+            save_video_dir=config.output_dir,
+        )
+        # Restore initial scene state after the check.
+        mj_data.qpos[:] = qpos_ref[0].detach().cpu().numpy()
+        mj_data.qvel[:] = qvel_ref[0].detach().cpu().numpy()
+        mj_data.ctrl[:] = ctrl_ref[0].detach().cpu().numpy()
+        mujoco.mj_step(mj_model, mj_data)
+        mj_data.time = 0.0
 
     images = []
     object_trace_site_ids = []
