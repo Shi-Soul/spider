@@ -382,12 +382,21 @@ def _initial_state_sanity_check(
     if seconds <= 0.0:
         return
 
-    timestep = float(mj_model.opt.timestep)
-    if timestep <= 0.0:
+    # Force a fine CPU MuJoCo timestep for the stability rollout. The
+    # production sim_dt (e.g., 0.01) is too coarse for the implicit-fast
+    # integrator to keep contact stable on rigid props, producing spurious
+    # drift even when the scene is well-supported. 0.002s matches the
+    # default MuJoCo timestep and cleanly resolves contact dynamics.
+    _SANITY_TIMESTEP = 0.002
+    original_timestep = float(mj_model.opt.timestep)
+    if original_timestep <= 0.0:
         loguru.logger.warning(
-            "sanity check skipped: invalid mj_model.opt.timestep={}", timestep
+            "sanity check skipped: invalid mj_model.opt.timestep={}",
+            original_timestep,
         )
         return
+    mj_model.opt.timestep = _SANITY_TIMESTEP
+    timestep = _SANITY_TIMESTEP
     n_steps = int(seconds / timestep)
     if n_steps <= 0:
         loguru.logger.warning(
@@ -395,8 +404,36 @@ def _initial_state_sanity_check(
             seconds,
             timestep,
         )
+        mj_model.opt.timestep = original_timestep
         return
 
+    try:
+        _run_sanity_check_body(
+            mj_model,
+            mj_data,
+            qpos_ref,
+            ctrl_ref,
+            config,
+            save_video_dir,
+            seconds,
+            timestep,
+            n_steps,
+        )
+    finally:
+        mj_model.opt.timestep = original_timestep
+
+
+def _run_sanity_check_body(
+    mj_model: mujoco.MjModel,
+    mj_data: mujoco.MjData,
+    qpos_ref: torch.Tensor,
+    ctrl_ref: torch.Tensor,
+    config: Config,
+    save_video_dir: str | None,
+    seconds: float,
+    timestep: float,
+    n_steps: int,
+) -> None:
     qpos0_np = qpos_ref[0].detach().cpu().numpy().astype(np.float64)
     ctrl0_np = ctrl_ref[0].detach().cpu().numpy().astype(np.float64)
 
@@ -441,10 +478,36 @@ def _initial_state_sanity_check(
         n_steps,
     )
 
+    # Track MAX drift across the rollout, not just end-vs-start. An object
+    # that bounces and then settles back near its origin would otherwise
+    # silently pass the check.
+    max_drift_pos_right = 0.0
+    max_drift_pos_left = 0.0
+    max_drift_rot_right = 0.0
+    max_drift_rot_left = 0.0
     try:
         for step_i in range(n_steps):
             mj_data.ctrl[:] = ctrl0_np
             mujoco.mj_step(mj_model, mj_data)
+            r_p, r_q, l_p, l_q = _object_pose_slice(
+                np.array(mj_data.qpos), config.embodiment_type, int(config.nq_obj)
+            )
+            if right_pos_0 is not None and r_p is not None:
+                max_drift_pos_right = max(
+                    max_drift_pos_right, float(np.linalg.norm(r_p - right_pos_0))
+                )
+            if right_quat_0 is not None and r_q is not None:
+                max_drift_rot_right = max(
+                    max_drift_rot_right, _quat_angle(right_quat_0, r_q)
+                )
+            if left_pos_0 is not None and l_p is not None:
+                max_drift_pos_left = max(
+                    max_drift_pos_left, float(np.linalg.norm(l_p - left_pos_0))
+                )
+            if left_quat_0 is not None and l_q is not None:
+                max_drift_rot_left = max(
+                    max_drift_rot_left, _quat_angle(left_quat_0, l_q)
+                )
             if renderer is not None and step_i % render_every == 0:
                 try:
                     try:
@@ -471,22 +534,17 @@ def _initial_state_sanity_check(
     pos_thresh = float(config.sanity_check_pos_thresh)
     rot_thresh = float(config.sanity_check_rot_thresh)
 
-    def _record_pos(label: str, p0: np.ndarray | None, p_t: np.ndarray | None) -> None:
-        if p0 is None or p_t is None:
-            return
-        d = float(np.linalg.norm(p_t - p0))
-        drifts.append((label, d, pos_thresh))
-
-    def _record_rot(label: str, q0: np.ndarray | None, q_t: np.ndarray | None) -> None:
-        if q0 is None or q_t is None:
-            return
-        d = _quat_angle(q0, q_t)
-        drifts.append((label, d, rot_thresh))
-
-    _record_pos("right object pos drift", right_pos_0, right_pos_t)
-    _record_rot("right object rot drift", right_quat_0, right_quat_t)
-    _record_pos("left object pos drift", left_pos_0, left_pos_t)
-    _record_rot("left object rot drift", left_quat_0, left_quat_t)
+    # Use MAX-over-rollout drift so transient bounces (e.g., teapot
+    # oscillating against a thin support cube) are caught even when the
+    # end-frame pose returns close to the start.
+    if right_pos_0 is not None and right_pos_t is not None:
+        drifts.append(("right object max pos drift", max_drift_pos_right, pos_thresh))
+    if right_quat_0 is not None and right_quat_t is not None:
+        drifts.append(("right object max rot drift", max_drift_rot_right, rot_thresh))
+    if left_pos_0 is not None and left_pos_t is not None:
+        drifts.append(("left object max pos drift", max_drift_pos_left, pos_thresh))
+    if left_quat_0 is not None and left_quat_t is not None:
+        drifts.append(("left object max rot drift", max_drift_rot_left, rot_thresh))
 
     failures = [(label, val, thr) for (label, val, thr) in drifts if val > thr]
 

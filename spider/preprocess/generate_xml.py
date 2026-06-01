@@ -121,7 +121,6 @@ def main(
     friction_scale: float = 1.0,
     show_viewer: bool = True,
     act_scene: bool = False,
-    add_object_support: bool = True,
 ):
     dataset_dir = os.path.abspath(dataset_dir)
     processed_dir = get_processed_data_dir(
@@ -243,35 +242,22 @@ def main(
     with open(task_info_path) as f:
         task_info = json.load(f)
 
-    # add floor: by default at z=0, but if the dataset reports the object's
-    # first-frame lowest world z (oakinkv2), put the floor a couple cm under
-    # the object so the support plate added by ``decompose_fast`` (which
-    # extends from obj_min_z down by ``thickness``) clears the world floor.
+    # add floor 1mm under z=0. Dataset processors (oakinkv2, arcticv2) offset
+    # the trajectory so the object's lowest world-frame z at frame 0 is 0; we
+    # then drop the floor by 1mm to give the contact solver a small clearance,
+    # otherwise frame-0 object mesh vertices at exactly z=0 sit perfectly
+    # coplanar with the floor and the constraint solver explodes (huge drift,
+    # NaNs in qacc) the moment physics steps.
+    #
+    # The body-fixed support plate (added by decompose_fast/decompose) is a
+    # small 3x3cm square that sits *inside* the object's lower bbox: its
+    # bottom is flush with the object's lowest mesh z (z=0) and its top lifts
+    # upward, so the plate adds no height below the object.
     if embodiment_type in ["right", "bimanual"]:
         material_name = "right_groundplane"
     else:
         material_name = "left_groundplane"
-    # Place the world floor right under the support plate's TOP (the plate
-    # is body-fixed to the object and hangs ``floor_well_below_offset`` below
-    # the object's frame-0 bottom). The floor catches the plate at frame 0,
-    # so the object sits at its original mocap height with the plate dangling
-    # below; the trajectory plays in original world coordinates.
-    plate_top_z = (
-        task_info.get("right_plate_top_world_z")
-        or task_info.get("left_plate_top_world_z")
-    )
-    if plate_top_z is not None:
-        # Plate occupies [plate_top_z - 0.01, plate_top_z] (body-fixed in
-        # local frame). Floor 1mm below plate's bottom so they just touch at
-        # frame 0 without overlap.
-        floor_z = float(plate_top_z) - 0.01 - 0.001
-    else:
-        # legacy fallback (no support plate available)
-        obj_min_z = task_info.get("obj_first_frame_lowest_world_z")
-        if obj_min_z is not None:
-            floor_z = float(obj_min_z) - 0.01 - 0.001
-        else:
-            floor_z = 0.0
+    floor_z = -0.001
     mj_spec.worldbody.add_geom(
         name="floor",
         type=mujoco.mjtGeom.mjGEOM_PLANE,
@@ -574,43 +560,6 @@ def main(
     object_collision_names = right_object_collision_names + left_object_collision_names
     loguru.logger.info(f"Added {len(object_collision_names)} objects to model")
 
-    # Static support cubes: each cube is a worldbody geom with contype=0/
-    # conaffinity=0; collisions are scoped via explicit <pair> entries below
-    # (matching the convention used for floor/object pairs in this file).
-    support_cube_pairs: list[tuple[str, list[str]]] = []
-    if add_object_support and task_info.get("needs_object_support", False):
-        hand_to_collision_names = {
-            "right": right_object_collision_names,
-            "left": left_object_collision_names,
-        }
-        for hand_side, obj_collision_names in hand_to_collision_names.items():
-            if not obj_collision_names:
-                continue
-            plate_top_z = task_info.get(f"{hand_side}_plate_top_world_z")
-            xy = task_info.get(f"{hand_side}_obj_first_frame_xy")
-            if plate_top_z is None or xy is None:
-                continue
-            plate_top_z = float(plate_top_z)
-            cube_half_h = max((plate_top_z - floor_z) / 2.0, 1e-4)
-            cube_z = floor_z + cube_half_h
-            cube_name = f"obj_support_{hand_side}"
-            mj_spec.worldbody.add_geom(
-                name=cube_name,
-                type=mujoco.mjtGeom.mjGEOM_BOX,
-                size=[0.025, 0.025, cube_half_h],
-                pos=[float(xy[0]), float(xy[1]), float(cube_z)],
-                contype=0,
-                conaffinity=0,
-                rgba=[0.6, 0.6, 0.6, 1.0],
-                group=3,
-            )
-            support_cube_pairs.append((cube_name, list(obj_collision_names)))
-            loguru.logger.info(
-                f"Added object support cube {cube_name} at "
-                f"({xy[0]:.3f}, {xy[1]:.3f}, {cube_z:.4f}) with "
-                f"half-height {cube_half_h:.4f}m."
-            )
-
     # add contact pairs
     default_solref = [0.02, 1]
     default_friction = [
@@ -843,18 +792,6 @@ def main(
     #             solref=default_solref,
     #             friction=default_friction,
     #         )
-
-    for cube_name, obj_collision_names in support_cube_pairs:
-        for obj_collision_name in obj_collision_names:
-            mj_spec.add_pair(
-                name=f"{cube_name}_{obj_collision_name}",
-                geomname1=cube_name,
-                geomname2=obj_collision_name,
-                solref=default_solref,
-                friction=default_friction,
-                condim=3,
-            )
-            contact_cnt += 1
 
     loguru.logger.info(f"Added {contact_cnt} contact pairs")
 

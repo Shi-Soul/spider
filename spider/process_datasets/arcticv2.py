@@ -7,20 +7,25 @@
 """Process Arctic raw_seqs into SPIDER's mjwp_fast schema.
 
 This pipeline reads Arctic-v2 ``raw_seqs/<subject>/<sequence>.{mano,object}.npy``
-plus ``meta/object_vtemplates/<obj>/{top,bottom}.obj`` and produces a single
-clip per (subject, sequence). Compared to ``oakinkv2.py`` this pipeline:
+plus ``meta/object_vtemplates/<obj>/bottom.obj`` and produces a single
+clip per (subject, sequence). Specifically:
 
 1. Filters to the 6 dexmachina-pinned objects
    (box, ketchup, laptop, mixer, notebook, waffleiron). See
    :mod:`spider.postprocess.evaluate_dexmachina` lines 230-234.
-2. Treats the object as RIGID: welds top+bottom at frame-0 articulation angle
-   and writes a single ``visual.obj``. Articulated-object support is a
-   future feature; we log a warning at run time.
-3. Clips to the grasp stage only: starts ``pre_grasp_seconds`` before the
-   first frame where any hand vert is within 5cm of the object, and ends
-   ``post_lift_seconds`` after the object lifts above
-   ``frame0_z + lift_z_thresh``.
-4. Bimanual: both hand poses come from MANO FK; ``active_hand`` records
+2. Uses ONLY the object's bottom part (``bottom.obj``). The object is
+   treated as a single rigid body; no articulation. The wrist contacts
+   the bottom (the part that the hand picks up).
+3. Clips to the picking stage only: detects when the object first starts
+   moving (translation away from its frame-0 position), keeps
+   ``pre_grasp_seconds`` (default 2s) before that and ``post_lift_seconds``
+   (default 2s) after. This matches the user's "object-motion start"
+   criterion.
+4. Floor offset: shifts the entire scene (object + both hands) so that the
+   object's lowest world-z at the FIRST CLIP FRAME sits at z=0. Arctic
+   captures place the table well above z=0; without this shift the floor
+   in the simulator scene is below the object.
+5. Bimanual: both hand poses come from MANO FK; ``active_hand`` records
    which hand(s) actually contact the object.
 
 Author: Chaoyi Pan
@@ -139,7 +144,21 @@ def _patch_chumpy_compat() -> None:
 
 
 def _load_mano_layers(mano_assets_root: str) -> tuple:
-    """Return (right_layer, left_layer) ManoLayer instances."""
+    """Return (right_layer, left_layer) ManoLayer instances.
+
+    Arctic raw_seqs MANO parameters are stored relative to the **non-flat**
+    MANO mean pose (see ``arctic/common/body_models.py``: ``build_mano_aa``
+    is called with ``flat_hand=False``). manotorch must use the same to
+    reproduce Arctic's joints — using ``flat_hand_mean=True`` would offset
+    every finger joint by the MANO mean.
+
+    ``center_idx=None`` (NOT ``0``) so the wrist joint isn't shifted to the
+    origin before adding ``trans``. With ``center_idx=0`` manotorch outputs
+    ``J_canonical_zeroed_at_wrist + trans``, while ``smplx.MANO`` (what
+    Arctic uses) outputs ``J_canonical + trans`` — using ``center_idx=0``
+    moves the wrist by the canonical wrist offset (~5-10 cm, mostly in x)
+    and shifts every fingertip with it.
+    """
     _patch_chumpy_compat()
     from manotorch.manolayer import ManoLayer
 
@@ -148,17 +167,17 @@ def _load_mano_layers(mano_assets_root: str) -> tuple:
         mano_assets_root=root,
         rot_mode="axisang",
         side="right",
-        center_idx=0,
+        center_idx=None,
         use_pca=False,
-        flat_hand_mean=True,
+        flat_hand_mean=False,
     )
     left = ManoLayer(
         mano_assets_root=root,
         rot_mode="axisang",
         side="left",
-        center_idx=0,
+        center_idx=None,
         use_pca=False,
-        flat_hand_mean=True,
+        flat_hand_mean=False,
     )
     return right, left
 
@@ -187,111 +206,98 @@ def _mano_fk(
     return joints.cpu().numpy(), verts.cpu().numpy()
 
 
-def _build_rigid_object_mesh(
+def _build_bottom_only_object_mesh(
     obj_template_dir: str,
-    arti_angle_rad: float,
     out_path: str,
 ) -> None:
-    """Concatenate top.obj + bottom.obj after applying a frame-0 articulation.
+    """Export Arctic's bottom-part mesh as the rigid object mesh.
 
-    Arctic articulates the top part about the z-axis through the origin
-    (the canonical convention). We rotate top.obj vertices by ``arti_angle_rad``
-    about z, then merge with bottom.obj into a single welded mesh.
-
-    Vertices are kept in millimetres (the Arctic template native unit) and
-    converted to metres on output.
+    Arctic's object is articulated (top + bottom around a hinge). Per the
+    requested workflow, we keep only the bottom part — that is the body the
+    hand grasps and lifts. ``bottom.obj`` is shipped under
+    ``meta/object_vtemplates/<obj>/`` in millimetres; we convert to metres.
     """
-    top = trimesh.load(os.path.join(obj_template_dir, "top.obj"), process=False)
-    bot = trimesh.load(os.path.join(obj_template_dir, "bottom.obj"), process=False)
-    top_verts = np.asarray(top.vertices, dtype=np.float64)
-    bot_verts = np.asarray(bot.vertices, dtype=np.float64)
-    top_faces = np.asarray(top.faces, dtype=np.int64)
-    bot_faces = np.asarray(bot.faces, dtype=np.int64)
-
-    # Apply articulation: rotate top about z-axis through origin.
-    # Arctic stores arti as a positive scalar; sign matches the canonical
-    # opening direction in arctic.utils.articulate.
-    rot = R.from_rotvec(np.array([0.0, 0.0, arti_angle_rad]))
-    top_verts = rot.apply(top_verts)
-
-    # Merge.
-    n_top = top_verts.shape[0]
-    verts = np.concatenate([top_verts, bot_verts], axis=0)
-    faces = np.concatenate([top_faces, bot_faces + n_top], axis=0)
-    # mm -> m
-    verts = verts / 1000.0
-
-    merged = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-    merged.export(out_path)
+    mesh_path = os.path.join(obj_template_dir, "bottom.obj")
+    if not os.path.exists(mesh_path):
+        raise FileNotFoundError(
+            f"Expected bottom.obj under {obj_template_dir}; not found."
+        )
+    mesh = trimesh.load(mesh_path, process=False)
+    verts = np.asarray(mesh.vertices, dtype=np.float64) / 1000.0  # mm -> m
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    out = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    out.export(out_path)
 
 
 def _detect_grasp_window(
-    obj_verts_world: np.ndarray,   # (T, V_obj, 3)
+    obj_trans_m: np.ndarray,       # (T, 3) bottom-part world translation, metres
     rh_verts_world: np.ndarray,    # (T, 778, 3)
     lh_verts_world: np.ndarray,    # (T, 778, 3)
+    obj_verts_world: np.ndarray,   # (T, V_obj_sub, 3)  for active-hand assignment
     fps: float,
     pre_grasp_seconds: float,
     post_lift_seconds: float,
-    lift_z_thresh: float,
+    motion_thresh_m: float = 0.02,
     contact_thresh: float = 0.05,
 ) -> tuple[int, int, str]:
-    """Detect the grasp window and active hand.
+    """Detect the picking window using object motion onset.
 
-    Returns (start_frame, end_frame_exclusive, active_hand) where active_hand
-    is 'right', 'left', or 'both'.
+    The "grasp moment" is when the object first begins to move significantly
+    away from its frame-0 translation. We center the clip on that moment:
+
+        start = motion_onset - pre_grasp_seconds * fps
+        end   = motion_onset + post_lift_seconds * fps
+
+    The active hand is whichever hand's MANO verts come closest to the
+    object around the motion-onset frame.
+
+    Args:
+        obj_trans_m: per-frame object translation (bottom-part centre) in
+            metres; motion onset uses ``||trans - trans[0]|| > motion_thresh_m``.
+        rh_verts_world / lh_verts_world: MANO vertices for active-hand
+            classification.
+        obj_verts_world: subsampled object verts for hand-distance check.
+        motion_thresh_m: how far (in metres) the object must translate
+            from its frame-0 position to count as "moving".
     """
-    T = obj_verts_world.shape[0]
-    # Sub-sample object verts for speed (every ~50th vertex is fine for a
-    # nearest-distance lower bound).
-    stride = max(1, obj_verts_world.shape[1] // 200)
-    obj_sub = obj_verts_world[:, ::stride, :]
+    T = obj_trans_m.shape[0]
+    disp = np.linalg.norm(obj_trans_m - obj_trans_m[0:1], axis=-1)
+    moving_frames = np.where(disp > motion_thresh_m)[0]
+    if moving_frames.size == 0:
+        # Object never moves — fall back to the frame of largest displacement.
+        motion_onset = int(np.argmax(disp))
+    else:
+        motion_onset = int(moving_frames[0])
+
+    # Active-hand: whichever hand is closest to the object near onset.
     rh_sub = rh_verts_world[:, ::8, :]
     lh_sub = lh_verts_world[:, ::8, :]
-
-    rh_dist = np.empty(T)
-    lh_dist = np.empty(T)
-    for t in range(T):
-        d_rh = np.linalg.norm(
-            rh_sub[t][:, None, :] - obj_sub[t][None, :, :], axis=-1
-        ).min()
-        d_lh = np.linalg.norm(
-            lh_sub[t][:, None, :] - obj_sub[t][None, :, :], axis=-1
-        ).min()
-        rh_dist[t] = d_rh
-        lh_dist[t] = d_lh
-
-    rh_contacts = np.where(rh_dist < contact_thresh)[0]
-    lh_contacts = np.where(lh_dist < contact_thresh)[0]
-    if rh_contacts.size == 0 and lh_contacts.size == 0:
-        # Fall back to the closest-approach frame; treat both hands as active.
-        contact_start = int(np.argmin(np.minimum(rh_dist, lh_dist)))
+    win_lo = max(0, motion_onset - int(round(0.25 * fps)))
+    win_hi = min(T, motion_onset + int(round(0.25 * fps)) + 1)
+    rh_d = []
+    lh_d = []
+    for t in range(win_lo, win_hi):
+        rh_d.append(np.linalg.norm(
+            rh_sub[t][:, None, :] - obj_verts_world[t][None, :, :], axis=-1
+        ).min())
+        lh_d.append(np.linalg.norm(
+            lh_sub[t][:, None, :] - obj_verts_world[t][None, :, :], axis=-1
+        ).min())
+    rh_min = float(min(rh_d)) if rh_d else 1e9
+    lh_min = float(min(lh_d)) if lh_d else 1e9
+    if rh_min < contact_thresh and lh_min < contact_thresh:
         active = "both"
+    elif rh_min < contact_thresh:
+        active = "right"
+    elif lh_min < contact_thresh:
+        active = "left"
     else:
-        if rh_contacts.size and lh_contacts.size:
-            contact_start = int(min(rh_contacts[0], lh_contacts[0]))
-            active = "both"
-        elif rh_contacts.size:
-            contact_start = int(rh_contacts[0])
-            active = "right"
-        else:
-            contact_start = int(lh_contacts[0])
-            active = "left"
-
-    # Object's lowest world z (per-frame), used to detect lift.
-    obj_min_z = obj_verts_world[:, :, 2].min(axis=1)
-    z0 = obj_min_z[0]
-    lift_frames = np.where(obj_min_z > z0 + lift_z_thresh)[0]
-    # The "stable lift" frame is the first frame after contact_start where
-    # the object has lifted; if no lift happens, use the end of the clip.
-    lift_after_contact = lift_frames[lift_frames >= contact_start]
-    lift_frame = (
-        int(lift_after_contact[0]) if lift_after_contact.size > 0 else T - 1
-    )
+        active = "both"
 
     pre_n = int(round(pre_grasp_seconds * fps))
     post_n = int(round(post_lift_seconds * fps))
-    start = max(0, contact_start - pre_n)
-    end = min(T, lift_frame + post_n + 1)
+    start = max(0, motion_onset - pre_n)
+    end = min(T, motion_onset + post_n + 1)
     if end <= start:
         end = min(T, start + 1)
     return start, end, active
@@ -305,9 +311,9 @@ def main(
     data_id: int = 0,
     embodiment_type: str = "bimanual",
     robot_type: str = "xhand",
-    pre_grasp_seconds: float = 1.0,
+    pre_grasp_seconds: float = 2.0,
     post_lift_seconds: float = 2.0,
-    lift_z_thresh: float = 0.05,
+    motion_thresh_m: float = 0.02,
     target_fps: float = 30.0,
     mano_assets_root: str | None = None,
     no_preview: bool = False,
@@ -326,13 +332,14 @@ def main(
         embodiment_type: Always ``bimanual`` for Arctic.
         robot_type: e.g. ``xhand``, ``sharpa``. Used only to name the output
             dir; the schema itself is robot-agnostic.
-        pre_grasp_seconds: Pre-contact window before clipping.
-        post_lift_seconds: Post-lift settle window.
-        lift_z_thresh: Object min-z must rise this much above frame-0 to
-            count as "lifted".
+        pre_grasp_seconds: Seconds before object-motion onset to keep.
+        post_lift_seconds: Seconds after object-motion onset to keep.
+        motion_thresh_m: Object is considered "moving" once its translation
+            has moved this far (metres) from its frame-0 position.
         target_fps: Output FPS. Arctic raw is 30 Hz; default keeps it at 30.
-        mano_assets_root: Directory containing MANO pickles. Defaults to
-            ``<arctic_root>/unpack/body_models``.
+        mano_assets_root: Directory containing MANO pickles. On this machine
+            it lives under ``~/arctic/unpack/body_models``. If not provided
+            we auto-detect from a few common locations under ``arctic_root``.
         no_preview: Alias for ``--no-show-viewer``.
         show_viewer: Open the viser preview after writing the NPZ.
     """
@@ -376,8 +383,8 @@ def main(
 
     # Articulation discarded warning.
     loguru.logger.warning(
-        "arcticv2: articulation discarded; treating object as rigid (welded "
-        "at frame-0). Articulated-object support is a future feature."
+        "arcticv2: keeping ONLY the object's bottom part (the lifted body); "
+        "the articulated top half and articulation angle are discarded."
     )
 
     # 1. Load raw arrays.
@@ -424,47 +431,44 @@ def main(
         mano["left"]["trans"], mano["left"]["shape"],
     )
 
-    # 3. Build per-frame object world verts using the un-articulated combined
-    # mesh.obj (good enough for distance-based grasp detection; the welded
-    # mesh used for export is rebuilt after we know ``start``).
-    full_mesh = trimesh.load(
-        str(obj_template_dir / "mesh.obj"), process=False,
+    # 3. Build per-frame bottom-part world verts (used for the active-hand
+    # check). Object pose in raw_seqs/<seq>.object.npy gives the bottom
+    # part's world rotation+translation directly.
+    bottom_mesh = trimesh.load(
+        str(obj_template_dir / "bottom.obj"), process=False,
     )
-    full_verts_local = np.asarray(full_mesh.vertices, dtype=np.float64) / 1000.0
-    sub = full_verts_local[:: max(1, full_verts_local.shape[0] // 500)]
+    bottom_verts_local = np.asarray(bottom_mesh.vertices, dtype=np.float64) / 1000.0
+    sub = bottom_verts_local[:: max(1, bottom_verts_local.shape[0] // 500)]
     obj_world_verts = np.empty((T, sub.shape[0], 3), dtype=np.float64)
     for t in range(T):
         Rt = R.from_rotvec(obj_axang[t])
         obj_world_verts[t] = Rt.apply(sub) + obj_trans_m[t]
 
-    # 4. Detect grasp window + active hand on the full clip.
+    # 4. Detect picking window from object-motion onset.
     start, end, active_hand = _detect_grasp_window(
-        obj_world_verts, rh_verts, lh_verts,
+        obj_trans_m=obj_trans_m,
+        rh_verts_world=rh_verts,
+        lh_verts_world=lh_verts,
+        obj_verts_world=obj_world_verts,
         fps=FPS_MOCAP,
         pre_grasp_seconds=pre_grasp_seconds,
         post_lift_seconds=post_lift_seconds,
-        lift_z_thresh=lift_z_thresh,
+        motion_thresh_m=motion_thresh_m,
     )
     loguru.logger.info(
         f"clipped frame range = [{start}, {end}) ({end - start} frames @ "
         f"{FPS_MOCAP}Hz); active_hand={active_hand}"
     )
 
-    # 5. Build the rigid welded mesh at the FIRST CLIP FRAME's articulation.
-    weld_arti = float(obj_arti[start])
-    safe_name = f"{obj_name}_{subject}_{sequence}_arti{weld_arti:.3f}".replace(
-        ".", "p"
-    )
+    # 5. Export the bottom-only object mesh.
+    safe_name = f"{obj_name}_bottom"
     mesh_dir = get_mesh_dir(
         dataset_dir=dataset_dir, dataset_name="arcticv2", object_name=safe_name,
     )
     os.makedirs(mesh_dir, exist_ok=True)
     out_mesh = os.path.join(mesh_dir, "visual.obj")
-    _build_rigid_object_mesh(str(obj_template_dir), weld_arti, out_mesh)
-    loguru.logger.info(
-        f"Wrote welded rigid mesh (clip-frame-0 arti={weld_arti:.3f} rad) to "
-        f"{out_mesh}"
-    )
+    _build_bottom_only_object_mesh(str(obj_template_dir), out_mesh)
+    loguru.logger.info(f"Wrote bottom-only object mesh to {out_mesh}")
 
     # 6. Slice all per-frame arrays to [start, end).
     rh_joints = rh_joints[start:end]
@@ -511,6 +515,24 @@ def main(
     # global rotation is needed.
     unit_quat = np.array([1.0, 0.0, 0.0, 0.0])
 
+    # Wrist offsets: map MANO canonical hand frame to xhand's per-side
+    # ``{right,left}_palm`` site frame so the palm faces the correct side
+    # and fingers extend in the same direction as MANO's TPose.
+    # See spider/assets/robots/xhand/{right,left}.xml for site quats; columns
+    # of these matrices are (site_x, site_y, site_z) expressed in the MANO
+    # canonical-hand basis (right: fingers→-x, thumb→+z; left: fingers→+x,
+    # thumb→+z).
+    R_offset_right = R.from_matrix(np.array([
+        [0.0, 0.0, -1.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ]))
+    R_offset_left = R.from_matrix(np.array([
+        [0.0, 0.0, 1.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+    ]))
+
     qpos_wrist_right = np.zeros((n, 7))
     qpos_finger_right = np.zeros((n, 5, 7))
     qpos_obj_right = np.zeros((n, 7))
@@ -521,12 +543,12 @@ def main(
     # Per-hand wrist + fingertips from the FK output (joint 0 = wrist).
     for i in range(n):
         qpos_wrist_right[i, :3] = rh_joints[i, 0]
-        r = R.from_rotvec(rh_rot_clip[i])
+        r = R.from_rotvec(rh_rot_clip[i]) * R_offset_right
         xyzw = r.as_quat()
         qpos_wrist_right[i, 3:] = np.concatenate([xyzw[3:], xyzw[:3]])  # wxyz
 
         qpos_wrist_left[i, :3] = lh_joints[i, 0]
-        r = R.from_rotvec(lh_rot_clip[i])
+        r = R.from_rotvec(lh_rot_clip[i]) * R_offset_left
         xyzw = r.as_quat()
         qpos_wrist_left[i, 3:] = np.concatenate([xyzw[3:], xyzw[:3]])
 
@@ -536,31 +558,55 @@ def main(
             qpos_finger_left[i, j, :3] = lh_joints[i, FINGERTIP_INDICES[j]]
             qpos_finger_left[i, j, 3:] = unit_quat
 
-    # Object pose is the bottom link's world pose; both hands track the same
-    # rigid object.
+    # Object pose is the bottom link's world pose. The Arctic scene has only
+    # ONE object (both hands manipulate it together); ``qpos_obj_left`` is a
+    # zero-padded placeholder so the schema matches the oakinkv2-style empty
+    # left-object body in the generated scene XML.
     for i in range(n):
         r = R.from_rotvec(obj_axang_clip[i])
         xyzw = r.as_quat()
         wxyz = np.concatenate([xyzw[3:], xyzw[:3]])
         qpos_obj_right[i, :3] = obj_trans_clip[i]
         qpos_obj_right[i, 3:] = wxyz
-        qpos_obj_left[i, :3] = obj_trans_clip[i]
-        qpos_obj_left[i, 3:] = wxyz
+    qpos_obj_left[:, :3] = 0.0
+    qpos_obj_left[:, 3:] = unit_quat
 
-    # 10. Lowest-z statistics for floor/plate placement.
+    # 10. Floor offset: shift the entire scene so the bottom-part object's
+    # lowest world-z at the FIRST CLIP FRAME sits at z=0. Arctic captures
+    # have the table well above z=0; without this shift the simulator floor
+    # would sit far below the object and the floor-contact check is wrong.
     visual_mesh = pymeshlab.MeshSet()
     visual_mesh.load_new_mesh(out_mesh)
     obj_verts_local_full = np.asarray(visual_mesh.current_mesh().vertex_matrix())
     R_obj0 = R.from_rotvec(obj_axang_clip[0])
-    obj_verts_world_z_frame0 = float(
+    obj_lowest_z_pre = float(
         (R_obj0.apply(obj_verts_local_full) + qpos_obj_right[0, :3]).min(axis=0)[2]
     )
+    z_offset = -obj_lowest_z_pre
+    loguru.logger.info(
+        f"Floor offset: shifting scene by dz={z_offset:+.3f} m so the "
+        f"object's lowest z at frame 0 (was {obj_lowest_z_pre:+.3f} m) "
+        f"becomes 0."
+    )
+    qpos_wrist_right[:, 2] += z_offset
+    qpos_wrist_left[:, 2] += z_offset
+    qpos_finger_right[:, :, 2] += z_offset
+    qpos_finger_left[:, :, 2] += z_offset
+    qpos_obj_right[:, 2] += z_offset
+    # qpos_obj_left is a zero placeholder (empty left-object body); leave it.
+    # Keep the FK joint arrays aligned for the viser preview.
+    rh_joints[..., 2] += z_offset
+    lh_joints[..., 2] += z_offset
+
     obj_min_z_per_frame = []
     for k in range(n):
         Rk = R.from_rotvec(obj_axang_clip[k])
         zk = (Rk.apply(obj_verts_local_full) + qpos_obj_right[k, :3]).min(axis=0)[2]
         obj_min_z_per_frame.append(zk)
     obj_min_z_traj = float(np.min(obj_min_z_per_frame))
+    obj_first_frame_lowest_z = float(
+        (R_obj0.apply(obj_verts_local_full) + qpos_obj_right[0, :3]).min(axis=0)[2]
+    )
     scene_min_z = float(min(
         obj_min_z_traj,
         qpos_wrist_right[:, 2].min(),
@@ -568,7 +614,7 @@ def main(
         qpos_wrist_left[:, 2].min(),
         qpos_finger_left[:, :, 2].min(),
     ))
-    object_descends = obj_min_z_traj < obj_verts_world_z_frame0 - 0.02
+    object_descends = obj_min_z_traj < obj_first_frame_lowest_z - 0.02
 
     # 11. task_info.
     rel_mesh_dir = str(Path(mesh_dir).relative_to(dataset_dir))
@@ -578,13 +624,20 @@ def main(
         "robot_type": "mano",
         "embodiment_type": embodiment_type,
         "data_id": data_id,
+        # The Arctic scene has ONE object that both hands manipulate. Emit it
+        # only on the right side so generate_xml doesn't build two stacked
+        # free-floating bodies at the same pose. ``qpos_obj_left`` is still
+        # written to the NPZ as a zero-padding so downstream loaders that
+        # always expect both arrays continue to work; the left object body
+        # in the scene XML will be empty (gravcomp=1) like in oakinkv2.
         "right_object_mesh_dir": rel_mesh_dir,
-        "left_object_mesh_dir": rel_mesh_dir,
+        "left_object_mesh_dir": None,
         "ref_dt": 1.0 / target_fps,
         "n_frames": n,
-        "obj_first_frame_lowest_world_z": obj_verts_world_z_frame0,
+        "obj_first_frame_lowest_world_z": obj_first_frame_lowest_z,
         "scene_lowest_world_z": scene_min_z,
         "object_descends_from_frame0": bool(object_descends),
+        "z_offset_applied": z_offset,
         # arctic-specific provenance
         "arctic_subject": subject,
         "arctic_object": obj_name,
@@ -593,9 +646,8 @@ def main(
         "active_hand": active_hand,
         "pre_grasp_seconds": pre_grasp_seconds,
         "post_lift_seconds": post_lift_seconds,
-        "lift_z_thresh": lift_z_thresh,
+        "motion_thresh_m": motion_thresh_m,
         "articulation_discarded": True,
-        "frame0_arti_rad": float(obj_arti[start]),
     }
     task_info_path = f"{output_dir}/../task_info.json"
     with open(task_info_path, "w") as f:
@@ -613,10 +665,9 @@ def main(
     )
     loguru.logger.info(f"Saved qpos to {output_dir}/trajectory_keypoints.npz")
     loguru.logger.info(
-        f"Object frame-0 lowest world z = {obj_verts_world_z_frame0:+.3f} m; "
+        f"After offset: obj frame-0 lowest world z = {obj_first_frame_lowest_z:+.3f} m; "
         f"scene lowest z = {scene_min_z:+.3f} m"
         + (" (object descends from frame 0)" if object_descends else " (object stays above frame-0 z)")
-        + ". Final needs_object_support is decided by decompose_fast/decompose."
     )
 
     if not show_viewer:

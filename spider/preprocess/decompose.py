@@ -35,7 +35,8 @@ def main(
     task: str = "pick_spoon_bowl",
     data_id: int = 0,
     add_flat_base: bool = True,
-    floor_well_below_offset: float = 0.0,
+    plate_size: float = 0.03,
+    plate_thickness: float = 0.01,
 ):
     dataset_dir = os.path.abspath(dataset_dir)
     if embodiment_type == "right":
@@ -138,40 +139,47 @@ def main(
                 low_xy = v_world[near_floor_mask, :2].mean(axis=0)
                 hulls = flatten_base(
                     hulls,
+                    thickness=plate_thickness,
                     R_world_local=R_obj,
                     obj_world_pos=obj_pos,
                     floor_z=obj_min_world_z,
-                    well_below_offset=floor_well_below_offset,
+                    plate_xy=low_xy,
+                    plate_size=plate_size,
                 )
-                plate_top_z = obj_min_world_z - floor_well_below_offset
+                plate_top_z = obj_min_world_z + plate_thickness
                 task_info[f"{hand}_plate_top_world_z"] = float(plate_top_z)
+                task_info[f"{hand}_plate_bottom_world_z"] = float(obj_min_world_z)
                 task_info[f"{hand}_obj_first_frame_xy"] = [
                     float(low_xy[0]),
                     float(low_xy[1]),
                 ]
-                task_info["floor_well_below_offset"] = float(floor_well_below_offset)
-                scene_min_z = task_info.get("scene_lowest_world_z")
-                if scene_min_z is not None:
-                    task_info["needs_object_support"] = bool(
-                        obj_min_world_z > float(scene_min_z) + 0.02
-                    )
-                else:
-                    task_info["needs_object_support"] = True
+                task_info["plate_size"] = float(plate_size)
+                task_info["plate_thickness"] = float(plate_thickness)
                 loguru.logger.info(
-                    f"Added flat base for {hand} hand: plate top at world "
-                    f"z={plate_top_z:.4f} (well_below_offset="
-                    f"{floor_well_below_offset:.3f}m)."
+                    f"Added 3x3cm flat base for {hand} hand: plate bottom at "
+                    f"world z={obj_min_world_z:.4f}, top at z={plate_top_z:.4f} "
+                    "(object lowest z unchanged)."
                 )
             else:
-                hulls = flatten_base(hulls)
+                hulls = flatten_base(
+                    hulls,
+                    thickness=plate_thickness,
+                    plate_size=plate_size,
+                )
                 loguru.logger.warning(
                     f"No first-frame obj pose for {hand} hand; falling back to "
                     "local-frame plate (object may not rest stably on floor)."
                 )
 
-        # ensure output directory exists
+        # ensure output directory exists; clear any prior .obj files so a
+        # smaller decomposition doesn't leave stale hulls from a previous run
+        # (which generate_xml would still load and over-collide).
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
+        else:
+            for stale in os.listdir(output_dir):
+                if stale.endswith(".obj"):
+                    os.remove(os.path.join(output_dir, stale))
         for i, (vs, fs) in enumerate(hulls):
             mesh_part = trimesh.Trimesh(vs, fs)
             part_filename = f"{output_dir}/{i}.obj"

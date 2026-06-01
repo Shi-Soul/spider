@@ -20,5 +20,5 @@ joint_noise_scale: 0.1
 pos_noise_scale: 0.01
 rot_noise_scale: 0.01
 final_noise_scale: 0.01
-object_rot_threshold: 0.5
-max_revert_forward_attempts: 1
+object_rot_threshold: 1.0
+max_local_retries: 3

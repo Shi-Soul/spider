@@ -142,11 +142,33 @@ def compute_object_tracking_error(
         pos_object_left_ref_raw = qpos_object_left_ref[:, :3]
 
         # ADD-AUC3 uses raw world-frame positions (no mean-centering).
-        add_auc3_right = compute_add_auc3(
-            pos_object_right_traj_raw, pos_object_right_ref_raw
+        # Detect single-object setups: a side whose object trajectory has
+        # near-zero displacement is treated as absent and reported as NaN.
+        right_displacement = float(
+            np.linalg.norm(
+                pos_object_right_ref_raw - pos_object_right_ref_raw[:1], axis=1
+            ).mean()
         )
-        add_auc3_left = compute_add_auc3(
-            pos_object_left_traj_raw, pos_object_left_ref_raw
+        left_displacement = float(
+            np.linalg.norm(
+                pos_object_left_ref_raw - pos_object_left_ref_raw[:1], axis=1
+            ).mean()
+        )
+        right_absent = right_displacement < 1e-3
+        left_absent = left_displacement < 1e-3
+        add_auc3_right = (
+            float("nan")
+            if right_absent
+            else compute_add_auc3(
+                pos_object_right_traj_raw, pos_object_right_ref_raw
+            )
+        )
+        add_auc3_left = (
+            float("nan")
+            if left_absent
+            else compute_add_auc3(
+                pos_object_left_traj_raw, pos_object_left_ref_raw
+            )
         )
 
         pos_object_right_traj = (
@@ -212,7 +234,8 @@ def compute_object_tracking_error(
         else:
             obj_pos_err = (pos_err_right + pos_err_left) / 2
             obj_quat_err = (quat_err_right + quat_err_left) / 2
-            add_auc3_mean = (add_auc3_right + add_auc3_left) / 2
+            # nanmean: if one side is N/A, mean equals the other side.
+            add_auc3_mean = float(np.nanmean([add_auc3_right, add_auc3_left]))
     else:
         if use_act:
             qpos_object_traj = qpos_traj[:, -6:]
@@ -236,13 +259,18 @@ def compute_object_tracking_error(
 
         # ADD-AUC3 uses raw world-frame positions (no mean-centering).
         add_auc3_unimanual = compute_add_auc3(pos_object_traj, pos_object_ref)
+        # The "off" side is absent in unimanual setups -- report NaN there.
 
         pos_err_right = obj_pos_err if embodiment_type == "right" else 0.0
         pos_err_left = obj_pos_err if embodiment_type == "left" else 0.0
         quat_err_right = obj_quat_err if embodiment_type == "right" else 0.0
         quat_err_left = obj_quat_err if embodiment_type == "left" else 0.0
-        add_auc3_right = add_auc3_unimanual if embodiment_type == "right" else 0.0
-        add_auc3_left = add_auc3_unimanual if embodiment_type == "left" else 0.0
+        add_auc3_right = (
+            add_auc3_unimanual if embodiment_type == "right" else float("nan")
+        )
+        add_auc3_left = (
+            add_auc3_unimanual if embodiment_type == "left" else float("nan")
+        )
         add_auc3_mean = add_auc3_unimanual
 
     return {

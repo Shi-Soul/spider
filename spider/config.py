@@ -120,7 +120,7 @@ class Config:
     terminate_resample: bool = False
     object_pos_threshold: float = 0.1
     object_rot_threshold: float = 0.3
-    max_revert_forward_attempts: int = 3
+    max_local_retries: int = 3
     max_revert_depth: int = 3
     base_pos_threshold: float = 0.5
     base_rot_threshold: float = 0.4

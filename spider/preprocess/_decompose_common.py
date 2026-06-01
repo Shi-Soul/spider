@@ -17,36 +17,44 @@ def flatten_base(
     R_world_local: np.ndarray | None = None,
     obj_world_pos: np.ndarray | None = None,
     floor_z: float = 0.0,
-    pad: float = 0.05,
-    well_below_offset: float = 0.0,
+    plate_xy: np.ndarray | tuple[float, float] | None = None,
+    plate_size: float = 0.03,
 ) -> list[MeshPart]:
-    """Append a thin plate that supports the object resting on a world-frame floor.
+    """Append a thin support plate body-fixed to the object.
 
-    If ``R_world_local`` and ``obj_world_pos`` are given, the plate is added in
-    the object's *local* frame so that, when the free joint is set to
-    (obj_world_pos, R_world_local), the plate's TOP sits at ``floor_z`` (minus
-    ``well_below_offset``) and the plate extends ``thickness`` downward from
-    there. With ``well_below_offset=0.0`` (the default) the plate's top is
-    flush with the object's lowest world-frame vertex.
+    The plate is a small (``plate_size`` x ``plate_size``) square whose BOTTOM
+    sits at the object's lowest world-frame z (``floor_z``) and TOP at
+    ``floor_z + thickness``. The plate lives *inside* the object's lower bbox
+    so it adds no height below the object — the object's effective lowest z
+    is unchanged.
 
-    Otherwise (the legacy behavior), the plate is placed at the convex hull's
-    local-frame ``min_z``.
+    If ``R_world_local`` and ``obj_world_pos`` are given, the plate is built
+    in world coordinates centered at ``plate_xy`` (default: object's lowest
+    contact xy in world frame), then transformed into the object's local
+    frame so it follows the body.
 
-    The plate's XY extent is the object's world-frame bbox padded by ``pad``
-    so it is large enough to support the object even if it tilts slightly.
+    Otherwise (legacy fallback), the plate is added in the convex hull's
+    local frame at the hull's ``min_z`` with the same small footprint.
     """
     hull_list = list(hulls)
     if not hull_list:
         return hull_list
 
     all_vertices = np.vstack([vertices for vertices, _ in hull_list])
+    half = plate_size / 2.0
 
     if R_world_local is not None and obj_world_pos is not None:
-        v_world = (R_world_local @ all_vertices.T).T + obj_world_pos
-        wx_min, wx_max = v_world[:, 0].min() - pad, v_world[:, 0].max() + pad
-        wy_min, wy_max = v_world[:, 1].min() - pad, v_world[:, 1].max() + pad
-        z_top = floor_z - well_below_offset
-        z_bot = z_top - thickness
+        if plate_xy is None:
+            v_world = (R_world_local @ all_vertices.T).T + obj_world_pos
+            cx = float(0.5 * (v_world[:, 0].min() + v_world[:, 0].max()))
+            cy = float(0.5 * (v_world[:, 1].min() + v_world[:, 1].max()))
+        else:
+            cx = float(plate_xy[0])
+            cy = float(plate_xy[1])
+        wx_min, wx_max = cx - half, cx + half
+        wy_min, wy_max = cy - half, cy + half
+        z_bot = floor_z
+        z_top = floor_z + thickness
         corners_world_top = np.array(
             [
                 [wx_min, wy_min, z_top],
@@ -60,21 +68,21 @@ def flatten_base(
         corners_world = np.vstack([corners_world_bot, corners_world_top])
         plate_vertices = (R_world_local.T @ (corners_world - obj_world_pos).T).T
     else:
-        min_x, max_x = np.min(all_vertices[:, 0]), np.max(all_vertices[:, 0])
-        min_y, max_y = np.min(all_vertices[:, 1]), np.max(all_vertices[:, 1])
-        min_z = np.min(all_vertices[:, 2])
+        cx = float(0.5 * (all_vertices[:, 0].min() + all_vertices[:, 0].max()))
+        cy = float(0.5 * (all_vertices[:, 1].min() + all_vertices[:, 1].max()))
+        min_z = float(all_vertices[:, 2].min())
         z0 = min_z
         z1 = min_z + thickness
         plate_vertices = np.array(
             [
-                [min_x, min_y, z0],
-                [max_x, min_y, z0],
-                [max_x, max_y, z0],
-                [min_x, max_y, z0],
-                [min_x, min_y, z1],
-                [max_x, min_y, z1],
-                [max_x, max_y, z1],
-                [min_x, max_y, z1],
+                [cx - half, cy - half, z0],
+                [cx + half, cy - half, z0],
+                [cx + half, cy + half, z0],
+                [cx - half, cy + half, z0],
+                [cx - half, cy - half, z1],
+                [cx + half, cy - half, z1],
+                [cx + half, cy + half, z1],
+                [cx - half, cy + half, z1],
             ]
         )
 
