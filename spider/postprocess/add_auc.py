@@ -27,7 +27,7 @@ def _trapezoid(y: np.ndarray, x: np.ndarray) -> float:
 def compute_add_auc(
     achieved_position: np.ndarray,
     target_position: np.ndarray,
-    max_threshold: float = 0.03,
+    max_threshold: float = 0.1,
     num_points: int = 100,
 ) -> float:
     """Returns the AUC of the success-rate curve over [0, max_threshold].
@@ -51,15 +51,15 @@ def compute_add_auc(
     return _trapezoid(success, normalized_thresholds)
 
 
-def compute_add_auc3(
+def compute_add_auc10(
     achieved_position: np.ndarray,
     target_position: np.ndarray,
     num_points: int = 100,
 ) -> float:
-    """ADD-AUC integrated over thresholds in [0, 3] cm."""
+    """ADD-AUC integrated over thresholds in [0, 10] cm."""
     return compute_add_auc(
         achieved_position,
         target_position,
-        max_threshold=0.03,
+        max_threshold=0.1,
         num_points=num_points,
     )
