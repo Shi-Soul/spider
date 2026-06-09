@@ -482,8 +482,16 @@ def make_optimize_fn_fast(optimize_once):  # noqa: D103
             last_info = info
             best_qpos = info["recorded_qpos"]
 
-            avail = min(config.ctrl_steps, ref_slice[0].shape[0] - 1)
-            ref_qpos_slice = ref_slice[0][1 : avail + 1]
+            # Time alignment: ref_slice[0][i] = qpos_ref[sim_step + 1 + i]
+            # (built via get_slice(ref_data, s+1, s+horizon+1) in run_mjwp_fast).
+            # recorded_qpos[i] is the state AFTER step_env applied ctrls[i],
+            # so it lives at sim time (sim_step + i + 1) * sim_dt — exactly
+            # ref index sim_step + 1 + i. So recorded_qpos[i] aligns with
+            # ref_slice[0][i], not ref_slice[0][i+1] (the previous code was
+            # off by one ref step, exaggerating tracking error by ~1 dt of
+            # natural reference motion).
+            avail = min(config.ctrl_steps, ref_slice[0].shape[0])
+            ref_qpos_slice = ref_slice[0][:avail]
             check_qpos = best_qpos[:avail]
 
             exceeded, error_info = check_tracking_error(

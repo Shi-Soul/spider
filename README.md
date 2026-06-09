@@ -102,28 +102,18 @@ uv sync
 ```
 
 If you already have the example datasets cloned, you can skip the preprocessing step where we convert the human data to robot kinematic trajectories.
-Run SPIDER on a processed trial:
+Pick one of the three reference tasks below — each picks the right
+``+override=…`` Hydra config and the right ``task`` / ``embodiment_type``
+for that dataset:
 
 ```bash
-# for gigahand dataset
-export TASK=p36-tea
-export HAND_TYPE=bimanual
-export DATA_ID=0
-export ROBOT_TYPE=xhand
-export DATASET_NAME=gigahand
+uv run examples/run_mjwp_fast.py +override=gigahand_fast    task=p36-tea          embodiment_type=bimanual data_id=0 robot_type=xhand
+uv run examples/run_mjwp_fast.py +override=arcticv2_fast    task=s01-box_use_01   embodiment_type=bimanual data_id=0 robot_type=xhand
+uv run examples/run_mjwp_fast.py +override=oakinkv2_fast    task=pick_spoon_bowl  embodiment_type=right    data_id=0 robot_type=xhand
 
-# for oakinkv2 dataset (recommended: pre-processed to start from picking stage)
-export TASK=pick_spoon_bowl
-export HAND_TYPE=right
-export DATA_ID=0
-export ROBOT_TYPE=xhand
-export DATASET_NAME=oakinkv2
-
-# run retargeting
-uv run examples/run_mjwp.py +override=${DATASET_NAME}
-
-# to use original (slower) config from the paper, add _origin suffix
-uv run examples/run_mjwp.py +override=${DATASET_NAME}_origin
+# To use the original (slower) config from the paper, add the _origin
+# suffix to the override (gigahand only ships _origin currently):
+uv run examples/run_mjwp.py +override=gigahand_origin task=p36-tea embodiment_type=bimanual
 ```
 
 > Note: ``oakinkv2`` is the recommended OakInk pipeline. It loads directly
@@ -133,6 +123,13 @@ uv run examples/run_mjwp.py +override=${DATASET_NAME}_origin
 > target. The legacy ``oakink`` pipeline (which consumes the
 > already-baked maniptrans pickles starting after the grasp) is still
 > available via ``+override=oakink``, but for new work prefer ``oakinkv2``.
+
+> Note: ``arcticv2`` reads Arctic raw_seqs and clips to a 4 s window
+> centered on the object's motion onset (default 2 s pre / 2 s post). Only
+> the object's bottom part is kept (rigid). Tasks are named
+> ``<subject>-<sequence>``, e.g. ``s01-box_use_01``,
+> ``s01-ketchup_use_01``, ``s01-laptop_use_01`` — see ``ARCTIC_OBJECTS`` in
+> ``spider/process_datasets/arcticv2.py`` for the supported objects.
 
 For full workflow, please refer to the [Workflow](#workflow) section.
 
@@ -166,6 +163,11 @@ Please refer to [Native Mujoco Wrap workflow](docs/workflows/workflow-mjwp.md) f
 
 - supports dexterous hand and humanoid robot retargeting
 
+The pipeline is the same for every dataset:
+``process_datasets → decompose(_fast) → [detect_contact] → generate_xml →
+ik(_fast) → run_mjwp(_fast) → [read_to_robot]``. Only step 1 (the dataset
+processor) is dataset-specific. Below, one canonical task per dataset.
+
 ```bash
 TASK=p36-tea
 HAND_TYPE=bimanual
@@ -173,36 +175,47 @@ DATA_ID=0
 ROBOT_TYPE=xhand
 DATASET_NAME=gigahand
 
-# put your raw data under folder raw/{dataset_name/ in your dataset folder
+# raw data lives under ${dataset_dir}/raw/gigahand/
 
-# read data from self collected dataset
-uv run spider/process_datasets/gigahand.py --task=${TASK} --embodiment-type=${HAND_TYPE} --data-id=${DATA_ID}
+# 1. read raw dataset → unified NPZ schema
+# Gigahand — bimanual tea-pot pour (p36-tea)
+uv run examples/run_mjwp.py +override=gigahand \
+    task=p36-tea embodiment_type=bimanual data_id=0 robot_type=xhand
 
-# decompose object
-# here we use fast decompose pipeline with mink
-# you can also use decompose.py for original decompose pipeline with CoACD for higher quality decomposition
-uv run spider/preprocess/decompose_fast.py --task=${TASK} --dataset-name=${DATASET_NAME} --data-id=${DATA_ID} --embodiment-type=${HAND_TYPE}
+# Arctic-v2 — bimanual box pick (s01/box_use_01)
+uv run examples/run_mjwp.py +override=arcticv2 \
+    task=s01-box_use_01 embodiment_type=bimanual data_id=0 robot_type=xhand
 
-# detect contact (optional)
+# OakInk-v2 — right-hand spoon pick (pick_spoon_bowl)
+uv run examples/run_mjwp.py +override=oakinkv2 \
+    task=pick_spoon_bowl embodiment_type=right data_id=0 robot_type=xhand
+
+# 2. decompose object
+# default uses CoACD (accurate but slow); decompose_fast.py is a heuristic alternative
+uv run spider/preprocess/decompose.py     --task=${TASK} --dataset-name=${DATASET_NAME} --data-id=${DATA_ID} --embodiment-type=${HAND_TYPE}
+
+# 3. (optional) detect contact
 uv run spider/preprocess/detect_contact.py --task=${TASK} --dataset-name=${DATASET_NAME} --data-id=${DATA_ID} --embodiment-type=${HAND_TYPE}
 
-# generate scene
-uv run spider/preprocess/generate_xml.py --task=${TASK} --dataset-name=${DATASET_NAME} --data-id=${DATA_ID} --embodiment-type=${HAND_TYPE} --robot-type=${ROBOT_TYPE}
+# 4. generate scene XML
+uv run spider/preprocess/generate_xml.py   --task=${TASK} --dataset-name=${DATASET_NAME} --data-id=${DATA_ID} --embodiment-type=${HAND_TYPE} --robot-type=${ROBOT_TYPE}
 
-# kinematic retargeting
-# here we use fast IK pipeline with mink
-# you can also use ik.py for original ik pipeline with mujoco (used in paper)
-uv run spider/preprocess/ik_fast.py --task=${TASK} --dataset-name=${DATASET_NAME} --data-id=${DATA_ID} --embodiment-type=${HAND_TYPE} --robot-type=${ROBOT_TYPE}
+# 5. kinematic retargeting (mink-based fast IK; ik.py is the slower paper version)
+uv run spider/preprocess/ik_fast.py        --task=${TASK} --dataset-name=${DATASET_NAME} --data-id=${DATA_ID} --embodiment-type=${HAND_TYPE} --robot-type=${ROBOT_TYPE}
 
-# retargeting
-uv run examples/run_mjwp.py +override=${DATASET_NAME} task=${TASK} data_id=${DATA_ID} robot_type=${ROBOT_TYPE} embodiment_type=${HAND_TYPE}
+# 6. physics retargeting
+uv run examples/run_mjwp.py      +override=${DATASET_NAME}      task=${TASK} data_id=${DATA_ID} robot_type=${ROBOT_TYPE} embodiment_type=${HAND_TYPE}
+# faster, sampling-based variant:
+uv run examples/run_mjwp_fast.py +override=${DATASET_NAME}_fast task=${TASK} data_id=${DATA_ID} robot_type=${ROBOT_TYPE} embodiment_type=${HAND_TYPE}
 
-# experimental feature: automatic parameter tuning, useful when reference trajectory is bad
-uv run examples/run_mjwp_fast.py +override=${DATASET_NAME}_fast
-
-# read data for deployment (optional)
+# 7. (optional) export for robot deployment
 uv run spider/postprocess/read_to_robot.py --task=${TASK} --dataset-name=${DATASET_NAME} --data-id=${DATA_ID} --robot-type=${ROBOT_TYPE} --embodiment-type=${HAND_TYPE}
 ```
+
+> Headless rendering: ``ik_fast.py`` and ``run_mjwp_fast.py`` save MP4
+> previews via ``mujoco.Renderer``. On a machine without a display, prefix
+> the command with ``MUJOCO_GL=egl`` (or ``osmesa``) — otherwise GLFW
+> fails to init and the run aborts before saving.
 
 ### DexMachina Workflow
 

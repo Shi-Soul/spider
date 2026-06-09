@@ -20,6 +20,7 @@ from scipy.spatial.transform import Rotation as R
 
 from spider import ROOT
 from spider.io import get_all_tasks, get_processed_data_dir
+from spider.postprocess.add_auc import compute_add_auc10
 
 DEFAULT_REF_DT = 0.02
 DEFAULT_SIM_DT = 0.01
@@ -135,21 +136,52 @@ def compute_object_tracking_error(
             qpos_object_right_ref = qpos_ref[:, -14:-7]
             qpos_object_left_ref = qpos_ref[:, -7:]
 
-        pos_object_right_traj = qpos_object_right_traj[:, :3]
-        pos_object_left_traj = qpos_object_left_traj[:, :3]
-        pos_object_right_ref = qpos_object_right_ref[:, :3]
-        pos_object_left_ref = qpos_object_left_ref[:, :3]
+        pos_object_right_traj_raw = qpos_object_right_traj[:, :3]
+        pos_object_left_traj_raw = qpos_object_left_traj[:, :3]
+        pos_object_right_ref_raw = qpos_object_right_ref[:, :3]
+        pos_object_left_ref_raw = qpos_object_left_ref[:, :3]
 
-        pos_object_right_traj = pos_object_right_traj - pos_object_right_traj.mean(
+        # ADD-AUC10 uses raw world-frame positions (no mean-centering).
+        # Detect single-object setups: a side whose object trajectory has
+        # near-zero displacement is treated as absent and reported as NaN.
+        right_displacement = float(
+            np.linalg.norm(
+                pos_object_right_ref_raw - pos_object_right_ref_raw[:1], axis=1
+            ).mean()
+        )
+        left_displacement = float(
+            np.linalg.norm(
+                pos_object_left_ref_raw - pos_object_left_ref_raw[:1], axis=1
+            ).mean()
+        )
+        right_absent = right_displacement < 1e-3
+        left_absent = left_displacement < 1e-3
+        add_auc10_right = (
+            float("nan")
+            if right_absent
+            else compute_add_auc10(
+                pos_object_right_traj_raw, pos_object_right_ref_raw
+            )
+        )
+        add_auc10_left = (
+            float("nan")
+            if left_absent
+            else compute_add_auc10(
+                pos_object_left_traj_raw, pos_object_left_ref_raw
+            )
+        )
+
+        pos_object_right_traj = (
+            pos_object_right_traj_raw
+            - pos_object_right_traj_raw.mean(axis=0, keepdims=True)
+        )
+        pos_object_left_traj = pos_object_left_traj_raw - pos_object_left_traj_raw.mean(
             axis=0, keepdims=True
         )
-        pos_object_left_traj = pos_object_left_traj - pos_object_left_traj.mean(
+        pos_object_right_ref = pos_object_right_ref_raw - pos_object_right_ref_raw.mean(
             axis=0, keepdims=True
         )
-        pos_object_right_ref = pos_object_right_ref - pos_object_right_ref.mean(
-            axis=0, keepdims=True
-        )
-        pos_object_left_ref = pos_object_left_ref - pos_object_left_ref.mean(
+        pos_object_left_ref = pos_object_left_ref_raw - pos_object_left_ref_raw.mean(
             axis=0, keepdims=True
         )
 
@@ -194,12 +226,16 @@ def compute_object_tracking_error(
         if left_mask:
             obj_pos_err = pos_err_right
             obj_quat_err = quat_err_right
+            add_auc10_mean = add_auc10_right
         elif right_mask:
             obj_pos_err = pos_err_left
             obj_quat_err = quat_err_left
+            add_auc10_mean = add_auc10_left
         else:
             obj_pos_err = (pos_err_right + pos_err_left) / 2
             obj_quat_err = (quat_err_right + quat_err_left) / 2
+            # nanmean: if one side is N/A, mean equals the other side.
+            add_auc10_mean = float(np.nanmean([add_auc10_right, add_auc10_left]))
     else:
         if use_act:
             qpos_object_traj = qpos_traj[:, -6:]
@@ -221,10 +257,21 @@ def compute_object_tracking_error(
         obj_pos_err = np.linalg.norm(pos_object_traj - pos_object_ref, axis=1).mean()
         obj_quat_err = np.linalg.norm(quat_sub(quat_traj, quat_ref), axis=1).mean()
 
+        # ADD-AUC10 uses raw world-frame positions (no mean-centering).
+        add_auc10_unimanual = compute_add_auc10(pos_object_traj, pos_object_ref)
+        # The "off" side is absent in unimanual setups -- report NaN there.
+
         pos_err_right = obj_pos_err if embodiment_type == "right" else 0.0
         pos_err_left = obj_pos_err if embodiment_type == "left" else 0.0
         quat_err_right = obj_quat_err if embodiment_type == "right" else 0.0
         quat_err_left = obj_quat_err if embodiment_type == "left" else 0.0
+        add_auc10_right = (
+            add_auc10_unimanual if embodiment_type == "right" else float("nan")
+        )
+        add_auc10_left = (
+            add_auc10_unimanual if embodiment_type == "left" else float("nan")
+        )
+        add_auc10_mean = add_auc10_unimanual
 
     return {
         "obj_pos_err": obj_pos_err,
@@ -233,6 +280,9 @@ def compute_object_tracking_error(
         "pos_err_left": pos_err_left,
         "quat_err_right": quat_err_right,
         "quat_err_left": quat_err_left,
+        "add_auc10_right": add_auc10_right,
+        "add_auc10_left": add_auc10_left,
+        "add_auc10_mean": add_auc10_mean,
     }
 
 
@@ -424,6 +474,9 @@ def main(
             pos_err_left = errors["pos_err_left"]
             quat_err_right = errors["quat_err_right"]
             quat_err_left = errors["quat_err_left"]
+            add_auc10_right = errors["add_auc10_right"]
+            add_auc10_left = errors["add_auc10_left"]
+            add_auc10_mean = errors["add_auc10_mean"]
 
             # compute success
             success = (obj_pos_err <= pos_err_threshold) & (
@@ -448,6 +501,9 @@ def main(
                 "success": success,
                 "pos_err_threshold": pos_err_threshold,
                 "quat_err_threshold": quat_err_threshold,
+                "add_auc10_right": add_auc10_right,
+                "add_auc10_left": add_auc10_left,
+                "add_auc10_mean": add_auc10_mean,
             }
 
             # Convert to single-row dataframe
@@ -495,6 +551,9 @@ def main(
             "success",
             "pos_err_threshold",
             "quat_err_threshold",
+            "add_auc10_right",
+            "add_auc10_left",
+            "add_auc10_mean",
         ]
     ].copy()
 

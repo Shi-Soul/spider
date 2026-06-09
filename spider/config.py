@@ -35,6 +35,14 @@ class Config:
     task: str = "pick_spoon_bowl"
     seed: int = 0
 
+    # === SANITY CHECK CONFIGURATION ===
+    # Holds controls at ctrl_ref[0] for sanity_check_seconds and verifies the
+    # object does not drift more than the thresholds. Set seconds to 0.0 to
+    # disable the check.
+    sanity_check_seconds: float = 3.0
+    sanity_check_pos_thresh: float = 0.01
+    sanity_check_rot_thresh: float = 0.3
+
     # === DATASET CONFIGURATION ===
     dataset_dir: str = f"{spider.ROOT}/../example_datasets"
     dataset_name: str = "oakink"
@@ -112,7 +120,7 @@ class Config:
     terminate_resample: bool = False
     object_pos_threshold: float = 0.1
     object_rot_threshold: float = 0.3
-    max_revert_forward_attempts: int = 3
+    max_local_retries: int = 3
     max_revert_depth: int = 3
     base_pos_threshold: float = 0.5
     base_rot_threshold: float = 0.4

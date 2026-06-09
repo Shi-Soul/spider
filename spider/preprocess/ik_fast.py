@@ -17,6 +17,7 @@ Author: Chaoyi Pan
 Date: 2026-03-07
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -33,11 +34,26 @@ from spider.mujoco_utils import get_viewer
 
 # MANO 21-joint skeleton bones (parent -> child) for reference visualization
 _MANO_SKELETON_BONES = [
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (0, 9), (9, 10), (10, 11), (11, 12),
-    (0, 13), (13, 14), (14, 15), (15, 16),
-    (0, 17), (17, 18), (18, 19), (19, 20),
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 4),
+    (0, 5),
+    (5, 6),
+    (6, 7),
+    (7, 8),
+    (0, 9),
+    (9, 10),
+    (10, 11),
+    (11, 12),
+    (0, 13),
+    (13, 14),
+    (14, 15),
+    (15, 16),
+    (0, 17),
+    (17, 18),
+    (18, 19),
+    (19, 20),
 ]
 _MANO_FINGERTIP_INDICES = [4, 8, 12, 16, 20]
 
@@ -52,22 +68,30 @@ def _build_ref_skeleton(server, mano_assets_root, qpos_ref, ref_idx, embodiment_
     """
     if "right" in embodiment_type or embodiment_type == "bimanual":
         wrist_idx = ref_idx["right_palm"]
-        tip_idxs = [ref_idx[f"right_{n}"] for n in
-                    ["thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip"]]
+        tip_idxs = [
+            ref_idx[f"right_{n}"]
+            for n in ["thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip"]
+        ]
     elif "left" in embodiment_type:
         wrist_idx = ref_idx["left_palm"]
-        tip_idxs = [ref_idx[f"left_{n}"] for n in
-                    ["thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip"]]
+        tip_idxs = [
+            ref_idx[f"left_{n}"]
+            for n in ["thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip"]
+        ]
     else:
         return None
 
     wrist_h = server.scene.add_icosphere(
-        "ref_hand/wrist", radius=0.012, color=(80, 130, 220),
+        "ref_hand/wrist",
+        radius=0.012,
+        color=(80, 130, 220),
         position=tuple(qpos_ref[0, wrist_idx, :3]),
     )
     tip_handles = [
         server.scene.add_icosphere(
-            f"ref_hand/tip_{i}", radius=0.008, color=(220, 80, 80),
+            f"ref_hand/tip_{i}",
+            radius=0.008,
+            color=(220, 80, 80),
             position=tuple(qpos_ref[0, tidx, :3]),
         )
         for i, tidx in enumerate(tip_idxs)
@@ -76,10 +100,9 @@ def _build_ref_skeleton(server, mano_assets_root, qpos_ref, ref_idx, embodiment_
     for tidx in tip_idxs:
         h = server.scene.add_spline_catmull_rom(
             f"ref_hand/bone_w_to_{tidx}",
-            positions=np.stack([
-                qpos_ref[0, wrist_idx, :3], qpos_ref[0, tidx, :3]
-            ]),
-            color=(255, 200, 50), line_width=2.5,
+            positions=np.stack([qpos_ref[0, wrist_idx, :3], qpos_ref[0, tidx, :3]]),
+            color=(255, 200, 50),
+            line_width=2.5,
         )
         bone_handles.append((h, tidx))
 
@@ -100,7 +123,8 @@ def main(
     robot_type: str = "xhand",
     embodiment_type: str = "bimanual",
     task: str = "pick_spoon_bowl",
-    show_viewer: bool = False,
+    show_viewer: bool = True,
+    show_viser_viewer: bool = False,
     save_video: bool = True,
     save_viser: bool = False,
     mano_assets_root: str | None = None,
@@ -108,7 +132,7 @@ def main(
     start_idx: int = 0,
     end_idx: int = -1,
     sim_dt: float = 0.005,
-    ref_dt: float = 0.02,
+    ref_dt: float | None = None,
     wrist_pos_cost: float = 0.3,
     wrist_ori_cost: float = 3.0,
     finger_pos_cost: float = 10.0,
@@ -138,6 +162,24 @@ def main(
     )
     os.makedirs(processed_dir_robot, exist_ok=True)
     model_path = f"{processed_dir_robot}/../scene.xml"
+
+    # Resolve ref_dt: prefer the per-task value the dataset processor wrote
+    # to task_info.json (mocap rate varies per dataset — Arctic 30 Hz,
+    # OakInk2 50 Hz, etc.) so IK plays back at the recorded rate. Fall back
+    # to 50 Hz / 0.02 s only if no task_info is present.
+    task_info_path = Path(processed_dir_mano).parent / "task_info.json"
+    if ref_dt is None:
+        if task_info_path.exists():
+            with open(task_info_path) as f:
+                ref_dt = float(json.load(f).get("ref_dt", 0.02))
+            loguru.logger.info(
+                f"ref_dt={ref_dt:.4f}s ({1.0/ref_dt:.1f}Hz) loaded from {task_info_path}"
+            )
+        else:
+            ref_dt = 0.02
+            loguru.logger.warning(
+                f"No task_info.json at {task_info_path}; defaulting ref_dt=0.02s"
+            )
 
     # Load reference keypoints
     file_path = f"{processed_dir_mano}/trajectory_keypoints.npz"
@@ -187,7 +229,7 @@ def main(
 
     # -- Viser setup (optional) --
     viser_state = {"enabled": False}
-    if show_viewer or save_viser:
+    if show_viser_viewer or save_viser:
         try:
             from spider.viewers.viser_viewer import (
                 _STATE as _VISER_STATE,
@@ -366,9 +408,11 @@ def main(
             if viser_state["enabled"]:
                 mujoco.mj_forward(model, data)
                 viser_state["log_frame"](
-                    data, sim_time=t * ref_dt,
+                    data,
+                    sim_time=t * ref_dt,
                     viewer_body_entity_and_ids=viser_state["body_ids"],
-                    show_ui=True, playback_fps=1.0 / ref_dt,
+                    show_ui=True,
+                    playback_fps=1.0 / ref_dt,
                 )
                 if ref_skeleton is not None:
                     ref_skeleton(t)
@@ -456,7 +500,7 @@ def main(
         except Exception as e:
             loguru.logger.warning(f"Failed to save viser scene: {e}")
 
-    if show_viewer and viser_state["enabled"]:
+    if show_viser_viewer and viser_state["enabled"]:
         loguru.logger.info(
             "Viser viewer running. Use timeline slider in browser. Ctrl-C to exit."
         )

@@ -226,3 +226,6 @@ example_video_data/
 example_video_data
 tmp_datasets/
 .claude/
+
+sandbox/
+scripts/
