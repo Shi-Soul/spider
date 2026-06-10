@@ -20,7 +20,7 @@ from spider.tasks.g1_wbc.math_utils import (
     quat_apply_inverse,
     subtract_frame_transforms,
 )
-from spider.tasks.g1_wbc.motion import G1Motion
+from spider.tasks.g1_wbc.motion import G1CommandBatch, G1Motion
 
 
 class HistoryBuffer:
@@ -78,7 +78,7 @@ class RobotState:
 class G1WbcObservationBuilder:
     """Build the actor observation used by the WXY G1 WBC checkpoints."""
 
-    motion: G1Motion
+    motion: G1Motion | G1CommandBatch
     num_envs: int
     default_joint_pos: torch.Tensor
     device: torch.device | str
@@ -132,6 +132,17 @@ class G1WbcObservationBuilder:
     def _ref_fields(self, ref_indices: torch.Tensor) -> dict[str, torch.Tensor]:
         ref_indices = ref_indices.clamp(0, self.motion.num_frames - 1)
         cmd_body_idx = self._command_body_indices
+        if isinstance(self.motion, G1CommandBatch):
+            env_ids = torch.arange(ref_indices.shape[0], device=ref_indices.device)
+            return {
+                "joint_pos": self.motion.joint_pos[ref_indices, env_ids],
+                "joint_vel": self.motion.joint_vel[ref_indices, env_ids],
+                "body_pos_w": self.motion.body_pos_w[ref_indices, env_ids][:, cmd_body_idx],
+                "body_quat_w": self.motion.body_quat_w[ref_indices, env_ids][:, cmd_body_idx],
+                "body_ang_vel_w": self.motion.body_ang_vel_w[ref_indices, env_ids][
+                    :, cmd_body_idx
+                ],
+            }
         return {
             "joint_pos": self.motion.joint_pos[ref_indices],
             "joint_vel": self.motion.joint_vel[ref_indices],

@@ -124,6 +124,19 @@ def axis_angle_from_quat(quat: torch.Tensor, eps: float = 1.0e-6) -> torch.Tenso
     return quat[..., 1:4] / denom.unsqueeze(-1)
 
 
+def quat_from_axis_angle(axis_angle: torch.Tensor, eps: float = 1.0e-8) -> torch.Tensor:
+    """Convert an axis-angle vector to a quaternion in wxyz convention."""
+
+    angle = torch.linalg.norm(axis_angle, dim=-1, keepdim=True)
+    axis = axis_angle / angle.clamp(min=eps)
+    half_angle = 0.5 * angle
+    sin_half = torch.sin(half_angle)
+    quat = torch.cat([torch.cos(half_angle), axis * sin_half], dim=-1)
+    identity = torch.zeros_like(quat)
+    identity[..., 0] = 1.0
+    return torch.where(angle <= eps, identity, normalize(quat))
+
+
 def quat_error_magnitude(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
     return torch.norm(axis_angle_from_quat(quat_mul(q1, quat_conjugate(q2))), dim=-1)
 

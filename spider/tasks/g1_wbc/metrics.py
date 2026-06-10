@@ -135,6 +135,77 @@ def compute_rollout_metrics(
     return metrics
 
 
+def compute_rollout_scores(
+    motion: G1Motion,
+    rollout: RolloutResult,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Return one scalar score per rollout world/sample plus per-sample terms."""
+
+    device = rollout.qpos.device
+    motion = motion.to(device)
+    ref_idx = rollout.ref_indices.to(device)
+
+    ref_qpos = motion.qpos()[ref_idx]
+    ref_body_pos = motion.body_pos_w[ref_idx]
+    ref_body_quat = motion.body_quat_w[ref_idx]
+    ref_contact = motion.contact[ref_idx]
+
+    root_pos_err = torch.linalg.norm(rollout.qpos[..., :3] - ref_qpos[..., :3], dim=-1)
+    root_rot_err = quat_error_magnitude(rollout.qpos[..., 3:7], ref_qpos[..., 3:7])
+    joint_pos_err = torch.linalg.norm(rollout.qpos[..., 7:] - ref_qpos[..., 7:], dim=-1)
+
+    body_pos_err = torch.linalg.norm(rollout.body_pos_w - ref_body_pos, dim=-1)
+    body_rot_err = quat_error_magnitude(rollout.body_quat_w, ref_body_quat)
+    ee_indices = torch.tensor(
+        [MUJOCO_BODY_NAMES.index(name) for name in TASK_EE_BODY_NAMES],
+        dtype=torch.long,
+        device=device,
+    )
+    ee_pos_err = body_pos_err.index_select(-1, ee_indices)
+    ee_rot_err = body_rot_err.index_select(-1, ee_indices)
+    local_pos_err, local_rot_err = _local_body_errors(
+        rollout.body_pos_w,
+        rollout.body_quat_w,
+        ref_body_pos,
+        ref_body_quat,
+        ee_indices,
+    )
+
+    sim_contact_eval = rollout.contact_indicator[1:]
+    ref_contact_eval = ref_contact[1:]
+    contact_err = (sim_contact_eval - ref_contact_eval).abs()
+    contact_switch = _switch_rate(sim_contact_eval)
+    ctrl_delta = _diff_norm(rollout.controls)
+    joint_acc = _diff_norm(rollout.qvel[..., 6:]) / max(float(rollout.dt), 1.0e-6)
+
+    terms = {
+        "root_pos_error": _per_env_mean(root_pos_err),
+        "root_rot_error": _per_env_mean(root_rot_err),
+        "joint_pos_error": _per_env_mean(joint_pos_err),
+        "body_global_pos_error": _per_env_mean(body_pos_err),
+        "body_global_rot_error": _per_env_mean(body_rot_err),
+        "ee_global_pos_error": _per_env_mean(ee_pos_err),
+        "ee_global_rot_error": _per_env_mean(ee_rot_err),
+        "ee_local_pos_error": _per_env_mean(local_pos_err),
+        "ee_local_rot_error": _per_env_mean(local_rot_err),
+        "contact_mismatch": _per_env_mean(contact_err),
+        "contact_switch": _per_env_mean(contact_switch),
+        "control_delta": _per_env_mean(ctrl_delta),
+        "joint_acc": _per_env_mean(joint_acc),
+    }
+    score = -(
+        4.0 * terms["contact_mismatch"]
+        + 2.0 * terms["contact_switch"]
+        + 3.0 * terms["ee_global_pos_error"]
+        + 2.0 * terms["ee_local_pos_error"]
+        + 1.5 * terms["root_pos_error"]
+        + 0.5 * terms["root_rot_error"]
+        + 0.25 * terms["joint_pos_error"]
+        + 0.05 * terms["control_delta"]
+    )
+    return score, terms
+
+
 def _local_body_errors(
     body_pos: torch.Tensor,
     body_quat: torch.Tensor,
@@ -194,3 +265,15 @@ def _max(value: torch.Tensor) -> float:
     if value.numel() == 0:
         return 0.0
     return float(torch.nan_to_num(value.float()).max().detach().cpu().item())
+
+
+def _per_env_mean(value: torch.Tensor) -> torch.Tensor:
+    if value.numel() == 0:
+        env_count = value.shape[1] if value.ndim >= 2 else 0
+        return torch.zeros(env_count, dtype=torch.float32, device=value.device)
+    if value.ndim < 2:
+        return torch.nan_to_num(value.float())
+    env_count = value.shape[1]
+    return torch.nan_to_num(value.float()).reshape(value.shape[0], env_count, -1).mean(
+        dim=(0, 2)
+    )

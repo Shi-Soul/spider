@@ -22,7 +22,10 @@ from spider.tasks.g1_wbc.constants import (
     RIGHT_FOOT_BODY_NAME,
 )
 from spider.tasks.g1_wbc.math_utils import (
+    axis_angle_from_quat,
     finite_difference_root_velocity,
+    quat_inv,
+    quat_mul,
     quat_error_magnitude,
     world_velocity_to_qvel,
 )
@@ -99,6 +102,52 @@ class G1Motion:
             body_lin_vel_w=self.body_lin_vel_w.to(device),
             body_ang_vel_w=self.body_ang_vel_w.to(device),
             contact=self.contact.to(device),
+        )
+
+
+@dataclass
+class G1CommandBatch:
+    path: Path
+    motion_type: Literal["mujoco", "isaaclab"]
+    fps: float
+    joint_pos: torch.Tensor
+    joint_vel: torch.Tensor
+    body_pos_w: torch.Tensor
+    body_quat_w: torch.Tensor
+    body_lin_vel_w: torch.Tensor
+    body_ang_vel_w: torch.Tensor
+    qpos_trajectory: torch.Tensor
+    qvel_trajectory: torch.Tensor
+
+    @property
+    def num_frames(self) -> int:
+        return int(self.joint_pos.shape[0])
+
+    @property
+    def num_envs(self) -> int:
+        return int(self.joint_pos.shape[1])
+
+    @property
+    def device(self) -> torch.device:
+        return self.joint_pos.device
+
+    @property
+    def body_index(self) -> dict[str, int]:
+        return {name: i for i, name in enumerate(MUJOCO_BODY_NAMES)}
+
+    def to(self, device: str | torch.device) -> "G1CommandBatch":
+        return G1CommandBatch(
+            path=self.path,
+            motion_type=self.motion_type,
+            fps=self.fps,
+            joint_pos=self.joint_pos.to(device),
+            joint_vel=self.joint_vel.to(device),
+            body_pos_w=self.body_pos_w.to(device),
+            body_quat_w=self.body_quat_w.to(device),
+            body_lin_vel_w=self.body_lin_vel_w.to(device),
+            body_ang_vel_w=self.body_ang_vel_w.to(device),
+            qpos_trajectory=self.qpos_trajectory.to(device),
+            qvel_trajectory=self.qvel_trajectory.to(device),
         )
 
 
@@ -313,3 +362,42 @@ def root_pose_error(a_qpos: torch.Tensor, b_qpos: torch.Tensor) -> tuple[torch.T
     rot = quat_error_magnitude(a_qpos[..., 3:7], b_qpos[..., 3:7])
     return pos, rot
 
+
+def qvel_from_qpos_trajectory(qpos: torch.Tensor, dt: float = POLICY_DT) -> torch.Tensor:
+    """Finite-difference a qpos trajectory into MuJoCo qvel convention."""
+
+    if qpos.ndim == 2:
+        qpos_batched = qpos[:, None, :]
+        squeeze = True
+    elif qpos.ndim == 3:
+        qpos_batched = qpos
+        squeeze = False
+    else:
+        raise ValueError(f"Expected qpos shape (T, 36) or (T, N, 36), got {qpos.shape}")
+    if qpos_batched.shape[-1] != QPOS_DIM:
+        raise ValueError(f"Expected qpos dim {QPOS_DIM}, got {qpos_batched.shape}")
+
+    qvel = torch.zeros(
+        qpos_batched.shape[:-1] + (QVEL_DIM,),
+        dtype=qpos_batched.dtype,
+        device=qpos_batched.device,
+    )
+    if qpos_batched.shape[0] <= 1:
+        return qvel[:, 0] if squeeze else qvel
+
+    lin_vel = torch.zeros_like(qvel[..., :3])
+    ang_vel_w = torch.zeros_like(qvel[..., :3])
+    joint_vel = torch.zeros_like(qpos_batched[..., 7:])
+
+    lin_vel[:-1] = (qpos_batched[1:, :, :3] - qpos_batched[:-1, :, :3]) / dt
+    lin_vel[-1] = lin_vel[-2]
+    delta_quat = quat_mul(qpos_batched[1:, :, 3:7], quat_inv(qpos_batched[:-1, :, 3:7]))
+    ang_vel_w[:-1] = axis_angle_from_quat(delta_quat) / dt
+    ang_vel_w[-1] = ang_vel_w[-2]
+    joint_vel[:-1] = (qpos_batched[1:, :, 7:] - qpos_batched[:-1, :, 7:]) / dt
+    joint_vel[-1] = joint_vel[-2]
+
+    root_world_vel = torch.cat([lin_vel, ang_vel_w], dim=-1)
+    qvel[..., :6] = world_velocity_to_qvel(qpos_batched[..., :7], root_world_vel)
+    qvel[..., 6:] = joint_vel
+    return qvel[:, 0] if squeeze else qvel

@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from spider.tasks.g1_wbc.metrics import compute_rollout_metrics
+from spider.tasks.g1_wbc.mpc import G1WbcMpcConfig, optimize_mpc_command
 from spider.tasks.g1_wbc.motion import load_motion, validate_motion_dims
 from spider.tasks.g1_wbc.policy import load_wbc_actor, resolve_checkpoint_path
 from spider.tasks.g1_wbc.rollout import RolloutResult, WbcRolloutConfig, run_no_mpc_rollout
@@ -26,20 +27,54 @@ def main() -> None:
     actor = load_wbc_actor(args.checkpoint, device=device)
     checkpoint_path = resolve_checkpoint_path(args.checkpoint)
 
-    if args.method != "no_mpc":
-        raise NotImplementedError("Only no_mpc rollout is implemented in this batch.")
-
     config = WbcRolloutConfig(
         model_path=args.model_path,
         device=device,
-        num_envs=args.num_envs,
+        num_envs=args.num_envs if args.method == "no_mpc" else 1,
         max_steps=args.max_steps,
         ref_offset=args.ref_offset,
         nconmax_per_env=args.nconmax_per_env,
         njmax_per_env=args.njmax_per_env,
         sync_after_step=args.sync_after_step,
     )
-    rollout = run_no_mpc_rollout(motion, actor, config)
+    mpc_payload = None
+    mpc_result = None
+    if args.method == "no_mpc":
+        rollout = run_no_mpc_rollout(motion, actor, config)
+    else:
+        mpc_config = G1WbcMpcConfig(
+            mode=args.method,
+            num_samples=args.mpc_samples,
+            num_iterations=args.mpc_iterations,
+            elite_frac=args.mpc_elite_frac,
+            temperature=args.mpc_temperature,
+            root_pos_sigma=args.mpc_root_pos_sigma,
+            root_rot_sigma=args.mpc_root_rot_sigma,
+            joint_sigma=args.mpc_joint_sigma,
+            sigma_decay=args.mpc_sigma_decay,
+            smooth_passes=args.mpc_smooth_passes,
+            command_reg_weight=args.mpc_command_reg_weight,
+            command_smooth_weight=args.mpc_command_smooth_weight,
+            seed=args.seed,
+        )
+        mpc_result = optimize_mpc_command(motion, actor, config, mpc_config)
+        rollout = mpc_result.rollout
+        mpc_payload = {
+            "num_samples": args.mpc_samples,
+            "num_iterations": args.mpc_iterations,
+            "elite_frac": args.mpc_elite_frac,
+            "temperature": args.mpc_temperature,
+            "root_pos_sigma": args.mpc_root_pos_sigma,
+            "root_rot_sigma": args.mpc_root_rot_sigma,
+            "joint_sigma": args.mpc_joint_sigma,
+            "sigma_decay": args.mpc_sigma_decay,
+            "smooth_passes": args.mpc_smooth_passes,
+            "command_reg_weight": args.mpc_command_reg_weight,
+            "command_smooth_weight": args.mpc_command_smooth_weight,
+            "history": [vars(item) for item in mpc_result.history],
+            "final_scores_mean": _safe_tensor_stat(mpc_result.scores, "mean"),
+            "final_scores_max": _safe_tensor_stat(mpc_result.scores, "max"),
+        }
     metrics = compute_rollout_metrics(motion, rollout)
 
     payload = {
@@ -53,6 +88,8 @@ def main() -> None:
         "ref_offset": args.ref_offset,
         "metrics": metrics,
     }
+    if mpc_payload is not None:
+        payload["mpc"] = mpc_payload
     print(json.dumps(payload, indent=2, sort_keys=True))
 
     if args.output_dir is not None:
@@ -62,6 +99,8 @@ def main() -> None:
         metrics_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         if args.save_rollout:
             _save_rollout(output_dir / "rollout.npz", rollout)
+            if mpc_result is not None:
+                _save_mpc_result(output_dir / "mpc_command.npz", mpc_result)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -81,7 +120,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--method",
         default="no_mpc",
-        choices=("no_mpc",),
+        choices=("no_mpc", "g1_wbc_ee", "g1_wbc_joint"),
         help="Evaluation method to run.",
     )
     parser.add_argument(
@@ -112,6 +151,18 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Save rollout tensors to rollout.npz when output-dir is set.",
     )
+    parser.add_argument("--mpc-samples", type=int, default=64)
+    parser.add_argument("--mpc-iterations", type=int, default=3)
+    parser.add_argument("--mpc-elite-frac", type=float, default=0.125)
+    parser.add_argument("--mpc-temperature", type=float, default=0.7)
+    parser.add_argument("--mpc-root-pos-sigma", type=float, default=0.015)
+    parser.add_argument("--mpc-root-rot-sigma", type=float, default=0.035)
+    parser.add_argument("--mpc-joint-sigma", type=float, default=0.06)
+    parser.add_argument("--mpc-sigma-decay", type=float, default=0.75)
+    parser.add_argument("--mpc-smooth-passes", type=int, default=2)
+    parser.add_argument("--mpc-command-reg-weight", type=float, default=0.10)
+    parser.add_argument("--mpc-command-smooth-weight", type=float, default=0.0003)
+    parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
 
@@ -133,8 +184,31 @@ def _save_rollout(path: Path, rollout: RolloutResult) -> None:
     np.savez_compressed(path, **arrays)
 
 
+def _save_mpc_result(path: Path, result) -> None:
+    arrays = {
+        "refined_qpos": _cpu_np(result.refined_qpos),
+        "candidate_scores": _cpu_np(result.scores),
+        "command_joint_pos": _cpu_np(result.command.joint_pos),
+        "command_joint_vel": _cpu_np(result.command.joint_vel),
+        "command_body_pos_w": _cpu_np(result.command.body_pos_w),
+        "command_body_quat_w": _cpu_np(result.command.body_quat_w),
+        "command_qpos_trajectory": _cpu_np(result.command.qpos_trajectory),
+        "command_qvel_trajectory": _cpu_np(result.command.qvel_trajectory),
+    }
+    np.savez_compressed(path, **arrays)
+
+
 def _cpu_np(value: torch.Tensor) -> np.ndarray:
     return value.detach().cpu().numpy()
+
+
+def _safe_tensor_stat(value: torch.Tensor, stat: str) -> float:
+    if value.numel() == 0:
+        return 0.0
+    value = torch.nan_to_num(value.float())
+    if stat == "max":
+        return float(value.max().detach().cpu().item())
+    return float(value.mean().detach().cpu().item())
 
 
 if __name__ == "__main__":

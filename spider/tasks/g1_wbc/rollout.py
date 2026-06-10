@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import mujoco
@@ -26,7 +26,11 @@ from spider.tasks.g1_wbc.constants import (
     QVEL_DIM,
     RIGHT_FOOT_BODY_NAME,
 )
-from spider.tasks.g1_wbc.motion import G1Motion
+from spider.tasks.g1_wbc.motion import (
+    G1CommandBatch,
+    G1Motion,
+    qvel_from_qpos_trajectory,
+)
 from spider.tasks.g1_wbc.obs import G1WbcObservationBuilder, RobotState
 from spider.tasks.g1_wbc.policy import WbcActor
 
@@ -351,22 +355,46 @@ def run_no_mpc_rollout(
 
     device = torch.device(config.device)
     motion = motion.to(device)
+    return run_command_rollout(
+        motion,
+        actor,
+        config,
+        initial_qpos=motion.qpos()[0],
+        initial_qvel=motion.qvel()[0],
+    )
+
+
+def run_command_rollout(
+    command: G1Motion | G1CommandBatch,
+    actor: WbcActor,
+    config: WbcRolloutConfig,
+    *,
+    initial_qpos: torch.Tensor,
+    initial_qvel: torch.Tensor,
+) -> RolloutResult:
+    """Roll out the WBC actor with a motion or batched refined command source."""
+
+    device = torch.device(config.device)
+    command = command.to(device)
     actor = actor.to(device)
     actor.eval()
 
-    total_steps = motion.num_frames
+    if isinstance(command, G1CommandBatch) and command.num_envs != config.num_envs:
+        raise ValueError(
+            f"Command batch has {command.num_envs} envs, config has {config.num_envs}."
+        )
+
+    total_steps = command.num_frames
     if config.max_steps is not None:
         total_steps = min(total_steps, int(config.max_steps))
     if total_steps < 1:
         raise ValueError("Need at least one rollout step.")
 
     env = G1WbcMujocoWarpEnv(config)
-    qpos_ref = motion.qpos()
-    qvel_ref = motion.qvel()
-    env.reset(qpos_ref[0], qvel_ref[0])
+    env.reset(initial_qpos, initial_qvel)
 
     obs_builder = G1WbcObservationBuilder(
-        motion=motion,
+        motion=command,
         num_envs=config.num_envs,
         default_joint_pos=env.default_joint_pos,
         device=device,
@@ -405,7 +433,7 @@ def run_no_mpc_rollout(
     with torch.inference_mode():
         for step_idx in range(total_steps):
             ref_idx_scalar = min(
-                max(step_idx + int(config.ref_offset), 0), motion.num_frames - 1
+                max(step_idx + int(config.ref_offset), 0), command.num_frames - 1
             )
             ref_idx = torch.full(
                 (config.num_envs,), ref_idx_scalar, dtype=torch.long, device=device
@@ -447,6 +475,77 @@ def run_no_mpc_rollout(
         contact_indicator=torch.stack(contact_indicator, dim=0),
         contact_force=torch.stack(contact_force, dim=0),
         ref_indices=torch.stack(ref_indices, dim=0),
+    )
+
+
+def command_batch_from_qpos_trajectory(
+    template_motion: G1Motion,
+    qpos_trajectory: torch.Tensor,
+    config: WbcRolloutConfig,
+    *,
+    preserve_template_first: bool = False,
+) -> G1CommandBatch:
+    """Convert batched refined qpos trajectories into WBC command fields."""
+
+    device = torch.device(config.device)
+    template_motion = template_motion.to(device)
+    qpos_trajectory = qpos_trajectory.to(device, dtype=torch.float32)
+    if qpos_trajectory.ndim == 2:
+        qpos_trajectory = qpos_trajectory[:, None, :]
+    if qpos_trajectory.ndim != 3 or qpos_trajectory.shape[-1] != QPOS_DIM:
+        raise ValueError(
+            "Expected qpos trajectory shape (T, N, 36) or (T, 36), "
+            f"got {qpos_trajectory.shape}."
+        )
+
+    num_envs = int(qpos_trajectory.shape[1])
+    qvel_trajectory = qvel_from_qpos_trajectory(qpos_trajectory, dt=POLICY_DT)
+    kin_config = replace(config, num_envs=num_envs, max_steps=None)
+    env = G1WbcMujocoWarpEnv(kin_config)
+
+    body_pos = []
+    body_quat = []
+    body_lin_vel = []
+    body_ang_vel = []
+    with torch.inference_mode():
+        for frame_idx in range(qpos_trajectory.shape[0]):
+            env.reset(qpos_trajectory[frame_idx], qvel_trajectory[frame_idx])
+            state = env.robot_state()
+            body_pos.append(state.body_pos_w.detach().clone())
+            body_quat.append(state.body_quat_w.detach().clone())
+            body_lin_vel.append(state.body_lin_vel_w.detach().clone())
+            body_ang_vel.append(state.body_ang_vel_w.detach().clone())
+
+    joint_pos = qpos_trajectory[..., 7:].contiguous()
+    joint_vel = qvel_trajectory[..., 6:].contiguous()
+    body_pos_w = torch.stack(body_pos, dim=0)
+    body_quat_w = torch.stack(body_quat, dim=0)
+    body_lin_vel_w = torch.stack(body_lin_vel, dim=0)
+    body_ang_vel_w = torch.stack(body_ang_vel, dim=0)
+
+    if preserve_template_first:
+        frame_count = qpos_trajectory.shape[0]
+        joint_pos[:, 0] = template_motion.joint_pos[:frame_count]
+        joint_vel[:, 0] = template_motion.joint_vel[:frame_count]
+        body_pos_w[:, 0] = template_motion.body_pos_w[:frame_count]
+        body_quat_w[:, 0] = template_motion.body_quat_w[:frame_count]
+        body_lin_vel_w[:, 0] = template_motion.body_lin_vel_w[:frame_count]
+        body_ang_vel_w[:, 0] = template_motion.body_ang_vel_w[:frame_count]
+        qpos_trajectory[:, 0] = template_motion.qpos()[:frame_count]
+        qvel_trajectory[:, 0] = template_motion.qvel()[:frame_count]
+
+    return G1CommandBatch(
+        path=template_motion.path,
+        motion_type=template_motion.motion_type,
+        fps=template_motion.fps,
+        joint_pos=joint_pos,
+        joint_vel=joint_vel,
+        body_pos_w=body_pos_w,
+        body_quat_w=body_quat_w,
+        body_lin_vel_w=body_lin_vel_w,
+        body_ang_vel_w=body_ang_vel_w,
+        qpos_trajectory=qpos_trajectory.contiguous(),
+        qvel_trajectory=qvel_trajectory.contiguous(),
     )
 
 
