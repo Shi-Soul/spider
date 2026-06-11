@@ -22,7 +22,12 @@ DEFAULT_DATASETS = [
     "/home/bai/ARC/Dataset/TeleAI-MoCap-Hangzhou/G1-29dof-BYDnpz-50fps-segmented_2k/mocap2_interp10",
 ]
 
-DEFAULT_METHODS = ["direct", "no_mpc", "g1_wbc_joint", "g1_wbc_ee"]
+DEFAULT_METHODS = [
+    "no_mpc",
+    "g1_wbc_joint",
+    "g1_wbc_joint_global",
+    "g1_wbc_ee",
+]
 DEFAULT_CKPTS = ["bc", "bcrl"]
 
 
@@ -73,7 +78,7 @@ def run_eval(
         "--nconmax-per-env", str(nconmax_per_env),
         "--njmax-per-env", str(njmax_per_env),
     ]
-    if method not in ("direct", "no_mpc"):
+    if method != "no_mpc":
         cmd += ["--mpc-preset", mpc_preset]
         optional_args = {
             "--mpc-samples": mpc_samples,

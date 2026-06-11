@@ -31,7 +31,7 @@ from spider.tasks.g1_wbc.rollout import (
     run_command_rollout,
 )
 
-MpcMode = Literal["g1_wbc_ee", "g1_wbc_joint"]
+MpcMode = Literal["g1_wbc_ee", "g1_wbc_joint", "g1_wbc_joint_global"]
 MpcPreset = Literal["aggressive", "conservative"]
 
 
@@ -383,8 +383,13 @@ def _guided_delta_from_no_mpc(
     )
     quat_err = quat_mul(base_qpos[:, 3:7], quat_inv(executed[:, 3:7]))
     guided[:, 3:6] = axis_angle_from_quat(quat_err) * float(config.guided_root_rot_gain)
+    joint_gain = (
+        0.0
+        if config.mode in ("g1_wbc_ee", "g1_wbc_joint_global")
+        else float(config.guided_joint_gain)
+    )
     guided[:, 6:] = (base_qpos[:, 7:] - executed[:, 7:]) * float(
-        config.guided_joint_gain
+        joint_gain
     )
     guided[:, :3] = guided[:, :3].clamp(
         -float(config.guided_root_pos_clip), float(config.guided_root_pos_clip)
@@ -434,19 +439,42 @@ def _score_from_terms(
 ) -> torch.Tensor:
     if mode == "g1_wbc_ee":
         return -(
-            5.0 * terms["contact_mismatch"]
+            4.0 * terms["contact_false_positive"]
+            + 3.0 * terms["contact_false_negative"]
             + 3.0 * terms["contact_switch"]
+            + 0.6 * terms["contact_force_excess"]
+            + 0.3 * terms["contact_force_delta"]
             + 5.0 * terms["ee_global_pos_error"]
-            + 2.0 * terms["ee_local_pos_error"]
+            + 2.5 * terms["ee_local_pos_error"]
+            + 0.6 * terms["ee_global_rot_error"]
+            + 0.3 * terms["ee_local_rot_error"]
             + 1.0 * terms["root_pos_error"]
-            + 0.5 * terms["root_rot_error"]
-            + 0.12 * terms["joint_pos_error"]
-            + 0.35 * terms["control_delta"]
-            + 0.0025 * terms["joint_acc"]
+            + 0.4 * terms["root_rot_error"]
+            + 0.40 * terms["control_delta"]
+            + 0.0030 * terms["joint_acc"]
+        )
+    if mode == "g1_wbc_joint_global":
+        return -(
+            4.0 * terms["contact_false_positive"]
+            + 3.0 * terms["contact_false_negative"]
+            + 3.0 * terms["contact_switch"]
+            + 0.5 * terms["contact_force_excess"]
+            + 0.25 * terms["contact_force_delta"]
+            + 2.5 * terms["body_global_pos_error"]
+            + 0.8 * terms["body_global_rot_error"]
+            + 2.0 * terms["ee_global_pos_error"]
+            + 0.8 * terms["ee_global_rot_error"]
+            + 1.5 * terms["root_pos_error"]
+            + 0.4 * terms["root_rot_error"]
+            + 0.20 * terms["control_delta"]
+            + 0.0015 * terms["joint_acc"]
         )
     return -(
-        5.0 * terms["contact_mismatch"]
+        4.0 * terms["contact_false_positive"]
+        + 3.0 * terms["contact_false_negative"]
         + 3.0 * terms["contact_switch"]
+        + 0.5 * terms["contact_force_excess"]
+        + 0.25 * terms["contact_force_delta"]
         + 2.0 * terms["body_global_pos_error"]
         + 0.6 * terms["body_global_rot_error"]
         + 1.2 * terms["joint_pos_error"]

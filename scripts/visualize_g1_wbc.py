@@ -3,9 +3,9 @@
 
 Modes:
   --method no_mpc         : no-MPC rollout with reference ghost
-  --method direct         : direct joint target rollout with reference ghost
   --method g1_wbc_joint   : MPC joint rollout with reference ghost
-  --method compare-all    : direct + no-MPC + MPC joint + MPC EE panels
+  --method g1_wbc_joint_global : MPC global-only joint rollout with reference ghost
+  --method compare-all    : no-MPC + MPC joint/global/EE panels
   --method saved          : render --saved-rollout/--saved-command trajectories
   --method compare        : no-MPC + MPC joint/EE panels
 
@@ -41,7 +41,6 @@ from spider.tasks.g1_wbc.mpc import (
 from spider.tasks.g1_wbc.rollout import (
     WbcRolloutConfig,
     load_wbc_model,
-    run_direct_rollout,
     run_no_mpc_rollout,
 )
 
@@ -123,10 +122,11 @@ def main():
     p.add_argument("--motion-type", default="isaaclab")
     p.add_argument("--checkpoint", default="bc")
     p.add_argument("--method", default="compare",
-                   choices=("direct", "no_mpc", "g1_wbc_joint", "g1_wbc_ee",
+                   choices=("no_mpc", "g1_wbc_joint",
+                            "g1_wbc_joint_global", "g1_wbc_ee",
                             "compare", "compare-all", "saved"))
     p.add_argument("--compare-with", default="g1_wbc_joint",
-                   choices=("g1_wbc_joint", "g1_wbc_ee"))
+                   choices=("g1_wbc_joint", "g1_wbc_joint_global", "g1_wbc_ee"))
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--max-steps", type=int, default=250)
     p.add_argument("--nconmax-per-env", type=int, default=WbcRolloutConfig.nconmax_per_env)
@@ -206,15 +206,6 @@ def main():
     )
 
     def run_method(method):
-        if method == "direct":
-            qpos = motion.qpos()[: args.max_steps or motion.num_frames]
-            r = run_direct_rollout(
-                qpos,
-                cfg,
-                initial_qpos=motion.qpos()[0],
-                initial_qvel=motion.qvel()[0],
-            )
-            return r.qpos[:, 0].cpu().numpy(), method
         if method == "no_mpc":
             r = run_no_mpc_rollout(motion, actor, cfg)
             return r.qpos[:, 0].cpu().numpy(), method
@@ -252,9 +243,9 @@ def main():
         sims = [run_method("no_mpc"), run_method(args.compare_with)]
     elif args.method == "compare-all":
         sims = [
-            run_method("direct"),
             run_method("no_mpc"),
             run_method("g1_wbc_joint"),
+            run_method("g1_wbc_joint_global"),
             run_method("g1_wbc_ee"),
         ]
     else:

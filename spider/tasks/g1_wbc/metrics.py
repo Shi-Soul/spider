@@ -78,6 +78,9 @@ def compute_rollout_metrics(
     false_negative = ((sim_contact_eval <= 0.5) & (ref_contact_eval > 0.5)).float()
     contact_switch = _switch_rate(sim_contact_eval)
     ref_contact_switch = _switch_rate(ref_contact_eval)
+    contact_force = rollout.contact_force[1:]
+    contact_force_excess = _contact_force_excess(contact_force)
+    contact_force_delta = _diff_norm(contact_force) / _contact_force_scale()
 
     action_delta = _diff_norm(rollout.actions)
     ctrl_delta = _diff_norm(rollout.controls)
@@ -105,9 +108,11 @@ def compute_rollout_metrics(
         "contact_switch_rate": _mean(contact_switch),
         "reference_contact_switch_rate": _mean(ref_contact_switch),
         "contact_force_active_mean": _active_force_mean(
-            rollout.contact_force[1:], sim_contact_eval
+            contact_force, sim_contact_eval
         ),
-        "contact_force_peak": _max(rollout.contact_force[1:]),
+        "contact_force_peak": _max(contact_force),
+        "contact_force_excess_mean": _mean(contact_force_excess),
+        "contact_force_delta_mean": _mean(contact_force_delta),
         "action_delta_mean": _mean(action_delta),
         "control_delta_mean": _mean(ctrl_delta),
         "joint_acc_mean": _mean(joint_acc),
@@ -174,7 +179,12 @@ def compute_rollout_scores(
     sim_contact_eval = rollout.contact_indicator[1:]
     ref_contact_eval = ref_contact[1:]
     contact_err = (sim_contact_eval - ref_contact_eval).abs()
+    false_positive = ((sim_contact_eval > 0.5) & (ref_contact_eval <= 0.5)).float()
+    false_negative = ((sim_contact_eval <= 0.5) & (ref_contact_eval > 0.5)).float()
     contact_switch = _switch_rate(sim_contact_eval)
+    contact_force = rollout.contact_force[1:]
+    contact_force_excess = _contact_force_excess(contact_force)
+    contact_force_delta = _diff_norm(contact_force) / _contact_force_scale()
     ctrl_delta = _diff_norm(rollout.controls)
     joint_acc = _diff_norm(rollout.qvel[..., 6:]) / max(float(rollout.dt), 1.0e-6)
 
@@ -189,7 +199,11 @@ def compute_rollout_scores(
         "ee_local_pos_error": _per_env_mean(local_pos_err),
         "ee_local_rot_error": _per_env_mean(local_rot_err),
         "contact_mismatch": _per_env_mean(contact_err),
+        "contact_false_positive": _per_env_mean(false_positive),
+        "contact_false_negative": _per_env_mean(false_negative),
         "contact_switch": _per_env_mean(contact_switch),
+        "contact_force_excess": _per_env_mean(contact_force_excess),
+        "contact_force_delta": _per_env_mean(contact_force_delta),
         "control_delta": _per_env_mean(ctrl_delta),
         "joint_acc": _per_env_mean(joint_acc),
     }
@@ -253,6 +267,14 @@ def _active_force_mean(force: torch.Tensor, contact: torch.Tensor) -> float:
     if not torch.any(mask):
         return 0.0
     return _mean(force[mask])
+
+
+def _contact_force_scale() -> float:
+    return 300.0
+
+
+def _contact_force_excess(force: torch.Tensor) -> torch.Tensor:
+    return torch.relu(force - _contact_force_scale()) / _contact_force_scale()
 
 
 def _mean(value: torch.Tensor) -> float:

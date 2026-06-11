@@ -13,7 +13,7 @@ from spider.tasks.g1_wbc.metrics import compute_rollout_metrics
 from spider.tasks.g1_wbc.mpc import G1WbcMpcConfig, mpc_config_from_preset, optimize_mpc_command
 from spider.tasks.g1_wbc.motion import load_motion, validate_motion_dims
 from spider.tasks.g1_wbc.policy import load_wbc_actor, resolve_checkpoint_path
-from spider.tasks.g1_wbc.rollout import RolloutResult, WbcRolloutConfig, run_direct_rollout, run_no_mpc_rollout
+from spider.tasks.g1_wbc.rollout import RolloutResult, WbcRolloutConfig, run_no_mpc_rollout
 
 
 def main() -> None:
@@ -24,11 +24,8 @@ def main() -> None:
 
     motion = load_motion(args.motion, motion_type=args.motion_type, device=device)
     validate_motion_dims(motion)
-    actor = None
-    checkpoint_path = None
-    if args.method != "direct":
-        actor = load_wbc_actor(args.checkpoint, device=device)
-        checkpoint_path = resolve_checkpoint_path(args.checkpoint)
+    actor = load_wbc_actor(args.checkpoint, device=device)
+    checkpoint_path = resolve_checkpoint_path(args.checkpoint)
 
     config = WbcRolloutConfig(
         model_path=args.model_path,
@@ -47,15 +44,7 @@ def main() -> None:
     if args.method == "no_mpc":
         assert actor is not None
         rollout = run_no_mpc_rollout(motion, actor, config)
-    elif args.method == "direct":
-        qpos = motion.qpos()[:config.max_steps or motion.num_frames]
-        rollout = run_direct_rollout(
-            qpos, config,
-            initial_qpos=motion.qpos()[0],
-            initial_qvel=motion.qvel()[0],
-        )
     else:
-        assert actor is not None
         mpc_config = _build_mpc_config(args)
         mpc_result = optimize_mpc_command(motion, actor, config, mpc_config)
         rollout = mpc_result.rollout
@@ -128,7 +117,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--method",
         default="no_mpc",
-        choices=("no_mpc", "direct", "g1_wbc_ee", "g1_wbc_joint"),
+        choices=(
+            "no_mpc",
+            "g1_wbc_ee",
+            "g1_wbc_joint",
+            "g1_wbc_joint_global",
+        ),
         help="Evaluation method to run.",
     )
     parser.add_argument(
