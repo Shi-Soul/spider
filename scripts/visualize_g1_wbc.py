@@ -47,6 +47,7 @@ from spider.tasks.g1_wbc.rollout import (
 
 
 GHOST_RGBA = np.array([0.0, 0.85, 1.0, 0.45], dtype=np.float32)
+LIGHT_MODE_FIXED = 0
 
 
 def render_panel(
@@ -114,6 +115,27 @@ def robot_geom_ids(model):
             continue
         ids.append(geom_id)
     return np.asarray(ids, dtype=np.int32)
+
+
+def configure_global_lighting(model):
+    """Use world-fixed lighting so brightness does not track the robot."""
+
+    model.vis.headlight.ambient[:] = (0.35, 0.35, 0.35)
+    model.vis.headlight.diffuse[:] = (0.45, 0.45, 0.45)
+    model.vis.headlight.specular[:] = (0.05, 0.05, 0.05)
+    fixed_lights = (
+        ((-3.0, -4.0, 6.0), (3.0, 4.0, -6.0), (0.55, 0.55, 0.55)),
+        ((4.0, 2.0, 5.0), (-4.0, -2.0, -5.0), (0.35, 0.35, 0.35)),
+        ((0.0, 5.0, 4.0), (0.0, -5.0, -4.0), (0.25, 0.25, 0.25)),
+    )
+    for light_id in range(model.nlight):
+        pos, direction, diffuse = fixed_lights[min(light_id, len(fixed_lights) - 1)]
+        model.light_mode[light_id] = LIGHT_MODE_FIXED
+        model.light_pos[light_id] = pos
+        model.light_dir[light_id] = direction
+        model.light_diffuse[light_id] = diffuse
+        model.light_ambient[light_id] = (0.12, 0.12, 0.12)
+        model.light_specular[light_id] = (0.05, 0.05, 0.05)
 
 
 def make_follow_camera(ref_qpos, sim_qpos, *, distance, azimuth, elevation):
@@ -308,6 +330,7 @@ def main():
         sims.extend(saved_sims)
 
     model = load_wbc_model(cfg.model_path)
+    configure_global_lighting(model)
     model.vis.global_.offwidth = args.width
     model.vis.global_.offheight = args.height
     renderer = mujoco.Renderer(model, height=args.height, width=args.width)
