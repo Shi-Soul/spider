@@ -6,10 +6,14 @@ Modes:
   --method direct         : direct joint target rollout with reference ghost
   --method g1_wbc_joint   : MPC joint rollout with reference ghost
   --method compare-all    : direct + no-MPC + MPC joint + MPC EE panels
+  --method saved          : render --saved-rollout/--saved-command trajectories
   --method compare        : no-MPC + MPC joint/EE panels
 
 Usage (from tracking_bfm venv):
   python scripts/visualize_g1_wbc.py --motion MOTION.npz --method compare
+  python scripts/visualize_g1_wbc.py --motion MOTION.npz --method saved \
+    --saved-rollout no_mpc:/path/to/rollout.npz \
+    --saved-command mpc_joint:/path/to/mpc_command.npz
 """
 
 from __future__ import annotations
@@ -120,7 +124,7 @@ def main():
     p.add_argument("--checkpoint", default="bc")
     p.add_argument("--method", default="compare",
                    choices=("direct", "no_mpc", "g1_wbc_joint", "g1_wbc_ee",
-                            "compare", "compare-all"))
+                            "compare", "compare-all", "saved"))
     p.add_argument("--compare-with", default="g1_wbc_joint",
                    choices=("g1_wbc_joint", "g1_wbc_ee"))
     p.add_argument("--device", default="cuda:0")
@@ -161,6 +165,26 @@ def main():
     p.add_argument("--mpc-root-rot-sigma", type=float, default=None)
     p.add_argument("--mpc-joint-sigma", type=float, default=None)
     p.add_argument("--seed", type=int, default=G1WbcMpcConfig.seed)
+    p.add_argument(
+        "--saved-rollout",
+        action="append",
+        default=[],
+        metavar="LABEL:PATH",
+        help="Append qpos from a saved evaluate.py --save-rollout rollout.npz.",
+    )
+    p.add_argument(
+        "--saved-command",
+        action="append",
+        default=[],
+        metavar="LABEL:PATH",
+        help="Append qpos from a saved evaluate.py MPC mpc_command.npz.",
+    )
+    p.add_argument(
+        "--saved-env-index",
+        type=int,
+        default=0,
+        help="Environment index to render from saved batched arrays.",
+    )
     p.add_argument("--width", type=int, default=960)
     p.add_argument("--height", type=int, default=540)
     args = p.parse_args()
@@ -169,7 +193,9 @@ def main():
     device = torch.device(args.device)
     motion_path = Path(args.motion).expanduser().resolve()
     motion = load_motion(motion_path, motion_type=args.motion_type, device=device)
-    actor = load_wbc_actor(args.checkpoint, device=device)
+    actor = None
+    if args.method != "saved" or not (args.saved_rollout or args.saved_command):
+        actor = load_wbc_actor(args.checkpoint, device=device)
     cfg = WbcRolloutConfig(
         device=str(device),
         max_steps=args.max_steps,
@@ -211,7 +237,18 @@ def main():
         r = optimize_mpc_command(motion, actor, cfg, mpc)
         return r.rollout.qpos[:, 0].cpu().numpy(), method
 
-    if args.method == "compare":
+    saved_sims = load_saved_sims(
+        args.saved_rollout,
+        args.saved_command,
+        env_index=args.saved_env_index,
+        max_steps=args.max_steps,
+    )
+
+    if args.method == "saved":
+        if not saved_sims:
+            raise ValueError("--method saved requires --saved-rollout or --saved-command.")
+        sims = saved_sims
+    elif args.method == "compare":
         sims = [run_method("no_mpc"), run_method(args.compare_with)]
     elif args.method == "compare-all":
         sims = [
@@ -222,6 +259,8 @@ def main():
         ]
     else:
         sims = [run_method(args.method)]
+    if args.method != "saved":
+        sims.extend(saved_sims)
 
     model = load_wbc_model(cfg.model_path)
     model.vis.global_.offwidth = args.width
@@ -281,6 +320,64 @@ def main():
         writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
     writer.release()
     print(f"Saved -> {out}")
+
+
+def load_saved_sims(
+    saved_rollouts,
+    saved_commands,
+    *,
+    env_index,
+    max_steps,
+):
+    sims = []
+    for item in saved_rollouts:
+        label, path = parse_labeled_path(item)
+        with np.load(path) as data:
+            if "qpos" not in data.files:
+                raise ValueError(f"Saved rollout {path} is missing qpos.")
+            qpos = select_saved_qpos(data["qpos"], env_index=env_index)
+        sims.append((trim_saved_qpos(qpos, max_steps), label))
+    for item in saved_commands:
+        label, path = parse_labeled_path(item)
+        with np.load(path) as data:
+            key = "refined_qpos" if "refined_qpos" in data.files else "command_qpos_trajectory"
+            if key not in data.files:
+                raise ValueError(
+                    f"Saved command {path} is missing refined_qpos/command_qpos_trajectory."
+                )
+            qpos = select_saved_qpos(data[key], env_index=env_index)
+        sims.append((trim_saved_qpos(qpos, max_steps), label))
+    return sims
+
+
+def parse_labeled_path(value):
+    if ":" in value:
+        label, raw_path = value.split(":", 1)
+        label = label.strip()
+    else:
+        raw_path = value
+        label = ""
+    path = Path(raw_path).expanduser().resolve()
+    if not label:
+        label = path.parent.name if path.name in ("rollout.npz", "mpc_command.npz") else path.stem
+    return label, path
+
+
+def select_saved_qpos(qpos, *, env_index):
+    qpos = np.asarray(qpos, dtype=np.float32)
+    if qpos.ndim == 3:
+        if not 0 <= env_index < qpos.shape[1]:
+            raise ValueError(f"saved-env-index {env_index} outside qpos shape {qpos.shape}.")
+        qpos = qpos[:, env_index]
+    if qpos.ndim != 2 or qpos.shape[-1] != 36:
+        raise ValueError(f"Expected saved qpos shape (T,36) or (T,N,36), got {qpos.shape}.")
+    return qpos
+
+
+def trim_saved_qpos(qpos, max_steps):
+    if max_steps is None:
+        return qpos
+    return qpos[: int(max_steps) + 1]
 
 
 if __name__ == "__main__":
