@@ -145,10 +145,12 @@ def main():
     p.add_argument(
         "--mpc-preset",
         default="aggressive",
-        choices=("aggressive", "conservative", "explore", "rootrot"),
+        choices=("aggressive", "conservative", "explore", "rootrot", "wide"),
     )
     p.add_argument("--mpc-samples", type=int, default=None)
     p.add_argument("--mpc-iterations", type=int, default=None)
+    p.add_argument("--mpc-planning-horizon-steps", type=int, default=None)
+    p.add_argument("--mpc-control-steps", type=int, default=None)
     p.add_argument("--mpc-elite-frac", type=float, default=None)
     p.add_argument("--mpc-temperature", type=float, default=None)
     p.add_argument(
@@ -159,6 +161,11 @@ def main():
     p.add_argument(
         "--mpc-command-smooth-weight",
         type=float,
+        default=None,
+    )
+    p.add_argument(
+        "--mpc-acceptance-gate",
+        action=argparse.BooleanOptionalAction,
         default=None,
     )
     p.add_argument("--mpc-root-pos-sigma", type=float, default=None)
@@ -213,10 +220,13 @@ def main():
         overrides = {
             "num_samples": args.mpc_samples,
             "num_iterations": args.mpc_iterations,
+            "planning_horizon_steps": args.mpc_planning_horizon_steps,
+            "control_steps": args.mpc_control_steps,
             "elite_frac": args.mpc_elite_frac,
             "temperature": args.mpc_temperature,
             "command_reg_weight": args.mpc_command_reg_weight,
             "command_smooth_weight": args.mpc_command_smooth_weight,
+            "acceptance_gate": args.mpc_acceptance_gate,
             "root_pos_sigma": args.mpc_root_pos_sigma,
             "root_rot_sigma": args.mpc_root_rot_sigma,
             "joint_sigma": args.mpc_joint_sigma,

@@ -56,10 +56,13 @@ def run_eval(
     njmax_per_env: int = WbcRolloutConfig.njmax_per_env,
     mpc_samples: int | None = None,
     mpc_iterations: int | None = None,
+    mpc_planning_horizon_steps: int | None = None,
+    mpc_control_steps: int | None = None,
     mpc_elite_frac: float | None = None,
     mpc_temperature: float | None = None,
     mpc_command_reg_weight: float | None = None,
     mpc_command_smooth_weight: float | None = None,
+    mpc_acceptance_gate: bool | None = None,
     mpc_root_pos_sigma: float | None = None,
     mpc_root_rot_sigma: float | None = None,
     mpc_joint_sigma: float | None = None,
@@ -83,10 +86,13 @@ def run_eval(
         optional_args = {
             "--mpc-samples": mpc_samples,
             "--mpc-iterations": mpc_iterations,
+            "--mpc-planning-horizon-steps": mpc_planning_horizon_steps,
+            "--mpc-control-steps": mpc_control_steps,
             "--mpc-elite-frac": mpc_elite_frac,
             "--mpc-temperature": mpc_temperature,
             "--mpc-command-reg-weight": mpc_command_reg_weight,
             "--mpc-command-smooth-weight": mpc_command_smooth_weight,
+            "--mpc-acceptance-gate": mpc_acceptance_gate,
             "--mpc-root-pos-sigma": mpc_root_pos_sigma,
             "--mpc-root-rot-sigma": mpc_root_rot_sigma,
             "--mpc-joint-sigma": mpc_joint_sigma,
@@ -152,10 +158,12 @@ def main() -> None:
     parser.add_argument(
         "--mpc-preset",
         default="aggressive",
-        choices=("aggressive", "conservative", "explore", "rootrot"),
+        choices=("aggressive", "conservative", "explore", "rootrot", "wide"),
     )
     parser.add_argument("--mpc-samples", type=int, default=None)
     parser.add_argument("--mpc-iterations", type=int, default=None)
+    parser.add_argument("--mpc-planning-horizon-steps", type=int, default=None)
+    parser.add_argument("--mpc-control-steps", type=int, default=None)
     parser.add_argument("--mpc-elite-frac", type=float, default=None)
     parser.add_argument("--mpc-temperature", type=float, default=None)
     parser.add_argument(
@@ -166,6 +174,11 @@ def main() -> None:
     parser.add_argument(
         "--mpc-command-smooth-weight",
         type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--mpc-acceptance-gate",
+        action=argparse.BooleanOptionalAction,
         default=None,
     )
     parser.add_argument("--mpc-root-pos-sigma", type=float, default=None)
@@ -194,10 +207,13 @@ def main() -> None:
                     njmax_per_env=args.njmax_per_env,
                     mpc_samples=args.mpc_samples,
                     mpc_iterations=args.mpc_iterations,
+                    mpc_planning_horizon_steps=args.mpc_planning_horizon_steps,
+                    mpc_control_steps=args.mpc_control_steps,
                     mpc_elite_frac=args.mpc_elite_frac,
                     mpc_temperature=args.mpc_temperature,
                     mpc_command_reg_weight=args.mpc_command_reg_weight,
                     mpc_command_smooth_weight=args.mpc_command_smooth_weight,
+                    mpc_acceptance_gate=args.mpc_acceptance_gate,
                     mpc_root_pos_sigma=args.mpc_root_pos_sigma,
                     mpc_root_rot_sigma=args.mpc_root_rot_sigma,
                     mpc_joint_sigma=args.mpc_joint_sigma,
@@ -252,6 +268,20 @@ def _compact_mpc_payload(payload: dict | None) -> dict | None:
         "final_scores_max",
         "num_samples",
         "num_iterations",
+        "planning_horizon_steps",
+        "control_steps",
+        "num_windows",
+        "accepted_windows",
+        "used_baseline_fallback",
+        "acceptance_gate",
+        "root_pos_sigma",
+        "root_rot_sigma",
+        "joint_sigma",
+        "min_root_pos_sigma",
+        "min_root_rot_sigma",
+        "min_joint_sigma",
+        "sigma_decay",
+        "smooth_passes",
         "command_reg_weight",
         "command_smooth_weight",
     )

@@ -73,6 +73,8 @@ class RolloutResult:
     contact_force: torch.Tensor
     ref_indices: torch.Tensor
     dt: float = POLICY_DT
+    final_last_action: torch.Tensor | None = None
+    final_history_state: dict | None = None
 
     @property
     def num_steps(self) -> int:
@@ -672,6 +674,9 @@ def run_command_rollout(
     *,
     initial_qpos: torch.Tensor,
     initial_qvel: torch.Tensor,
+    initial_last_action: torch.Tensor | None = None,
+    initial_history_state: dict | None = None,
+    ref_start: int = 0,
 ) -> RolloutResult:
     """Roll out the WBC actor with a motion or batched refined command source."""
 
@@ -700,7 +705,21 @@ def run_command_rollout(
         default_joint_pos=env.default_joint_pos,
         device=device,
     )
-    last_action = torch.zeros(config.num_envs, ACTION_DIM, device=device)
+    obs_builder.load_history_state_dict(initial_history_state)
+    if initial_last_action is None:
+        last_action = torch.zeros(config.num_envs, ACTION_DIM, device=device)
+    else:
+        last_action = initial_last_action.to(device, dtype=torch.float32)
+        if last_action.ndim == 1:
+            last_action = last_action.view(1, ACTION_DIM).expand(
+                config.num_envs, ACTION_DIM
+            )
+        if last_action.shape != (config.num_envs, ACTION_DIM):
+            raise ValueError(
+                f"Expected initial_last_action {(config.num_envs, ACTION_DIM)}, "
+                f"got {last_action.shape}."
+            )
+        last_action = last_action.contiguous()
 
     qpos_trace = []
     qvel_trace = []
@@ -729,7 +748,14 @@ def run_command_rollout(
         contact_indicator,
         contact_force,
     )
-    ref_indices.append(torch.zeros(config.num_envs, dtype=torch.long, device=device))
+    ref_indices.append(
+        torch.full(
+            (config.num_envs,),
+            int(ref_start),
+            dtype=torch.long,
+            device=device,
+        )
+    )
 
     with torch.inference_mode():
         for step_idx in range(total_steps):
@@ -761,7 +787,7 @@ def run_command_rollout(
             )
             actions.append(action.detach().clone())
             controls.append(ctrl.detach().clone())
-            ref_indices.append(ref_idx)
+            ref_indices.append(ref_idx + int(ref_start))
             last_action = action
 
     return RolloutResult(
@@ -776,6 +802,8 @@ def run_command_rollout(
         contact_indicator=torch.stack(contact_indicator, dim=0),
         contact_force=torch.stack(contact_force, dim=0),
         ref_indices=torch.stack(ref_indices, dim=0),
+        final_last_action=last_action.detach().clone(),
+        final_history_state=obs_builder.history_state_dict(),
     )
 
 

@@ -63,6 +63,46 @@ class HistoryBuffer:
         ordered = self._buffer.index_select(0, idx).transpose(0, 1)
         return ordered.reshape(self.num_envs, -1)
 
+    def state_dict(self) -> dict[str, torch.Tensor | int | None]:
+        return {
+            "buffer": None if self._buffer is None else self._buffer.detach().clone(),
+            "pointer": int(self._pointer),
+            "num_pushes": self._num_pushes.detach().clone(),
+        }
+
+    def load_state_dict(self, state: dict[str, torch.Tensor | int | None]) -> None:
+        buffer = state.get("buffer")
+        self._pointer = int(state.get("pointer", -1))
+        num_pushes = state.get("num_pushes")
+        if isinstance(num_pushes, torch.Tensor):
+            num_pushes = self._expand_batch(num_pushes.to(self.device, dtype=torch.long))
+            self._num_pushes = num_pushes.contiguous()
+        else:
+            self._num_pushes = torch.zeros(
+                self.num_envs, dtype=torch.long, device=self.device
+            )
+        if not isinstance(buffer, torch.Tensor):
+            self._buffer = None
+            self._pointer = -1
+            return
+        buffer = buffer.to(self.device)
+        if buffer.shape[0] != self.history_length:
+            raise ValueError(
+                f"Expected history length {self.history_length}, got {buffer.shape[0]}."
+            )
+        self._buffer = self._expand_batch(buffer).contiguous()
+
+    def _expand_batch(self, value: torch.Tensor) -> torch.Tensor:
+        batch_dim = 1 if value.ndim > 1 else 0
+        current = int(value.shape[batch_dim])
+        if current == self.num_envs:
+            return value.clone()
+        if current != 1:
+            raise ValueError(f"Cannot expand history batch {current} to {self.num_envs}.")
+        shape = list(value.shape)
+        shape[batch_dim] = self.num_envs
+        return value.expand(*shape).clone()
+
 
 @dataclass
 class RobotState:
@@ -198,3 +238,17 @@ class G1WbcObservationBuilder:
         if obs.shape[-1] != OBS_DIM:
             raise RuntimeError(f"Expected obs dim {OBS_DIM}, got {obs.shape[-1]}")
         return obs
+
+    def history_state_dict(self) -> dict[str, dict[str, torch.Tensor | int | None]]:
+        return {name: history.state_dict() for name, history in self.histories.items()}
+
+    def load_history_state_dict(
+        self,
+        state: dict[str, dict[str, torch.Tensor | int | None]] | None,
+    ) -> None:
+        if state is None:
+            return
+        for name, history_state in state.items():
+            if name not in self.histories:
+                continue
+            self.histories[name].load_state_dict(history_state)

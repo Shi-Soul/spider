@@ -32,7 +32,7 @@ from spider.tasks.g1_wbc.rollout import (
 )
 
 MpcMode = Literal["g1_wbc_ee", "g1_wbc_joint", "g1_wbc_joint_global"]
-MpcPreset = Literal["aggressive", "conservative", "explore", "rootrot"]
+MpcPreset = Literal["aggressive", "conservative", "explore", "rootrot", "wide"]
 
 
 @dataclass
@@ -42,6 +42,8 @@ class G1WbcMpcConfig:
     mode: MpcMode = "g1_wbc_joint"
     num_samples: int = 64
     num_iterations: int = 4
+    planning_horizon_steps: int = 80
+    control_steps: int = 20
     elite_frac: float = 0.125
     temperature: float = 0.7
     root_pos_sigma: float = 0.015
@@ -61,6 +63,9 @@ class G1WbcMpcConfig:
     guided_root_pos_clip: float = 0.05
     guided_root_rot_clip: float = 0.12
     guided_joint_clip: float = 0.20
+    use_global_root_rot_bias_candidates: bool = True
+    global_root_rot_bias_values: tuple[float, ...] = (-0.16, -0.08, 0.08, 0.16)
+    acceptance_gate: bool = True
     seed: int | None = 0
     freeze_first_frame: bool = True
 
@@ -68,6 +73,10 @@ class G1WbcMpcConfig:
 @dataclass
 class MpcIterationInfo:
     iteration: int
+    window_index: int
+    window_start: int
+    window_horizon: int
+    window_execute_steps: int
     best_score: float
     mean_score: float
     elite_score: float
@@ -93,8 +102,22 @@ class G1WbcMpcResult:
     scores: torch.Tensor
     history: list[MpcIterationInfo]
     accepted: bool = True
+    used_baseline_fallback: bool = False
     final_candidate_score: float = 0.0
     final_baseline_score: float = 0.0
+    num_windows: int = 0
+    accepted_windows: int = 0
+
+
+@dataclass
+class _MpcWindowOptimizeResult:
+    best_qpos: torch.Tensor
+    best_delta: torch.Tensor
+    scores: torch.Tensor
+    history: list[MpcIterationInfo]
+    best_is_template: bool
+    best_score: float
+    zero_delta_score: float
 
 
 def mpc_config_from_preset(
@@ -157,6 +180,41 @@ def mpc_config_from_preset(
             guided_root_rot_clip=0.40,
             guided_joint_clip=0.35,
         )
+    if preset == "wide":
+        return replace(
+            config,
+            num_samples=512,
+            num_iterations=4,
+            root_pos_sigma=0.10,
+            root_rot_sigma=0.24,
+            joint_sigma=0.32,
+            min_root_pos_sigma=0.025,
+            min_root_rot_sigma=0.06,
+            min_joint_sigma=0.08,
+            sigma_decay=0.95,
+            smooth_passes=0,
+            command_reg_weight=0.0,
+            command_smooth_weight=0.0,
+            guided_root_pos_gain=0.75,
+            guided_root_rot_gain=0.75,
+            guided_joint_gain=0.0,
+            guided_root_pos_clip=0.30,
+            guided_root_rot_clip=0.75,
+            guided_joint_clip=0.80,
+            global_root_rot_bias_values=(
+                -0.48,
+                -0.32,
+                -0.24,
+                -0.16,
+                -0.08,
+                0.08,
+                0.16,
+                0.24,
+                0.32,
+                0.48,
+            ),
+            acceptance_gate=False,
+        )
     raise ValueError(f"Unknown MPC preset: {preset}")
 
 
@@ -166,37 +224,27 @@ def optimize_mpc_command(
     rollout_config: WbcRolloutConfig,
     mpc_config: G1WbcMpcConfig,
 ) -> G1WbcMpcResult:
-    """Optimize a refined reference command using batched policy+sim rollouts."""
+    """Optimize and execute a refined command with receding-horizon MPC."""
 
     if mpc_config.num_samples < 2:
         raise ValueError("MPC requires at least two samples.")
     if mpc_config.num_iterations < 1:
         raise ValueError("MPC requires at least one iteration.")
+    if mpc_config.planning_horizon_steps < 1:
+        raise ValueError("MPC planning_horizon_steps must be positive.")
+    if mpc_config.control_steps < 1:
+        raise ValueError("MPC control_steps must be positive.")
 
     device = torch.device(rollout_config.device)
     motion = motion.to(device)
     actor = actor.to(device).eval()
-    horizon = motion.num_frames
+    total_steps = motion.num_frames - 1
     if rollout_config.max_steps is not None:
-        horizon = min(horizon, int(rollout_config.max_steps))
-    if horizon < 1:
+        total_steps = min(total_steps, int(rollout_config.max_steps))
+    if total_steps < 1:
         raise ValueError("Need at least one MPC horizon step.")
 
-    base_qpos = motion.qpos()[:horizon].contiguous()
-    initial_qpos = motion.qpos()[0]
-    initial_qvel = motion.qvel()[0]
-    mean_delta = torch.zeros(horizon, QPOS_DIM - 1, dtype=torch.float32, device=device)
-    sigma = _initial_sigma(horizon, device, mpc_config)
-    min_sigma = _min_sigma(horizon, device, mpc_config)
     joint_low, joint_high = _joint_limits(rollout_config, device)
-    guided_delta = _guided_delta_from_no_mpc(
-        motion,
-        actor,
-        rollout_config,
-        horizon,
-        base_qpos,
-        mpc_config,
-    )
 
     if mpc_config.seed is not None:
         generator = torch.Generator(device=device)
@@ -204,8 +252,233 @@ def optimize_mpc_command(
     else:
         generator = None
 
+    history: list[MpcIterationInfo] = []
+    final_scores = torch.empty(0, dtype=torch.float32, device=device)
+    refined_qpos = motion.qpos()[: total_steps + 1].detach().clone()
+
+    qpos_trace: list[torch.Tensor] = []
+    qvel_trace: list[torch.Tensor] = []
+    body_pos_trace: list[torch.Tensor] = []
+    body_quat_trace: list[torch.Tensor] = []
+    body_lin_vel_trace: list[torch.Tensor] = []
+    body_ang_vel_trace: list[torch.Tensor] = []
+    actions: list[torch.Tensor] = []
+    controls: list[torch.Tensor] = []
+    contact_indicator: list[torch.Tensor] = []
+    contact_force: list[torch.Tensor] = []
+    ref_indices: list[torch.Tensor] = []
+
+    current_qpos = motion.qpos()[0].detach().clone()
+    current_qvel = motion.qvel()[0].detach().clone()
+    current_last_action: torch.Tensor | None = None
+    current_history_state = None
+    sim_step = 0
+    window_index = 0
+    accepted_windows = 0
+
+    while sim_step < total_steps:
+        window_horizon = min(
+            int(mpc_config.planning_horizon_steps),
+            total_steps - sim_step,
+        )
+        execute_steps = min(int(mpc_config.control_steps), window_horizon)
+        window_result = _optimize_mpc_window(
+            motion,
+            actor,
+            rollout_config,
+            mpc_config,
+            start=sim_step,
+            horizon=window_horizon,
+            execute_steps=execute_steps,
+            initial_qpos=current_qpos,
+            initial_qvel=current_qvel,
+            initial_last_action=current_last_action,
+            initial_history_state=current_history_state,
+            joint_low=joint_low,
+            joint_high=joint_high,
+            generator=generator,
+            window_index=window_index,
+        )
+        final_scores = window_result.scores.detach().clone()
+        history.extend(window_result.history)
+
+        final_config = replace(rollout_config, num_envs=1, max_steps=execute_steps)
+        window_motion = _slice_motion(motion, sim_step, window_horizon)
+        window_command = command_batch_from_qpos_trajectory(
+            window_motion,
+            window_result.best_qpos[:, None, :],
+            final_config,
+            preserve_template_first=window_result.best_is_template,
+        )
+        window_rollout = run_command_rollout(
+            window_command,
+            actor,
+            final_config,
+            initial_qpos=current_qpos,
+            initial_qvel=current_qvel,
+            initial_last_action=current_last_action,
+            initial_history_state=current_history_state,
+            ref_start=sim_step,
+        )
+
+        if sim_step == 0:
+            qpos_trace.append(window_rollout.qpos[0, 0].detach().clone())
+            qvel_trace.append(window_rollout.qvel[0, 0].detach().clone())
+            body_pos_trace.append(window_rollout.body_pos_w[0, 0].detach().clone())
+            body_quat_trace.append(window_rollout.body_quat_w[0, 0].detach().clone())
+            body_lin_vel_trace.append(
+                window_rollout.body_lin_vel_w[0, 0].detach().clone()
+            )
+            body_ang_vel_trace.append(
+                window_rollout.body_ang_vel_w[0, 0].detach().clone()
+            )
+            contact_indicator.append(
+                window_rollout.contact_indicator[0, 0].detach().clone()
+            )
+            contact_force.append(window_rollout.contact_force[0, 0].detach().clone())
+            ref_indices.append(window_rollout.ref_indices[0, 0].detach().clone())
+
+        qpos_trace.extend(t.detach().clone() for t in window_rollout.qpos[1:, 0])
+        qvel_trace.extend(t.detach().clone() for t in window_rollout.qvel[1:, 0])
+        body_pos_trace.extend(
+            t.detach().clone() for t in window_rollout.body_pos_w[1:, 0]
+        )
+        body_quat_trace.extend(
+            t.detach().clone() for t in window_rollout.body_quat_w[1:, 0]
+        )
+        body_lin_vel_trace.extend(
+            t.detach().clone() for t in window_rollout.body_lin_vel_w[1:, 0]
+        )
+        body_ang_vel_trace.extend(
+            t.detach().clone() for t in window_rollout.body_ang_vel_w[1:, 0]
+        )
+        contact_indicator.extend(
+            t.detach().clone() for t in window_rollout.contact_indicator[1:, 0]
+        )
+        contact_force.extend(
+            t.detach().clone() for t in window_rollout.contact_force[1:, 0]
+        )
+        ref_indices.extend(t.detach().clone() for t in window_rollout.ref_indices[1:, 0])
+        actions.extend(t.detach().clone() for t in window_rollout.actions[:, 0])
+        controls.extend(t.detach().clone() for t in window_rollout.controls[:, 0])
+
+        end = sim_step + execute_steps
+        refined_qpos[sim_step:end] = window_result.best_qpos[:execute_steps]
+        if end <= total_steps:
+            refined_qpos[end] = window_result.best_qpos[
+                min(execute_steps, window_result.best_qpos.shape[0] - 1)
+            ]
+        current_qpos = window_rollout.qpos[-1, 0].detach().clone()
+        current_qvel = window_rollout.qvel[-1, 0].detach().clone()
+        current_last_action = (
+            None
+            if window_rollout.final_last_action is None
+            else window_rollout.final_last_action[0].detach().clone()
+        )
+        current_history_state = window_rollout.final_history_state
+        accepted_windows += int(window_result.best_score >= window_result.zero_delta_score)
+        sim_step = end
+        window_index += 1
+
+    rollout = RolloutResult(
+        qpos=torch.stack(qpos_trace, dim=0)[:, None, :],
+        qvel=torch.stack(qvel_trace, dim=0)[:, None, :],
+        body_pos_w=torch.stack(body_pos_trace, dim=0)[:, None, :, :],
+        body_quat_w=torch.stack(body_quat_trace, dim=0)[:, None, :, :],
+        body_lin_vel_w=torch.stack(body_lin_vel_trace, dim=0)[:, None, :, :],
+        body_ang_vel_w=torch.stack(body_ang_vel_trace, dim=0)[:, None, :, :],
+        actions=torch.stack(actions, dim=0)[:, None, :],
+        controls=torch.stack(controls, dim=0)[:, None, :],
+        contact_indicator=torch.stack(contact_indicator, dim=0)[:, None, :],
+        contact_force=torch.stack(contact_force, dim=0)[:, None, :],
+        ref_indices=torch.stack(ref_indices, dim=0)[:, None],
+    )
+    final_score = _single_rollout_score(motion, rollout, mpc_config.mode)
+
+    base_qpos = motion.qpos()[: total_steps + 1].contiguous()
+    baseline_config = replace(rollout_config, num_envs=1, max_steps=total_steps)
+    baseline_command = command_batch_from_qpos_trajectory(
+        motion,
+        base_qpos[:, None, :],
+        baseline_config,
+        preserve_template_first=True,
+    )
+    baseline_rollout = run_command_rollout(
+        baseline_command,
+        actor,
+        baseline_config,
+        initial_qpos=motion.qpos()[0],
+        initial_qvel=motion.qvel()[0],
+    )
+    baseline_score = _single_rollout_score(motion, baseline_rollout, mpc_config.mode)
+    accepted = final_score >= baseline_score
+    used_baseline_fallback = bool(mpc_config.acceptance_gate and not accepted)
+    if used_baseline_fallback:
+        rollout = baseline_rollout
+        final_command = baseline_command
+        refined_qpos = base_qpos
+    else:
+        final_command = command_batch_from_qpos_trajectory(
+            motion,
+            refined_qpos[:, None, :],
+            replace(rollout_config, num_envs=1, max_steps=None),
+            preserve_template_first=False,
+        )
+    return G1WbcMpcResult(
+        command=final_command,
+        rollout=rollout,
+        refined_qpos=refined_qpos,
+        scores=final_scores,
+        history=history,
+        accepted=accepted,
+        used_baseline_fallback=used_baseline_fallback,
+        final_candidate_score=final_score,
+        final_baseline_score=baseline_score,
+        num_windows=window_index,
+        accepted_windows=accepted_windows,
+    )
+
+
+def _optimize_mpc_window(
+    motion: G1Motion,
+    actor: WbcActor,
+    rollout_config: WbcRolloutConfig,
+    mpc_config: G1WbcMpcConfig,
+    *,
+    start: int,
+    horizon: int,
+    execute_steps: int,
+    initial_qpos: torch.Tensor,
+    initial_qvel: torch.Tensor,
+    initial_last_action: torch.Tensor | None,
+    initial_history_state: dict | None,
+    joint_low: torch.Tensor,
+    joint_high: torch.Tensor,
+    generator: torch.Generator | None,
+    window_index: int,
+) -> _MpcWindowOptimizeResult:
+    device = torch.device(rollout_config.device)
+    window_motion = _slice_motion(motion, start, horizon)
+    base_qpos = window_motion.qpos()[:horizon].contiguous()
+    mean_delta = torch.zeros(horizon, QPOS_DIM - 1, dtype=torch.float32, device=device)
+    sigma = _initial_sigma(horizon, device, mpc_config)
+    min_sigma = _min_sigma(horizon, device, mpc_config)
+    guided_delta = _guided_delta_from_no_mpc(
+        window_motion,
+        actor,
+        rollout_config,
+        horizon,
+        base_qpos,
+        mpc_config,
+        initial_qpos=initial_qpos,
+        initial_qvel=initial_qvel,
+        initial_last_action=initial_last_action,
+        initial_history_state=initial_history_state,
+    )
+
     best_score = torch.tensor(-float("inf"), dtype=torch.float32, device=device)
     best_qpos = base_qpos
+    best_delta = torch.zeros_like(mean_delta)
     best_is_template = True
     final_scores = torch.empty(0, dtype=torch.float32, device=device)
     history: list[MpcIterationInfo] = []
@@ -215,6 +488,7 @@ def optimize_mpc_command(
         num_envs=mpc_config.num_samples,
         max_steps=horizon,
     )
+    zero_delta_score = -float("inf")
 
     for iteration in range(mpc_config.num_iterations):
         candidates_delta = _sample_delta(
@@ -231,7 +505,7 @@ def optimize_mpc_command(
             joint_high=joint_high,
         )
         command = command_batch_from_qpos_trajectory(
-            motion,
+            window_motion,
             candidates_qpos,
             batch_config,
             preserve_template_first=True,
@@ -242,6 +516,9 @@ def optimize_mpc_command(
             batch_config,
             initial_qpos=initial_qpos,
             initial_qvel=initial_qvel,
+            initial_last_action=initial_last_action,
+            initial_history_state=initial_history_state,
+            ref_start=start,
         )
         raw_scores, terms = compute_rollout_scores(motion, rollout)
         raw_task_scores = _score_from_terms(terms, mpc_config.mode)
@@ -252,6 +529,7 @@ def optimize_mpc_command(
         )
         scores = raw_task_scores - regularization
         final_scores = scores.detach().clone()
+        zero_delta_score = float(scores[0].detach().cpu().item())
 
         iteration_best = torch.argmax(scores)
         if scores[iteration_best] > best_score:
@@ -288,6 +566,10 @@ def optimize_mpc_command(
         history.append(
             MpcIterationInfo(
                 iteration=iteration,
+                window_index=window_index,
+                window_start=start,
+                window_horizon=horizon,
+                window_execute_steps=execute_steps,
                 best_score=float(scores.max().detach().cpu().item()),
                 mean_score=float(scores.mean().detach().cpu().item()),
                 elite_score=float(elite_scores.mean().detach().cpu().item()),
@@ -319,49 +601,32 @@ def optimize_mpc_command(
         )
         del raw_scores
 
-    final_config = replace(rollout_config, num_envs=1, max_steps=horizon)
-    final_command = command_batch_from_qpos_trajectory(
-        motion,
-        best_qpos[:, None, :],
-        final_config,
-        preserve_template_first=best_is_template,
-    )
-    final_rollout = run_command_rollout(
-        final_command,
-        actor,
-        final_config,
-        initial_qpos=initial_qpos,
-        initial_qvel=initial_qvel,
-    )
-    final_score = _single_rollout_score(motion, final_rollout, mpc_config.mode)
-    baseline_command = command_batch_from_qpos_trajectory(
-        motion,
-        base_qpos[:, None, :],
-        final_config,
-        preserve_template_first=True,
-    )
-    baseline_rollout = run_command_rollout(
-        baseline_command,
-        actor,
-        final_config,
-        initial_qpos=initial_qpos,
-        initial_qvel=initial_qvel,
-    )
-    baseline_score = _single_rollout_score(motion, baseline_rollout, mpc_config.mode)
-    accepted = final_score >= baseline_score
-    if not accepted:
-        final_command = baseline_command
-        final_rollout = baseline_rollout
-        best_qpos = base_qpos
-    return G1WbcMpcResult(
-        command=final_command,
-        rollout=final_rollout,
-        refined_qpos=best_qpos,
+    return _MpcWindowOptimizeResult(
+        best_qpos=best_qpos,
+        best_delta=best_delta,
         scores=final_scores,
         history=history,
-        accepted=accepted,
-        final_candidate_score=final_score,
-        final_baseline_score=baseline_score,
+        best_is_template=best_is_template,
+        best_score=float(best_score.detach().cpu().item()),
+        zero_delta_score=zero_delta_score,
+    )
+
+
+def _slice_motion(motion: G1Motion, start: int, length: int) -> G1Motion:
+    end = min(motion.num_frames, int(start) + int(length))
+    if end <= int(start):
+        raise ValueError(f"Empty motion window start={start}, length={length}.")
+    return G1Motion(
+        path=motion.path,
+        motion_type=motion.motion_type,
+        fps=motion.fps,
+        joint_pos=motion.joint_pos[start:end],
+        joint_vel=motion.joint_vel[start:end],
+        body_pos_w=motion.body_pos_w[start:end],
+        body_quat_w=motion.body_quat_w[start:end],
+        body_lin_vel_w=motion.body_lin_vel_w[start:end],
+        body_ang_vel_w=motion.body_ang_vel_w[start:end],
+        contact=motion.contact[start:end],
     )
 
 
@@ -420,11 +685,36 @@ def _sample_delta(
         next_reserved += 1
     if config.num_samples > next_reserved and mean_delta.abs().max() > 1.0e-8:
         delta[:, next_reserved, :] = mean_delta
+        next_reserved += 1
+    if (
+        config.mode == "g1_wbc_joint_global"
+        and config.use_global_root_rot_bias_candidates
+    ):
+        next_reserved = _add_global_root_rot_bias_candidates(
+            delta,
+            next_reserved,
+            config,
+        )
     if config.smooth_passes > 0:
         delta = _smooth_delta(delta, config.smooth_passes)
     if config.freeze_first_frame:
         delta[0] = 0.0
     return delta
+
+
+def _add_global_root_rot_bias_candidates(
+    delta: torch.Tensor,
+    next_reserved: int,
+    config: G1WbcMpcConfig,
+) -> int:
+    for axis in range(3):
+        for value in config.global_root_rot_bias_values:
+            if next_reserved >= config.num_samples:
+                return next_reserved
+            delta[:, next_reserved, :] = 0.0
+            delta[:, next_reserved, 3 + axis] = float(value)
+            next_reserved += 1
+    return next_reserved
 
 
 def _guided_delta_from_no_mpc(
@@ -434,6 +724,11 @@ def _guided_delta_from_no_mpc(
     horizon: int,
     base_qpos: torch.Tensor,
     config: G1WbcMpcConfig,
+    *,
+    initial_qpos: torch.Tensor | None = None,
+    initial_qvel: torch.Tensor | None = None,
+    initial_last_action: torch.Tensor | None = None,
+    initial_history_state: dict | None = None,
 ) -> torch.Tensor | None:
     if not config.use_guided_candidate or config.num_samples < 2:
         return None
@@ -442,8 +737,10 @@ def _guided_delta_from_no_mpc(
         motion,
         actor,
         no_mpc_config,
-        initial_qpos=motion.qpos()[0],
-        initial_qvel=motion.qvel()[0],
+        initial_qpos=motion.qpos()[0] if initial_qpos is None else initial_qpos,
+        initial_qvel=motion.qvel()[0] if initial_qvel is None else initial_qvel,
+        initial_last_action=initial_last_action,
+        initial_history_state=initial_history_state,
     )
     executed = no_mpc_rollout.qpos[1 : horizon + 1, 0]
     if executed.shape[0] != horizon:

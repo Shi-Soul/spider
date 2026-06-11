@@ -52,23 +52,39 @@ def main() -> None:
             "preset": args.mpc_preset,
             "num_samples": mpc_config.num_samples,
             "num_iterations": mpc_config.num_iterations,
+            "planning_horizon_steps": mpc_config.planning_horizon_steps,
+            "control_steps": mpc_config.control_steps,
             "elite_frac": mpc_config.elite_frac,
             "temperature": mpc_config.temperature,
             "root_pos_sigma": mpc_config.root_pos_sigma,
             "root_rot_sigma": mpc_config.root_rot_sigma,
             "joint_sigma": mpc_config.joint_sigma,
+            "min_root_pos_sigma": mpc_config.min_root_pos_sigma,
+            "min_root_rot_sigma": mpc_config.min_root_rot_sigma,
+            "min_joint_sigma": mpc_config.min_joint_sigma,
             "sigma_decay": mpc_config.sigma_decay,
             "smooth_passes": mpc_config.smooth_passes,
             "command_reg_weight": mpc_config.command_reg_weight,
             "command_smooth_weight": mpc_config.command_smooth_weight,
+            "acceptance_gate": mpc_config.acceptance_gate,
             "guided_candidate": mpc_config.use_guided_candidate,
             "guided_root_pos_gain": mpc_config.guided_root_pos_gain,
             "guided_root_rot_gain": mpc_config.guided_root_rot_gain,
             "guided_joint_gain": mpc_config.guided_joint_gain,
+            "guided_root_pos_clip": mpc_config.guided_root_pos_clip,
+            "guided_root_rot_clip": mpc_config.guided_root_rot_clip,
+            "guided_joint_clip": mpc_config.guided_joint_clip,
+            "use_global_root_rot_bias_candidates":
+                mpc_config.use_global_root_rot_bias_candidates,
+            "global_root_rot_bias_values":
+                list(mpc_config.global_root_rot_bias_values),
             "history": [vars(item) for item in mpc_result.history],
             "final_scores_mean": _safe_tensor_stat(mpc_result.scores, "mean"),
             "final_scores_max": _safe_tensor_stat(mpc_result.scores, "max"),
             "accepted": mpc_result.accepted,
+            "used_baseline_fallback": mpc_result.used_baseline_fallback,
+            "num_windows": mpc_result.num_windows,
+            "accepted_windows": mpc_result.accepted_windows,
             "final_candidate_score": mpc_result.final_candidate_score,
             "final_baseline_score": mpc_result.final_baseline_score,
         }
@@ -178,11 +194,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mpc-preset",
         default="aggressive",
-        choices=("aggressive", "conservative", "explore", "rootrot"),
+        choices=("aggressive", "conservative", "explore", "rootrot", "wide"),
         help="Tuned MPC parameter preset. Explicit MPC flags override this.",
     )
     parser.add_argument("--mpc-samples", type=int, default=None)
     parser.add_argument("--mpc-iterations", type=int, default=None)
+    parser.add_argument("--mpc-planning-horizon-steps", type=int, default=None)
+    parser.add_argument("--mpc-control-steps", type=int, default=None)
     parser.add_argument("--mpc-elite-frac", type=float, default=None)
     parser.add_argument("--mpc-temperature", type=float, default=None)
     parser.add_argument("--mpc-root-pos-sigma", type=float, default=None)
@@ -205,6 +223,12 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Include a no-MPC-error feedback candidate in the MPC sample batch.",
+    )
+    parser.add_argument(
+        "--mpc-acceptance-gate",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Fall back to the unmodified reference command when final MPC score is worse.",
     )
     parser.add_argument(
         "--mpc-guided-root-pos-gain",
@@ -230,6 +254,8 @@ def _build_mpc_config(args: argparse.Namespace) -> G1WbcMpcConfig:
     overrides = {
         "num_samples": args.mpc_samples,
         "num_iterations": args.mpc_iterations,
+        "planning_horizon_steps": args.mpc_planning_horizon_steps,
+        "control_steps": args.mpc_control_steps,
         "elite_frac": args.mpc_elite_frac,
         "temperature": args.mpc_temperature,
         "root_pos_sigma": args.mpc_root_pos_sigma,
@@ -239,6 +265,7 @@ def _build_mpc_config(args: argparse.Namespace) -> G1WbcMpcConfig:
         "smooth_passes": args.mpc_smooth_passes,
         "command_reg_weight": args.mpc_command_reg_weight,
         "command_smooth_weight": args.mpc_command_smooth_weight,
+        "acceptance_gate": args.mpc_acceptance_gate,
         "use_guided_candidate": args.mpc_guided_candidate,
         "guided_root_pos_gain": args.mpc_guided_root_pos_gain,
         "guided_root_rot_gain": args.mpc_guided_root_rot_gain,
