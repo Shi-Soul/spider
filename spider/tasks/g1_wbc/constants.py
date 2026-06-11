@@ -187,9 +187,13 @@ ROOT_QVEL_DIM = 6
 QPOS_DIM = ROOT_QPOS_DIM + ACTION_DIM
 QVEL_DIM = ROOT_QVEL_DIM + ACTION_DIM
 
-DEFAULT_G1_MODEL_PATH = (
+SPIDER_G1_SCENE_MODEL_PATH = (
     Path(spider.ROOT) / "assets" / "robots" / "unitree_g1" / "scene.xml"
 )
+WXY_G1_MODEL_PATH = (
+    Path(spider.ROOT) / "assets" / "robots" / "unitree_g1" / "wxy_g1.xml"
+)
+DEFAULT_G1_MODEL_PATH = WXY_G1_MODEL_PATH
 DEFAULT_WXY_ROOT = Path(spider.ROOT).parents[1] / "wxy"
 DEFAULT_CKPT_DIRS = {
     "bc": DEFAULT_WXY_ROOT / "0608_ckpt_bc",

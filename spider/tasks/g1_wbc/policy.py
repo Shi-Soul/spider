@@ -31,7 +31,7 @@ class WbcActor(nn.Module):
         self.register_buffer("obs_std", torch.ones(1, input_dim))
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        obs = (obs - self.obs_mean) / self.obs_std.clamp(min=1e-6)
+        obs = (obs - self.obs_mean) / (self.obs_std + 1.0e-2)
         return self.mlp(obs)
 
 
@@ -78,4 +78,3 @@ def load_wbc_actor(
     actor.to(device)
     actor.eval()
     return actor
-

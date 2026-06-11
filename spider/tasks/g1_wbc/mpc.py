@@ -13,7 +13,13 @@ from spider.tasks.g1_wbc.constants import (
     POLICY_DT,
     QPOS_DIM,
 )
-from spider.tasks.g1_wbc.math_utils import normalize, quat_from_axis_angle, quat_mul
+from spider.tasks.g1_wbc.math_utils import (
+    axis_angle_from_quat,
+    normalize,
+    quat_from_axis_angle,
+    quat_inv,
+    quat_mul,
+)
 from spider.tasks.g1_wbc.metrics import compute_rollout_scores
 from spider.tasks.g1_wbc.motion import G1CommandBatch, G1Motion
 from spider.tasks.g1_wbc.policy import WbcActor
@@ -21,7 +27,7 @@ from spider.tasks.g1_wbc.rollout import (
     RolloutResult,
     WbcRolloutConfig,
     command_batch_from_qpos_trajectory,
-    configure_wbc_model,
+    load_wbc_model,
     run_command_rollout,
 )
 
@@ -47,6 +53,13 @@ class G1WbcMpcConfig:
     smooth_passes: int = 2
     command_reg_weight: float = 0.10
     command_smooth_weight: float = 0.0003
+    use_guided_candidate: bool = True
+    guided_root_pos_gain: float = 0.5
+    guided_root_rot_gain: float = 0.5
+    guided_joint_gain: float = 0.4
+    guided_root_pos_clip: float = 0.05
+    guided_root_rot_clip: float = 0.12
+    guided_joint_clip: float = 0.20
     seed: int | None = 0
     freeze_first_frame: bool = True
 
@@ -99,6 +112,14 @@ def optimize_mpc_command(
     sigma = _initial_sigma(horizon, device, mpc_config)
     min_sigma = _min_sigma(horizon, device, mpc_config)
     joint_low, joint_high = _joint_limits(rollout_config, device)
+    guided_delta = _guided_delta_from_no_mpc(
+        motion,
+        actor,
+        rollout_config,
+        horizon,
+        base_qpos,
+        mpc_config,
+    )
 
     if mpc_config.seed is not None:
         generator = torch.Generator(device=device)
@@ -119,7 +140,13 @@ def optimize_mpc_command(
     )
 
     for iteration in range(mpc_config.num_iterations):
-        candidates_delta = _sample_delta(mean_delta, sigma, mpc_config, generator)
+        candidates_delta = _sample_delta(
+            mean_delta,
+            sigma,
+            mpc_config,
+            generator,
+            guided_delta=guided_delta,
+        )
         candidates_qpos = _apply_delta_to_qpos(
             base_qpos,
             candidates_delta,
@@ -248,6 +275,8 @@ def _sample_delta(
     sigma: torch.Tensor,
     config: G1WbcMpcConfig,
     generator: torch.Generator | None,
+    *,
+    guided_delta: torch.Tensor | None,
 ) -> torch.Tensor:
     shape = (mean_delta.shape[0], config.num_samples, mean_delta.shape[1])
     noise = torch.randn(
@@ -258,13 +287,67 @@ def _sample_delta(
     )
     delta = mean_delta[:, None, :] + noise * sigma[:, None, :]
     delta[:, 0, :] = 0.0
-    if config.num_samples > 1 and mean_delta.abs().max() > 1.0e-8:
-        delta[:, 1, :] = mean_delta
+    next_reserved = 1
+    if (
+        guided_delta is not None
+        and config.num_samples > next_reserved
+        and guided_delta.abs().max() > 1.0e-8
+    ):
+        delta[:, next_reserved, :] = guided_delta
+        next_reserved += 1
+    if config.num_samples > next_reserved and mean_delta.abs().max() > 1.0e-8:
+        delta[:, next_reserved, :] = mean_delta
     if config.smooth_passes > 0:
         delta = _smooth_delta(delta, config.smooth_passes)
     if config.freeze_first_frame:
         delta[0] = 0.0
     return delta
+
+
+def _guided_delta_from_no_mpc(
+    motion: G1Motion,
+    actor: WbcActor,
+    rollout_config: WbcRolloutConfig,
+    horizon: int,
+    base_qpos: torch.Tensor,
+    config: G1WbcMpcConfig,
+) -> torch.Tensor | None:
+    if not config.use_guided_candidate or config.num_samples < 2:
+        return None
+    no_mpc_config = replace(rollout_config, num_envs=1, max_steps=horizon)
+    no_mpc_rollout = run_command_rollout(
+        motion,
+        actor,
+        no_mpc_config,
+        initial_qpos=motion.qpos()[0],
+        initial_qvel=motion.qvel()[0],
+    )
+    executed = no_mpc_rollout.qpos[1 : horizon + 1, 0]
+    if executed.shape[0] != horizon:
+        return None
+    guided = torch.zeros(horizon, QPOS_DIM - 1, dtype=torch.float32, device=base_qpos.device)
+    guided[:, :3] = (base_qpos[:, :3] - executed[:, :3]) * float(
+        config.guided_root_pos_gain
+    )
+    quat_err = quat_mul(base_qpos[:, 3:7], quat_inv(executed[:, 3:7]))
+    guided[:, 3:6] = axis_angle_from_quat(quat_err) * float(config.guided_root_rot_gain)
+    guided[:, 6:] = (base_qpos[:, 7:] - executed[:, 7:]) * float(
+        config.guided_joint_gain
+    )
+    guided[:, :3] = guided[:, :3].clamp(
+        -float(config.guided_root_pos_clip), float(config.guided_root_pos_clip)
+    )
+    guided[:, 3:6] = guided[:, 3:6].clamp(
+        -float(config.guided_root_rot_clip), float(config.guided_root_rot_clip)
+    )
+    guided[:, 6:] = guided[:, 6:].clamp(
+        -float(config.guided_joint_clip), float(config.guided_joint_clip)
+    )
+    if config.smooth_passes > 0:
+        guided = _smooth_delta(guided[:, None, :], config.smooth_passes)[:, 0]
+    if config.freeze_first_frame:
+        guided[0] = 0.0
+    return guided
 
 
 def _smooth_delta(delta: torch.Tensor, passes: int) -> torch.Tensor:
@@ -300,24 +383,26 @@ def _score_from_terms(
     if mode == "g1_wbc_ee":
         return -(
             5.0 * terms["contact_mismatch"]
-            + 2.5 * terms["contact_switch"]
+            + 3.0 * terms["contact_switch"]
             + 5.0 * terms["ee_global_pos_error"]
             + 2.0 * terms["ee_local_pos_error"]
             + 1.0 * terms["root_pos_error"]
-            + 0.25 * terms["root_rot_error"]
-            + 0.08 * terms["joint_pos_error"]
-            + 0.05 * terms["control_delta"]
+            + 0.5 * terms["root_rot_error"]
+            + 0.12 * terms["joint_pos_error"]
+            + 0.35 * terms["control_delta"]
+            + 0.0025 * terms["joint_acc"]
         )
     return -(
         5.0 * terms["contact_mismatch"]
-        + 2.5 * terms["contact_switch"]
+        + 3.0 * terms["contact_switch"]
         + 2.0 * terms["body_global_pos_error"]
         + 0.6 * terms["body_global_rot_error"]
         + 1.2 * terms["joint_pos_error"]
         + 1.5 * terms["ee_global_pos_error"]
         + 1.5 * terms["root_pos_error"]
         + 0.4 * terms["root_rot_error"]
-        + 0.05 * terms["control_delta"]
+        + 0.20 * terms["control_delta"]
+        + 0.0015 * terms["joint_acc"]
     )
 
 
@@ -338,8 +423,7 @@ def _joint_limits(
     rollout_config: WbcRolloutConfig,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    model = mujoco.MjModel.from_xml_path(str(rollout_config.model_path))
-    configure_wbc_model(model)
+    model = load_wbc_model(rollout_config.model_path)
     low = []
     high = []
     for joint_name in MUJOCO_JOINT_NAMES:

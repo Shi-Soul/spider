@@ -25,6 +25,7 @@ from spider.tasks.g1_wbc.constants import (
     QPOS_DIM,
     QVEL_DIM,
     RIGHT_FOOT_BODY_NAME,
+    WXY_G1_MODEL_PATH,
 )
 from spider.tasks.g1_wbc.motion import (
     G1CommandBatch,
@@ -95,6 +96,100 @@ def _match_actuator_group(joint_name: str) -> tuple[float, float, float, float]:
     return matches[0]
 
 
+def _resolve_name_id(model: mujoco.MjModel, objtype: mujoco.mjtObj, name: str) -> int:
+    obj_id = mujoco.mj_name2id(model, objtype, name)
+    if obj_id >= 0:
+        return int(obj_id)
+    prefixed = f"robot/{name}"
+    obj_id = mujoco.mj_name2id(model, objtype, prefixed)
+    return int(obj_id)
+
+
+def _wxy_actuator_joint_names() -> tuple[str, ...]:
+    names: list[str] = []
+    for patterns, *_ in ACTUATOR_GROUPS:
+        for joint_name in MUJOCO_JOINT_NAMES:
+            if joint_name in names:
+                continue
+            if any(re.fullmatch(pattern, joint_name) for pattern in patterns):
+                names.append(joint_name)
+    if set(names) != set(MUJOCO_JOINT_NAMES):
+        missing = sorted(set(MUJOCO_JOINT_NAMES) - set(names))
+        extra = sorted(set(names) - set(MUJOCO_JOINT_NAMES))
+        raise ValueError(f"Invalid WXY actuator groups; missing={missing}, extra={extra}")
+    return tuple(names)
+
+
+def _configure_wxy_collision_spec(spec: mujoco.MjSpec) -> None:
+    foot_pattern = re.compile(r"^(left|right)_foot[1-7]_collision$")
+    for geom in spec.geoms:
+        name = geom.name or ""
+        if not re.fullmatch(r".*_collision", name):
+            geom.contype = 0
+            geom.conaffinity = 0
+            continue
+        geom.contype = 1
+        geom.conaffinity = 1
+        geom.condim = 1
+        geom.priority = 0
+        if foot_pattern.fullmatch(name):
+            geom.condim = 3
+            geom.priority = 1
+            geom.friction[0] = 0.6
+
+
+def _add_wxy_terrain_spec(spec: mujoco.MjSpec) -> None:
+    if any((geom.name or "") == "terrain" for geom in spec.geoms):
+        return
+    terrain_body = spec.worldbody.add_body(name="terrain")
+    terrain_body.add_geom(
+        name="terrain",
+        type=mujoco.mjtGeom.mjGEOM_PLANE,
+        size=(0.0, 0.0, 0.01),
+    )
+
+
+def _add_wxy_position_actuators(spec: mujoco.MjSpec) -> None:
+    existing = {actuator.name for actuator in spec.actuators}
+    for joint_name in _wxy_actuator_joint_names():
+        if joint_name in existing:
+            continue
+        kp, kd, effort, _ = _match_actuator_group(joint_name)
+        actuator = spec.add_actuator(name=joint_name, target=joint_name)
+        actuator.trntype = mujoco.mjtTrn.mjTRN_JOINT
+        actuator.dyntype = mujoco.mjtDyn.mjDYN_NONE
+        actuator.gaintype = mujoco.mjtGain.mjGAIN_FIXED
+        actuator.biastype = mujoco.mjtBias.mjBIAS_AFFINE
+        actuator.inheritrange = 0.0
+        actuator.ctrllimited = False
+        actuator.forcelimited = True
+        actuator.forcerange[0] = -float(effort)
+        actuator.forcerange[1] = float(effort)
+        actuator.gainprm[0] = float(kp)
+        actuator.biasprm[1] = -float(kp)
+        actuator.biasprm[2] = -float(kd)
+
+
+def _is_wxy_g1_model_path(model_path: str | Path) -> bool:
+    return Path(model_path).expanduser().name == WXY_G1_MODEL_PATH.name
+
+
+def load_wbc_model(model_path: str | Path) -> mujoco.MjModel:
+    """Load a G1 WBC model with tracking_bfm-compatible physics semantics."""
+
+    path = Path(model_path).expanduser()
+    if _is_wxy_g1_model_path(path):
+        spec = mujoco.MjSpec.from_file(str(path))
+        _configure_wxy_collision_spec(spec)
+        _add_wxy_terrain_spec(spec)
+        _add_wxy_position_actuators(spec)
+        model = spec.compile()
+    else:
+        model = mujoco.MjModel.from_xml_path(str(path))
+    configure_wbc_model(model)
+    return model
+
+
 def joint_actuator_specs(
     device: str | torch.device = "cpu",
 ) -> dict[str, torch.Tensor]:
@@ -134,15 +229,15 @@ def configure_wbc_model(model: mujoco.MjModel) -> None:
     model.opt.ls_iterations = 20
     if hasattr(model.opt, "ccd_iterations"):
         model.opt.ccd_iterations = 50
-    model.opt.tolerance = 1.0e-8
+    model.opt.tolerance = 1.0e-6
     model.opt.ls_tolerance = 1.0e-2
+    model.opt.disableflags = int(mujoco.mjtDisableBit.mjDSBL_ISLAND)
+    model.opt.enableflags = 0
 
     for joint_name in MUJOCO_JOINT_NAMES:
         kp, kd, effort, armature = _match_actuator_group(joint_name)
-        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
-        actuator_id = mujoco.mj_name2id(
-            model, mujoco.mjtObj.mjOBJ_ACTUATOR, joint_name
-        )
+        joint_id = _resolve_name_id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+        actuator_id = _resolve_name_id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, joint_name)
         if joint_id < 0 or actuator_id < 0:
             raise ValueError(f"G1 model is missing joint/actuator {joint_name}")
         dof_id = int(model.jnt_dofadr[joint_id])
@@ -169,13 +264,12 @@ class G1WbcMujocoWarpEnv:
         self.torch_device = torch.device(config.device)
         self.num_envs = int(config.num_envs)
 
-        self.model_cpu = mujoco.MjModel.from_xml_path(str(config.model_path))
-        configure_wbc_model(self.model_cpu)
+        self.model_cpu = load_wbc_model(config.model_path)
         self.data_cpu = mujoco.MjData(self.model_cpu)
         mujoco.mj_forward(self.model_cpu, self.data_cpu)
 
         self.body_ids = [
-            mujoco.mj_name2id(self.model_cpu, mujoco.mjtObj.mjOBJ_BODY, name)
+            _resolve_name_id(self.model_cpu, mujoco.mjtObj.mjOBJ_BODY, name)
             for name in MUJOCO_BODY_NAMES
         ]
         if any(body_id < 0 for body_id in self.body_ids):
@@ -185,9 +279,24 @@ class G1WbcMujocoWarpEnv:
             raise ValueError(f"G1 model is missing bodies: {missing}")
         self.root_body_id = self.body_ids[0]
         self.foot_geom_ids = self._resolve_foot_geoms()
-        self.floor_geom_id = mujoco.mj_name2id(
-            self.model_cpu, mujoco.mjtObj.mjOBJ_GEOM, "floor"
+        self.floor_geom_id = self._resolve_ground_geom()
+        self.ctrl_actuator_ids = torch.tensor(
+            [
+                _resolve_name_id(self.model_cpu, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+                for name in MUJOCO_JOINT_NAMES
+            ],
+            dtype=torch.long,
+            device=self.torch_device,
         )
+        if torch.any(self.ctrl_actuator_ids < 0):
+            missing = [
+                name
+                for name, actuator_id in zip(
+                    MUJOCO_JOINT_NAMES, self.ctrl_actuator_ids.detach().cpu().tolist()
+                )
+                if actuator_id < 0
+            ]
+            raise ValueError(f"G1 model is missing actuators: {missing}")
 
         wp.set_device(self.device)
         with wp.ScopedDevice(self.device):
@@ -205,9 +314,9 @@ class G1WbcMujocoWarpEnv:
     def _resolve_foot_geoms(self) -> tuple[torch.Tensor, torch.Tensor]:
         foot_ids: list[torch.Tensor] = []
         for body_name in (LEFT_FOOT_BODY_NAME, RIGHT_FOOT_BODY_NAME):
-            body_id = mujoco.mj_name2id(
-                self.model_cpu, mujoco.mjtObj.mjOBJ_BODY, body_name
-            )
+            body_id = _resolve_name_id(self.model_cpu, mujoco.mjtObj.mjOBJ_BODY, body_name)
+            if body_id < 0:
+                raise ValueError(f"G1 model is missing foot body {body_name}")
             geom_ids = [
                 geom_id
                 for geom_id in range(self.model_cpu.ngeom)
@@ -218,6 +327,13 @@ class G1WbcMujocoWarpEnv:
             )
         return foot_ids[0], foot_ids[1]
 
+    def _resolve_ground_geom(self) -> int:
+        for geom_name in ("terrain", "floor"):
+            geom_id = _resolve_name_id(self.model_cpu, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+            if geom_id >= 0:
+                return geom_id
+        return -1
+
     def reset(self, qpos: torch.Tensor, qvel: torch.Tensor | None = None) -> None:
         """Set all worlds to the provided state and recompute derived quantities."""
 
@@ -226,7 +342,9 @@ class G1WbcMujocoWarpEnv:
             qvel = torch.zeros(self.num_envs, QVEL_DIM, device=self.torch_device)
         else:
             qvel = self._batch_state(qvel, QVEL_DIM)
-        ctrl = self.default_joint_pos.view(1, -1).expand(self.num_envs, -1)
+        ctrl = self._joint_order_to_model_ctrl(
+            self.default_joint_pos.view(1, -1).expand(self.num_envs, -1)
+        )
         zeros_time = torch.zeros(self.num_envs, dtype=torch.float32, device=self.torch_device)
         zeros_qacc = torch.zeros(self.num_envs, QVEL_DIM, device=self.torch_device)
         with wp.ScopedDevice(self.device):
@@ -255,13 +373,29 @@ class G1WbcMujocoWarpEnv:
             ctrl = ctrl.view(1, ACTION_DIM).expand(self.num_envs, ACTION_DIM)
         if ctrl.shape != (self.num_envs, ACTION_DIM):
             raise ValueError(f"Expected ctrl {(self.num_envs, ACTION_DIM)}, got {ctrl.shape}")
+        model_ctrl = self._joint_order_to_model_ctrl(ctrl)
         with wp.ScopedDevice(self.device):
-            wp.copy(self.data_wp.ctrl, wp.from_torch(ctrl.contiguous()))
+            wp.copy(self.data_wp.ctrl, wp.from_torch(model_ctrl.contiguous()))
             for _ in range(DECIMATION):
                 mjwarp.step(self.model_wp, self.data_wp)
             mjwarp.forward(self.model_wp, self.data_wp)
         if self.config.sync_after_step:
             wp.synchronize()
+
+    def _joint_order_to_model_ctrl(self, ctrl: torch.Tensor) -> torch.Tensor:
+        if self.ctrl_actuator_ids.numel() == self.model_cpu.nu and torch.equal(
+            self.ctrl_actuator_ids,
+            torch.arange(self.model_cpu.nu, dtype=torch.long, device=self.torch_device),
+        ):
+            return ctrl.contiguous()
+        model_ctrl = torch.zeros(
+            self.num_envs,
+            self.model_cpu.nu,
+            dtype=ctrl.dtype,
+            device=self.torch_device,
+        )
+        model_ctrl[:, self.ctrl_actuator_ids] = ctrl
+        return model_ctrl.contiguous()
 
     def robot_state(self) -> RobotState:
         """Return the current robot state in tracking_bfm-compatible tensors."""
