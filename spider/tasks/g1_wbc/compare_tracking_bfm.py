@@ -121,6 +121,8 @@ def _run_tracking_bfm_trace(
     env_cfg.seed = int(seed)
     env_cfg.decimation = DECIMATION
     env_cfg.sim.mujoco.timestep = PHYSICS_DT
+    env_cfg.sim.nconmax = 512
+    env_cfg.sim.njmax = 2048
     env_cfg.commands["motion"].motion_file = str(motion_path)
     env_cfg.commands["motion"].motion_type = motion_type
     env_cfg.commands["motion"].history_steps = 0
@@ -221,6 +223,8 @@ def _reset_tracking_bfm_to_frame(
 ) -> None:
     device = command.time_steps.device
     env_ids = torch.arange(env.num_envs, device=device)
+    env.sim.reset(env_ids)
+    env.scene.reset(env_ids)
     command.motion_idx[:] = 0
     command.motion_length[:] = command.motion.file_lengths[0]
     command.time_steps[:] = int(frame)

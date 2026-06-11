@@ -6,7 +6,6 @@ is standalone inside SPIDER and does not import tracking_bfm at runtime.
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 import spider
@@ -196,7 +195,7 @@ WXY_G1_MODEL_PATH = (
 TBFM_MODEL_PKL_PATH = (
     Path(spider.ROOT) / "assets" / "robots" / "unitree_g1" / "tbfm_model.pkl"
 )
-DEFAULT_G1_MODEL_PATH = TBFM_MODEL_PKL_PATH
+DEFAULT_G1_MODEL_PATH = WXY_G1_MODEL_PATH
 DEFAULT_WXY_ROOT = Path(spider.ROOT).parents[1] / "wxy"
 DEFAULT_CKPT_DIRS = {
     "bc": DEFAULT_WXY_ROOT / "0608_ckpt_bc",
@@ -230,7 +229,7 @@ def _reflected_inertia(
     )
 
 
-_NATURAL_FREQ = 10.0 * 2.0 * math.pi
+_NATURAL_FREQ = 10.0 * 2.0 * 3.1415926535
 _DAMPING_RATIO = 2.0
 _ARMATURE_5020 = _reflected_inertia(
     (0.139e-4, 0.017e-4, 0.169e-4),

@@ -72,6 +72,7 @@ class RobotState:
     body_quat_w: torch.Tensor
     body_lin_vel_w: torch.Tensor
     body_ang_vel_w: torch.Tensor
+    base_ang_vel_b: torch.Tensor | None = None
 
 
 @dataclass
@@ -172,7 +173,10 @@ class G1WbcObservationBuilder:
             self.num_envs, -1
         )
         projected_gravity = quat_apply_inverse(root_quat, gravity_w)
-        base_ang_vel_b = quat_apply_inverse(root_quat, robot.body_ang_vel_w[:, 0])
+        if robot.base_ang_vel_b is None:
+            base_ang_vel_b = quat_apply_inverse(root_quat, robot.body_ang_vel_w[:, 0])
+        else:
+            base_ang_vel_b = robot.base_ang_vel_b
         joint_pos_rel = robot.qpos[:, 7:] - self.default_joint_pos
         joint_vel_rel = robot.qvel[:, 6:]
         motion_ref_ang_vel = ref["body_ang_vel_w"][:, self._tracking_anchor_index]

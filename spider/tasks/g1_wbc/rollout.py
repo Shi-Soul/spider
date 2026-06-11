@@ -50,9 +50,11 @@ class WbcRolloutConfig:
     num_envs: int = 1
     max_steps: int | None = None
     ref_offset: int = 0
-    nconmax_per_env: int = 96
-    njmax_per_env: int = 320
+    nconmax_per_env: int = 512
+    njmax_per_env: int = 2048
     sync_after_step: bool = True
+    forward_after_step: bool = True
+    use_cuda_graph: bool = True
 
 
 @dataclass
@@ -124,6 +126,11 @@ def _configure_wxy_collision_spec(spec: mujoco.MjSpec) -> None:
     foot_pattern = re.compile(r"^(?:robot/)?(left|right)_foot[1-7]_collision$")
     for geom in spec.geoms:
         name = geom.name or ""
+        if name in ("terrain", "floor"):
+            geom.contype = 1
+            geom.conaffinity = 1
+            geom.condim = 3
+            continue
         if not re.fullmatch(r".*_collision", name):
             geom.contype = 0
             geom.conaffinity = 0
@@ -149,14 +156,40 @@ def _add_wxy_terrain_spec(spec: mujoco.MjSpec) -> None:
     )
 
 
+def _add_wxy_self_collision_sensors(spec: mujoco.MjSpec) -> None:
+    """Add tracking_bfm's self-collision sensors to keep model layout identical."""
+
+    existing = {sensor.name for sensor in spec.sensors}
+    sensor_specs = (
+        ("self_collision_pelvis_found", 1 << 0),
+        ("self_collision_pelvis_force", 1 << 1),
+    )
+    for name, data_bits in sensor_specs:
+        if name in existing:
+            continue
+        spec.add_sensor(
+            name=name,
+            type=mujoco.mjtSensor.mjSENS_CONTACT,
+            objtype=mujoco.mjtObj.mjOBJ_XBODY,
+            objname="robot/pelvis",
+            reftype=mujoco.mjtObj.mjOBJ_XBODY,
+            refname="robot/pelvis",
+            intprm=(data_bits, 0, 1),
+        )
+
+
 def _add_wxy_actuators_to_spec(spec: mujoco.MjSpec) -> None:
     existing = {actuator.name for actuator in spec.actuators}
     for joint_name in _wxy_actuator_joint_names():
         prefixed = f"robot/{joint_name}"
         if prefixed in existing or joint_name in existing:
             continue
-        kp, kd, effort, _ = _match_actuator_group(joint_name)
-        actuator = spec.add_actuator(name=joint_name, target=prefixed)
+        kp, kd, effort, armature = _match_actuator_group(joint_name)
+        joint = spec.joint(prefixed)
+        joint.armature = float(armature)
+        joint.damping[0] = 0.0
+        joint.frictionloss = 0.0
+        actuator = spec.add_actuator(name=prefixed, target=prefixed)
         actuator.trntype = mujoco.mjtTrn.mjTRN_JOINT
         actuator.dyntype = mujoco.mjtDyn.mjDYN_NONE
         actuator.gaintype = mujoco.mjtGain.mjGAIN_FIXED
@@ -166,9 +199,28 @@ def _add_wxy_actuators_to_spec(spec: mujoco.MjSpec) -> None:
         actuator.forcelimited = True
         actuator.forcerange[0] = -float(effort)
         actuator.forcerange[1] = float(effort)
+        joint_range = joint.range
+        delta = float(effort) / float(kp)
+        actuator.ctrlrange[0] = float(joint_range[0]) - delta
+        actuator.ctrlrange[1] = float(joint_range[1]) + delta
         actuator.gainprm[0] = float(kp)
         actuator.biasprm[1] = -float(kp)
         actuator.biasprm[2] = -float(kd)
+
+
+def _add_wxy_init_keyframe(spec: mujoco.MjSpec) -> None:
+    """Add tracking_bfm's merged scene init keyframe."""
+
+    if any((key.name or "") == "init_state" for key in spec.keys):
+        return
+    qpos = [0.0, 0.0, 0.76, 1.0, 0.0, 0.0, 0.0]
+    qpos.extend(float(KNEES_BENT_JOINT_POS.get(name, 0.0)) for name in MUJOCO_JOINT_NAMES)
+    ctrl = []
+    for actuator in spec.actuators:
+        target = actuator.target or ""
+        joint_name = target.removeprefix("robot/")
+        ctrl.append(float(KNEES_BENT_JOINT_POS.get(joint_name, 0.0)))
+    spec.add_key(name="init_state", qpos=qpos, ctrl=ctrl)
 
 
 def _build_wxy_model() -> mujoco.MjModel:
@@ -177,20 +229,7 @@ def _build_wxy_model() -> mujoco.MjModel:
     wxy_path = WXY_G1_MODEL_PATH.expanduser().resolve()
     mesh_dir = str(wxy_path.parent / "meshes")
 
-    # Strip site elements that would auto-generate mocap actuators in MuJoCo 3.7.
     xml_text = wxy_path.read_text()
-    _SITE_NAMES_TO_STRIP = (
-        "imu_in_pelvis", "left_foot", "right_foot",
-        "imu_in_torso", "left_palm", "right_palm",
-    )
-    for site_name in _SITE_NAMES_TO_STRIP:
-        xml_text = re.sub(
-            rf'[ \t]*<site\s+name="{site_name}"[^>]*/>\s*\n?', "\n", xml_text,
-        )
-    # Also strip the unnamed default site tag.
-    xml_text = re.sub(
-        r'[ \t]*<site group="5" rgba="1 0 0 1"/>\s*\n?', "\n", xml_text,
-    )
     xml_text = xml_text.replace('meshdir="meshes"', f'meshdir="{mesh_dir}"')
     robot_spec = mujoco.MjSpec.from_string(xml_text)
 
@@ -200,11 +239,21 @@ def _build_wxy_model() -> mujoco.MjModel:
 
     # terrain first, then robot (matches tracking_bfm body ordering)
     _add_wxy_terrain_spec(spec)
+    spec.worldbody.add_site(
+        name="env_origin_0",
+        pos=(0.0, 0.0, 0.0),
+        size=(0.3, 0.3, 0.3),
+        type=mujoco.mjtGeom.mjGEOM_SPHERE,
+        rgba=(0.2, 0.6, 0.2, 0.3),
+        group=4,
+    )
     spec.attach(robot_spec, prefix="robot/",
                 frame=spec.worldbody.add_frame(name="robot_frame"))
 
     _configure_wxy_collision_spec(spec)
     _add_wxy_actuators_to_spec(spec)
+    _add_wxy_init_keyframe(spec)
+    _add_wxy_self_collision_sensors(spec)
     model = spec.compile()
     configure_wbc_model(model)
     return model
@@ -276,9 +325,9 @@ def configure_wbc_model(model: mujoco.MjModel) -> None:
     model.opt.ls_iterations = 20
     if hasattr(model.opt, "ccd_iterations"):
         model.opt.ccd_iterations = 50
-    model.opt.tolerance = 1.0e-6
+    model.opt.tolerance = 1.0e-8
     model.opt.ls_tolerance = 1.0e-2
-    model.opt.disableflags = int(mujoco.mjtDisableBit.mjDSBL_ISLAND) | int(mujoco.mjtDisableBit.mjDSBL_WARMSTART)
+    model.opt.disableflags = 0
     model.opt.enableflags = 0
 
     for joint_name in MUJOCO_JOINT_NAMES:
@@ -300,6 +349,8 @@ def configure_wbc_model(model: mujoco.MjModel) -> None:
         model.actuator_forcelimited[actuator_id] = 1
         model.actuator_forcerange[actuator_id] = (-effort, effort)
         model.actuator_ctrllimited[actuator_id] = 0
+    data = mujoco.MjData(model)
+    mujoco.mj_setConst(model, data)
 
 
 
@@ -348,6 +399,7 @@ class G1WbcMujocoWarpEnv:
         self.root_body_id = self.body_ids[0]
         self.foot_geom_ids = self._resolve_foot_geoms()
         self.floor_geom_id = self._resolve_ground_geom()
+        self.imu_ang_vel_slice = self._resolve_sensor_slice("robot/imu_ang_vel")
         self.ctrl_actuator_ids = torch.tensor(
             _resolve_actuator_ids_by_joint(self.model_cpu),
             dtype=torch.long,
@@ -357,6 +409,8 @@ class G1WbcMujocoWarpEnv:
         wp.set_device(self.device)
         with wp.ScopedDevice(self.device):
             self.model_wp = mjwarp.put_model(self.model_cpu)
+            self.model_wp.opt.ls_parallel = True
+            self.model_wp.opt.contact_sensor_maxmatch = 64
             self.data_wp = mjwarp.put_data(
                 self.model_cpu,
                 self.data_cpu,
@@ -364,6 +418,25 @@ class G1WbcMujocoWarpEnv:
                 nconmax=int(config.nconmax_per_env),
                 njmax=int(config.njmax_per_env),
             )
+            self.step_graph = None
+            self.forward_graph = None
+            self.reset_graph = None
+            self._reset_mask_wp = wp.zeros(self.num_envs, dtype=bool)
+            self._reset_mask = wp.to_torch(self._reset_mask_wp)
+            if config.use_cuda_graph and wp.get_device(self.device).is_cuda:
+                with wp.ScopedCapture() as capture:
+                    mjwarp.step(self.model_wp, self.data_wp)
+                self.step_graph = capture.graph
+                with wp.ScopedCapture() as capture:
+                    mjwarp.forward(self.model_wp, self.data_wp)
+                self.forward_graph = capture.graph
+                with wp.ScopedCapture() as capture:
+                    mjwarp.reset_data(
+                        self.model_wp,
+                        self.data_wp,
+                        reset=self._reset_mask_wp,
+                    )
+                self.reset_graph = capture.graph
         self.default_joint_pos = default_joint_pos_tensor(self.torch_device)
         self.action_scale = joint_actuator_specs(self.torch_device)["action_scale"]
 
@@ -390,6 +463,18 @@ class G1WbcMujocoWarpEnv:
                 return geom_id
         return -1
 
+    def _resolve_sensor_slice(self, sensor_name: str) -> slice | None:
+        sensor_id = mujoco.mj_name2id(
+            self.model_cpu,
+            mujoco.mjtObj.mjOBJ_SENSOR,
+            sensor_name,
+        )
+        if sensor_id < 0:
+            return None
+        start = int(self.model_cpu.sensor_adr[sensor_id])
+        dim = int(self.model_cpu.sensor_dim[sensor_id])
+        return slice(start, start + dim)
+
     def reset(self, qpos: torch.Tensor, qvel: torch.Tensor | None = None) -> None:
         """Set all worlds to the provided state and recompute derived quantities."""
 
@@ -398,18 +483,32 @@ class G1WbcMujocoWarpEnv:
             qvel = torch.zeros(self.num_envs, QVEL_DIM, device=self.torch_device)
         else:
             qvel = self._batch_state(qvel, QVEL_DIM)
-        ctrl = self._joint_order_to_model_ctrl(
-            self.default_joint_pos.view(1, -1).expand(self.num_envs, -1)
+        ctrl = torch.zeros(
+            self.num_envs,
+            ACTION_DIM,
+            dtype=torch.float32,
+            device=self.torch_device,
         )
+        ctrl = self._joint_order_to_model_ctrl(ctrl)
         zeros_time = torch.zeros(self.num_envs, dtype=torch.float32, device=self.torch_device)
-        zeros_qacc = torch.zeros(self.num_envs, QVEL_DIM, device=self.torch_device)
         with wp.ScopedDevice(self.device):
+            self._reset_mask.fill_(True)
+            if self.reset_graph is not None:
+                wp.capture_launch(self.reset_graph)
+            else:
+                mjwarp.reset_data(
+                    self.model_wp,
+                    self.data_wp,
+                    reset=self._reset_mask_wp,
+                )
             wp.copy(self.data_wp.qpos, wp.from_torch(qpos.contiguous()))
             wp.copy(self.data_wp.qvel, wp.from_torch(qvel.contiguous()))
             wp.copy(self.data_wp.ctrl, wp.from_torch(ctrl.contiguous()))
             wp.copy(self.data_wp.time, wp.from_torch(zeros_time.contiguous()))
-            wp.copy(self.data_wp.qacc, wp.from_torch(zeros_qacc.contiguous()))
-            mjwarp.forward(self.model_wp, self.data_wp)
+            if self.forward_graph is not None:
+                wp.capture_launch(self.forward_graph)
+            else:
+                mjwarp.forward(self.model_wp, self.data_wp)
         if self.config.sync_after_step:
             wp.synchronize()
 
@@ -433,8 +532,15 @@ class G1WbcMujocoWarpEnv:
         with wp.ScopedDevice(self.device):
             wp.copy(self.data_wp.ctrl, wp.from_torch(model_ctrl.contiguous()))
             for _ in range(DECIMATION):
-                mjwarp.step(self.model_wp, self.data_wp)
-            mjwarp.forward(self.model_wp, self.data_wp)
+                if self.step_graph is not None:
+                    wp.capture_launch(self.step_graph)
+                else:
+                    mjwarp.step(self.model_wp, self.data_wp)
+            if self.config.forward_after_step:
+                if self.forward_graph is not None:
+                    wp.capture_launch(self.forward_graph)
+                else:
+                    mjwarp.forward(self.model_wp, self.data_wp)
         if self.config.sync_after_step:
             wp.synchronize()
 
@@ -469,6 +575,11 @@ class G1WbcMujocoWarpEnv:
         lin_vel_w = lin_vel_c - torch.cross(
             ang_vel_w, root_subtree_com[:, None, :] - xpos, dim=-1
         )
+        base_ang_vel_b = None
+        if self.imu_ang_vel_slice is not None:
+            base_ang_vel_b = wp.to_torch(self.data_wp.sensordata)[
+                :, self.imu_ang_vel_slice
+            ].clone()
         return RobotState(
             qpos=qpos,
             qvel=qvel,
@@ -476,6 +587,7 @@ class G1WbcMujocoWarpEnv:
             body_quat_w=xquat,
             body_lin_vel_w=lin_vel_w,
             body_ang_vel_w=ang_vel_w,
+            base_ang_vel_b=base_ang_vel_b,
         )
 
     def foot_contact(self) -> tuple[torch.Tensor, torch.Tensor]:
