@@ -121,7 +121,7 @@ def _wxy_actuator_joint_names() -> tuple[str, ...]:
 
 
 def _configure_wxy_collision_spec(spec: mujoco.MjSpec) -> None:
-    foot_pattern = re.compile(r"^(left|right)_foot[1-7]_collision$")
+    foot_pattern = re.compile(r"^(?:robot/)?(left|right)_foot[1-7]_collision$")
     for geom in spec.geoms:
         name = geom.name or ""
         if not re.fullmatch(r".*_collision", name):
@@ -274,7 +274,7 @@ def configure_wbc_model(model: mujoco.MjModel) -> None:
         model.opt.ccd_iterations = 50
     model.opt.tolerance = 1.0e-6
     model.opt.ls_tolerance = 1.0e-2
-    model.opt.disableflags = int(mujoco.mjtDisableBit.mjDSBL_ISLAND)
+    model.opt.disableflags = int(mujoco.mjtDisableBit.mjDSBL_ISLAND) | int(mujoco.mjtDisableBit.mjDSBL_WARMSTART)
     model.opt.enableflags = 0
 
     for joint_name in MUJOCO_JOINT_NAMES:
