@@ -78,8 +78,60 @@ class _ViserState:
     playback_speed: int = 0
     playback_thread: Any | None = None
 
+    # Optimization-process recording (timeline of all transform updates).
+    recording_serializer: Any | None = None
+    recording_dt: float = 0.02
+
 
 _STATE = _ViserState()
+
+
+def start_recording(dt: float = 0.02) -> None:
+    """Begin recording every frame update into a serializable timeline.
+
+    After this call, every viser scene message (transform updates from
+    log_frame, etc.) is also routed to a StateSerializer. Call
+    `end_recording_and_save(path)` after the optimization loop to write
+    the full timeline to a .viser file.
+
+    Args:
+        dt: Wall-clock spacing (seconds) inserted between frames in the
+            recording. Use the simulator's render_dt or sim_dt.
+    """
+    if _STATE.server is None:
+        return
+    if _STATE.recording_serializer is not None:
+        # Already recording; nothing to do.
+        return
+    _STATE.recording_serializer = _STATE.server.get_scene_serializer()
+    _STATE.recording_dt = float(dt)
+
+
+def tick_recording() -> None:
+    """Advance the recording timeline by one dt.
+
+    Call this once per logged frame in the optimization loop. Any frame
+    updates emitted between calls are stored at the current time.
+    """
+    if _STATE.recording_serializer is None:
+        return
+    _STATE.recording_serializer.insert_sleep(_STATE.recording_dt)
+
+
+def end_recording_and_save(path: str) -> bool:
+    """Serialize the recorded timeline to disk. Returns True on success."""
+    if _STATE.recording_serializer is None:
+        return False
+    try:
+        from pathlib import Path
+
+        data = _STATE.recording_serializer.serialize()
+        Path(path).write_bytes(data)
+        return True
+    except Exception:
+        return False
+    finally:
+        _STATE.recording_serializer = None
 
 
 # -----------------------------

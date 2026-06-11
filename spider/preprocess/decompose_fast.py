@@ -13,7 +13,6 @@ except ModuleNotFoundError:
 
 import json
 import os
-from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
@@ -22,12 +21,11 @@ from loguru import logger
 from scipy.spatial.transform import Rotation as _ScipyR
 
 import spider
+from spider.preprocess._decompose_common import MeshPart, flatten_base
 
 
 def _R_from_quat(q_xyzw: np.ndarray) -> np.ndarray:
     return _ScipyR.from_quat(q_xyzw).as_matrix()
-
-MeshPart = tuple[np.ndarray, np.ndarray]
 
 
 def fast_voxel_convex_decomp_from_pointcloud(
@@ -52,104 +50,6 @@ def fast_voxel_convex_decomp_from_pointcloud(
     return hulls
 
 
-def flatten_base(
-    hulls: Iterable[MeshPart],
-    thickness: float = 0.01,
-    R_world_local: np.ndarray | None = None,
-    obj_world_pos: np.ndarray | None = None,
-    floor_z: float = 0.0,
-    pad: float = 0.05,
-    well_below_offset: float = 0.0,
-) -> list[MeshPart]:
-    """Append a thin plate that supports the object resting on a world-frame floor.
-
-    If ``R_world_local`` and ``obj_world_pos`` are given, the plate is added in
-    the object's *local* frame so that, when the free joint is set to
-    (obj_world_pos, R_world_local), the plate sits *above* the world floor at
-    ``floor_z`` (its bottom face just above the floor, top face supporting the
-    object's lowest convex hulls). This guarantees the object does NOT drop in
-    the first physics frame and avoids overlap between the plate and the world
-    floor that would push the object up.
-
-    Otherwise (the legacy behavior), the plate is placed at the convex hull's
-    local-frame ``min_z``.
-
-    The plate's XY extent is the object's world-frame bbox padded by ``pad``
-    so it is large enough to support the object even if it tilts slightly.
-    """
-    hull_list = list(hulls)
-    if not hull_list:
-        return hull_list
-
-    all_vertices = np.vstack([vertices for vertices, _ in hull_list])
-
-    if R_world_local is not None and obj_world_pos is not None:
-        # Compute world-frame XY footprint of the object.
-        v_world = (R_world_local @ all_vertices.T).T + obj_world_pos
-        wx_min, wx_max = v_world[:, 0].min() - pad, v_world[:, 0].max() + pad
-        wy_min, wy_max = v_world[:, 1].min() - pad, v_world[:, 1].max() + pad
-        # Place the plate so its TOP is at ``floor_z - well_below_offset``
-        # (i.e. well below the object's lowest world-frame z) and the plate
-        # extends ``thickness`` downward from there. The plate is body-fixed
-        # to the object and follows it through the trajectory, but its low
-        # offset means the plate sits well clear of the trajectory motion in
-        # world frame and doesn't interfere with the object's natural path.
-        z_top = floor_z - well_below_offset
-        z_bot = z_top - thickness
-        corners_world_top = np.array(
-            [
-                [wx_min, wy_min, z_top],
-                [wx_max, wy_min, z_top],
-                [wx_max, wy_max, z_top],
-                [wx_min, wy_max, z_top],
-            ]
-        )
-        corners_world_bot = corners_world_top.copy()
-        corners_world_bot[:, 2] = z_bot
-        corners_world = np.vstack([corners_world_bot, corners_world_top])
-        # Transform world -> local: v_local = R^T (v_world - obj_world_pos)
-        plate_vertices = (R_world_local.T @ (corners_world - obj_world_pos).T).T
-    else:
-        min_x, max_x = np.min(all_vertices[:, 0]), np.max(all_vertices[:, 0])
-        min_y, max_y = np.min(all_vertices[:, 1]), np.max(all_vertices[:, 1])
-        min_z = np.min(all_vertices[:, 2])
-        z0 = min_z
-        z1 = min_z + thickness
-        plate_vertices = np.array(
-            [
-                [min_x, min_y, z0],
-                [max_x, min_y, z0],
-                [max_x, max_y, z0],
-                [min_x, max_y, z0],
-                [min_x, min_y, z1],
-                [max_x, min_y, z1],
-                [max_x, max_y, z1],
-                [min_x, max_y, z1],
-            ]
-        )
-
-    plate_faces = np.array(
-        [
-            [0, 1, 2],
-            [0, 2, 3],
-            [4, 5, 6],
-            [4, 6, 7],
-            [0, 1, 5],
-            [0, 5, 4],
-            [1, 2, 6],
-            [1, 6, 5],
-            [2, 3, 7],
-            [2, 7, 6],
-            [3, 0, 4],
-            [3, 4, 7],
-        ],
-        dtype=int,
-    )
-
-    hull_list.append((plate_vertices, plate_faces))
-    return hull_list
-
-
 def main(
     dataset_dir: str = f"{spider.ROOT}/../example_datasets",
     dataset_name: str = "oakink",
@@ -157,11 +57,18 @@ def main(
     embodiment_type: str = "bimanual",
     task: str = "pick_spoon_bowl",
     data_id: int = 0,
-    add_floor: bool = False,
-    floor_well_below_offset: float = 0.05,
+    add_flat_base: bool = True,
+    plate_size: float = 0.03,
+    plate_thickness: float = 0.01,
     check_stability: bool = False,
     stability_max_drift: float = 0.005,
 ) -> None:
+    logger.warning(
+        "decompose_fast uses voxel-cluster convex hulls and does NOT capture "
+        "concavities (handles, mug interiors). For non-convex objects with "
+        "handles (teapot, mug, cup, kettle), prefer spider/preprocess/decompose.py "
+        "(CoACD-based) for better retargeting performance."
+    )
     dataset_path = Path(dataset_dir)
 
     if embodiment_type == "right":
@@ -208,8 +115,12 @@ def main(
             if key in kp.files and len(kp[key]) > 0:
                 pos = kp[key][0, :3]
                 q_wxyz = kp[key][0, 3:]
-                # only keep if the pose looks valid (not a zero placeholder)
-                if not (np.allclose(pos, 0) and np.allclose(q_wxyz, [1, 0, 0, 0])):
+                # skip placeholder (zero-pos identity-quat) and degenerate
+                # (zero-norm quat) entries -- the latter is what bimanual
+                # gigahand uses for the inactive hand.
+                placeholder = np.allclose(pos, 0) and np.allclose(q_wxyz, [1, 0, 0, 0])
+                degenerate = float(np.linalg.norm(q_wxyz)) < 1e-6
+                if not (placeholder or degenerate):
                     q_xyzw = np.concatenate([q_wxyz[1:], q_wxyz[:1]])
                     R_obj = np.asarray(_R_from_quat(q_xyzw))
                     first_obj_pose[h] = (pos, R_obj)
@@ -243,40 +154,63 @@ def main(
             logger.warning("No convex parts generated for {}; skipping export.", hand)
             continue
 
-        if add_floor:
+        if add_flat_base:
             pose = first_obj_pose.get(hand)
             if pose is not None:
                 obj_pos, R_obj = pose
-                # Place the plate flush with the object's lowest world-frame
-                # vertex at first-frame so the object rests stably without
-                # dropping or hovering. The world floor sits 1mm below the
-                # plate so they never overlap.
                 hull_verts = np.vstack([v for v, _ in hulls])
                 v_world = (R_obj @ hull_verts.T).T + obj_pos
                 obj_min_world_z = float(v_world[:, 2].min())
+                # xy of the lowest contact point -- the support plate sits
+                # directly under this, not under the object root (which can be
+                # 20+ cm away from the actual contact surface for objects with
+                # off-center geometry like the arctic box).
+                near_floor_mask = v_world[:, 2] < obj_min_world_z + 1e-3
+                low_xy = v_world[near_floor_mask, :2].mean(axis=0)
                 hulls = flatten_base(
                     hulls,
+                    thickness=plate_thickness,
                     R_world_local=R_obj,
                     obj_world_pos=obj_pos,
                     floor_z=obj_min_world_z,
-                    well_below_offset=floor_well_below_offset,
+                    plate_xy=low_xy,
+                    plate_size=plate_size,
                 )
-                plate_top_z = obj_min_world_z - floor_well_below_offset
+                # Plate's bottom is flush with object's lowest world z; top is
+                # plate_thickness above. Object's effective lowest z stays
+                # unchanged (the plate lives inside the object's lower bbox).
+                plate_top_z = obj_min_world_z + plate_thickness
                 task_info[f"{hand}_plate_top_world_z"] = float(plate_top_z)
-                task_info["floor_well_below_offset"] = float(floor_well_below_offset)
+                task_info[f"{hand}_plate_bottom_world_z"] = float(obj_min_world_z)
+                task_info[f"{hand}_obj_first_frame_xy"] = [
+                    float(low_xy[0]),
+                    float(low_xy[1]),
+                ]
+                task_info["plate_size"] = float(plate_size)
+                task_info["plate_thickness"] = float(plate_thickness)
                 logger.info(
-                    "Added support plate for {} hand: top at world z={:.4f} "
-                    "({:.2f}m below object's frame-0 bottom).",
-                    hand, plate_top_z, floor_well_below_offset,
+                    "Added 3x3cm flat base for {} hand: plate bottom at "
+                    "world z={:.4f}, top at z={:.4f} (object lowest z "
+                    "unchanged).",
+                    hand, obj_min_world_z, plate_top_z,
                 )
             else:
-                hulls = flatten_base(hulls)
+                hulls = flatten_base(
+                    hulls,
+                    thickness=plate_thickness,
+                    plate_size=plate_size,
+                )
                 logger.warning(
                     "No first-frame obj pose for {} hand; falling back to "
                     "local-frame plate (object may not rest stably on floor).",
                     hand,
                 )
+        # clear stale .obj files so a smaller decomposition doesn't leave
+        # leftover hulls from a previous run (which generate_xml would still
+        # load and over-collide).
         output_dir.mkdir(parents=True, exist_ok=True)
+        for stale in output_dir.glob("*.obj"):
+            stale.unlink()
 
         for idx, (vertices, faces) in enumerate(hulls):
             mesh_part = trimesh.Trimesh(vertices, faces)
@@ -317,15 +251,16 @@ def main(
                 )
                 continue
             convex_path = dataset_path / convex_dir
-            plate_top_z = task_info.get(f"{hand}_plate_top_world_z")
-            if plate_top_z is not None:
-                floor_z = float(plate_top_z) - 0.01 - 0.001
+            # World floor sits at the object's lowest world z at frame 0
+            # (which the dataset processor offsets to 0). The plate is
+            # body-fixed and sits inside the object's lower bbox; the floor
+            # catches the object's actual mesh.
+            plate_bottom_z = task_info.get(f"{hand}_plate_bottom_world_z")
+            if plate_bottom_z is not None:
+                floor_z = float(plate_bottom_z)
             else:
                 obj_min_z = task_info.get("obj_first_frame_lowest_world_z")
-                if obj_min_z is not None:
-                    floor_z = float(obj_min_z) - 0.01 - 0.001
-                else:
-                    floor_z = 0.0
+                floor_z = float(obj_min_z) if obj_min_z is not None else 0.0
             ok, drift = _check_initial_stability(
                 convex_path, pose[0], pose[1],
                 floor_z=floor_z, max_drift=stability_max_drift,

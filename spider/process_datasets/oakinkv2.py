@@ -101,6 +101,12 @@ def _try_load_mano_layer(mano_assets_root: str | None):
         mano_assets_root=mano_assets_root,
         rot_mode="quat",
         side="right",
+        # center_idx=0: OakInk2's `rh__tsl` IS the wrist's world position
+        # (smplx-style). manotorch's joints include a canonical wrist offset
+        # (~10 cm in x), so we must zero-center on the wrist before adding
+        # tsl, otherwise wrist + every fingertip get shifted by that offset
+        # — which manifests downstream as the hand floating ~10 cm away from
+        # the object it should be grasping.
         center_idx=0,
         use_pca=False,
         flat_hand_mean=True,
@@ -384,17 +390,25 @@ def main(
 
     # 11. global rotation: oakink y-up -> mujoco z-up
     r_global = R.from_euler("xyz", [np.pi / 2, 0, 0])
-    # Wrist offset for raw OakInk2 pose_coeffs (vs the maniptrans-style offset in
-    # ``oakink.py``). Empirically the ManipTrans wrist axis-angle equals
-    # raw_R * C with C ~ Rx(180°) * Rz(96°) (averaged across 3 sequences).
-    # Composing C with oakink.py's offset (Rx(pi/2) * Rz(pi)) gives the
-    # equivalent transform we should apply when starting from raw pose_coeffs.
-    _C_quat_xyzw = np.array([0.67038494, 0.74167282, -0.01732714, 0.0143258])
-    _C = R.from_quat(_C_quat_xyzw)
-    _old_offset = R.from_euler("xyz", [np.pi / 2, 0, 0]) * R.from_euler(
-        "xyz", [0, 0, np.pi]
-    )
-    r_right_wrist_offset = _C * _old_offset
+    # Wrist offset: maps the MANO canonical right-hand frame to xhand's
+    # ``right_palm`` site frame. Columns of the matrix are (site_x, site_y,
+    # site_z) expressed in the MANO canonical-hand basis (right TPose:
+    # fingers along -x_mano, thumb along +z_mano). At wrist rot=0 in MANO
+    # this gives:
+    #   site_z (xhand fingers) → -x_mano  (matches MANO TPose fingers)
+    #   site_y (xhand thumb side) → +z_mano (matches MANO TPose thumb)
+    #
+    # Replaces the previous ``Rx(pi/2)*Rz(pi)`` (with an unstable empirical
+    # ``_C`` correction): that version shipped from oakink.py via
+    # ManipTrans-preprocessed data, which silently re-baked the wrist
+    # axis-angle into a non-MANO-canonical convention. Reading raw OakInk2
+    # ``pose_coeffs`` directly (as we do now) requires the MANO-canonical
+    # offset below.
+    r_right_wrist_offset = R.from_matrix(np.array([
+        [0.0, 0.0, -1.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ]))
 
     # 12. build qpos arrays (5 fingertips kept for downstream IK schema)
     unit_quat = np.array([1, 0, 0, 0])
@@ -431,20 +445,36 @@ def main(
     qpos_finger_left[:, :, 3:] = unit_quat
     qpos_obj_left[:, 3:] = unit_quat
 
-    # Compute the object's lowest world-frame z at frame 0 (where to place
-    # the support plate, if any) AND the lowest z over the whole trajectory
-    # across the object mesh + hand keypoints (where to place the world floor
-    # so nothing dips below it). We DO NOT shift the trajectory — preserve raw
-    # mocap coordinates.
+    # Compute the object's lowest world-frame z at frame 0. If the object
+    # starts in the air (frame-0 lowest z > 0), shift the entire trajectory
+    # down so that the object's lowest point at frame 0 sits at z=0. This way
+    # the world floor at z=0 catches the object naturally without needing any
+    # static support geometry.
     visual_mesh = pymeshlab.MeshSet()
     visual_mesh.load_new_mesh(f"{mesh_dir}/visual.obj")
     obj_verts_local = np.asarray(visual_mesh.current_mesh().vertex_matrix())
     R_obj0 = R.from_matrix(obj_traj[0][:3, :3])
     R_world = r_global * R_obj0
-    obj_verts_world_z_frame0 = (
-        R_world.apply(obj_verts_local) + qpos_obj_right[0, :3]
-    ).min(axis=0)[2]
-    # Sample object's lowest world z at every output frame and take the global min.
+    obj_verts_world_z_frame0 = float(
+        (R_world.apply(obj_verts_local) + qpos_obj_right[0, :3]).min(axis=0)[2]
+    )
+
+    z_offset = obj_verts_world_z_frame0
+    if abs(z_offset) > 1e-6:
+        qpos_wrist_right[:, 2] -= z_offset
+        qpos_finger_right[:, :, 2] -= z_offset
+        qpos_obj_right[:, 2] -= z_offset
+        # Left arrays are zero placeholders for embodiment_type='right'; shift
+        # them too in case downstream readers compare against them.
+        qpos_wrist_left[:, 2] -= z_offset
+        qpos_finger_left[:, :, 2] -= z_offset
+        qpos_obj_left[:, 2] -= z_offset
+        loguru.logger.info(
+            f"Object started at z={z_offset:+.3f}m; offset trajectory by "
+            f"-{z_offset:+.3f}m so frame-0 obj lowest z is now 0."
+        )
+
+    obj_verts_world_z_frame0 = 0.0  # by construction after offset
     obj_min_z_per_frame = []
     for k in range(n):
         Rk = r_global * R.from_matrix(obj_traj[k][:3, :3])
@@ -456,20 +486,25 @@ def main(
         qpos_wrist_right[:, 2].min(),
         qpos_finger_right[:, :, 2].min(),
     ))
-    # If the trajectory takes the object significantly below its frame-0
-    # height (e.g. the cap of uncap_alcohol_burner moving down during the
-    # uncap motion), a fixed support plate at frame-0 level would block
-    # physics and clip through the floor. In that case, skip the plate and
-    # rely on the world floor alone for support.
     object_descends = obj_min_z_traj < obj_verts_world_z_frame0 - 0.02
     task_info["obj_first_frame_lowest_world_z"] = float(obj_verts_world_z_frame0)
     task_info["scene_lowest_world_z"] = scene_min_z
     task_info["object_descends_from_frame0"] = bool(object_descends)
+    task_info["trajectory_z_offset"] = float(z_offset)
+    task_info["right_obj_first_frame_xy"] = [
+        float(qpos_obj_right[0, 0]),
+        float(qpos_obj_right[0, 1]),
+    ]
+    task_info["left_obj_first_frame_xy"] = [
+        float(qpos_obj_left[0, 0]),
+        float(qpos_obj_left[0, 1]),
+    ]
     with open(task_info_path, "w") as f:
         json.dump(task_info, f, indent=2)
     loguru.logger.info(
-        f"Object frame-0 lowest world z = {obj_verts_world_z_frame0:+.3f}m; "
-        f"scene lowest world z = {scene_min_z:+.3f}m"
+        f"After offset: object frame-0 lowest world z = "
+        f"{obj_verts_world_z_frame0:+.3f}m; scene lowest world z = "
+        f"{scene_min_z:+.3f}m"
         + (" (object descends -- skip support plate)" if object_descends else "")
     )
 

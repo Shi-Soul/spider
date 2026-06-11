@@ -15,9 +15,16 @@ import os
 
 import coacd
 import loguru
+import numpy as np
 import tyro
+from scipy.spatial.transform import Rotation as _ScipyR
 
 import spider
+from spider.preprocess._decompose_common import flatten_base
+
+
+def _R_from_quat(q_xyzw: np.ndarray) -> np.ndarray:
+    return _ScipyR.from_quat(q_xyzw).as_matrix()
 
 
 def main(
@@ -27,6 +34,9 @@ def main(
     embodiment_type: str = "bimanual",
     task: str = "pick_spoon_bowl",
     data_id: int = 0,
+    add_flat_base: bool = True,
+    plate_size: float = 0.03,
+    plate_thickness: float = 0.01,
 ):
     dataset_dir = os.path.abspath(dataset_dir)
     if embodiment_type == "right":
@@ -49,6 +59,30 @@ def main(
     with open(task_info_path) as f:
         task_info = json.load(f)
 
+    # Load first-frame object pose so a flat base can be aligned with the
+    # object's actual lowest world-frame point.
+    keypoints_path = f"{processed_dir}/trajectory_keypoints.npz"
+    first_obj_pose: dict[str, tuple[np.ndarray, np.ndarray] | None] = {
+        "right": None,
+        "left": None,
+    }
+    if os.path.exists(keypoints_path):
+        kp = np.load(keypoints_path)
+        for h in ("right", "left"):
+            key = f"qpos_obj_{h}"
+            if key in kp.files and len(kp[key]) > 0:
+                pos = kp[key][0, :3]
+                q_wxyz = kp[key][0, 3:]
+                # skip placeholder (zero-pos identity-quat) and degenerate
+                # (zero-norm quat) entries -- the latter is what bimanual
+                # gigahand uses for the inactive hand.
+                placeholder = np.allclose(pos, 0) and np.allclose(q_wxyz, [1, 0, 0, 0])
+                degenerate = float(np.linalg.norm(q_wxyz)) < 1e-6
+                if not (placeholder or degenerate):
+                    q_xyzw = np.concatenate([q_wxyz[1:], q_wxyz[:1]])
+                    R_obj = np.asarray(_R_from_quat(q_xyzw))
+                    first_obj_pose[h] = (pos, R_obj)
+
     for hand in hands:
         if hand == "right":
             mesh_dir = task_info.get("right_object_mesh_dir")
@@ -69,9 +103,9 @@ def main(
         mesh = trimesh.load(
             input_file, force="mesh", process=False, skip_materials=True
         )
-        mesh = coacd.Mesh(mesh.vertices, mesh.faces)
+        coacd_mesh = coacd.Mesh(mesh.vertices, mesh.faces)
         result = coacd.run_coacd(
-            mesh,
+            coacd_mesh,
             threshold=0.07,
             max_convex_hull=16,
             preprocess_mode="auto",
@@ -89,10 +123,64 @@ def main(
             apx_mode="ch",
             seed=1,
         )
-        # ensure output directory exists
+
+        hulls = [
+            (np.asarray(vs), np.asarray(fs, dtype=int)) for (vs, fs) in result
+        ]
+
+        if add_flat_base:
+            pose = first_obj_pose.get(hand)
+            if pose is not None:
+                obj_pos, R_obj = pose
+                hull_verts = np.vstack([v for v, _ in hulls])
+                v_world = (R_obj @ hull_verts.T).T + obj_pos
+                obj_min_world_z = float(v_world[:, 2].min())
+                near_floor_mask = v_world[:, 2] < obj_min_world_z + 1e-3
+                low_xy = v_world[near_floor_mask, :2].mean(axis=0)
+                hulls = flatten_base(
+                    hulls,
+                    thickness=plate_thickness,
+                    R_world_local=R_obj,
+                    obj_world_pos=obj_pos,
+                    floor_z=obj_min_world_z,
+                    plate_xy=low_xy,
+                    plate_size=plate_size,
+                )
+                plate_top_z = obj_min_world_z + plate_thickness
+                task_info[f"{hand}_plate_top_world_z"] = float(plate_top_z)
+                task_info[f"{hand}_plate_bottom_world_z"] = float(obj_min_world_z)
+                task_info[f"{hand}_obj_first_frame_xy"] = [
+                    float(low_xy[0]),
+                    float(low_xy[1]),
+                ]
+                task_info["plate_size"] = float(plate_size)
+                task_info["plate_thickness"] = float(plate_thickness)
+                loguru.logger.info(
+                    f"Added 3x3cm flat base for {hand} hand: plate bottom at "
+                    f"world z={obj_min_world_z:.4f}, top at z={plate_top_z:.4f} "
+                    "(object lowest z unchanged)."
+                )
+            else:
+                hulls = flatten_base(
+                    hulls,
+                    thickness=plate_thickness,
+                    plate_size=plate_size,
+                )
+                loguru.logger.warning(
+                    f"No first-frame obj pose for {hand} hand; falling back to "
+                    "local-frame plate (object may not rest stably on floor)."
+                )
+
+        # ensure output directory exists; clear any prior .obj files so a
+        # smaller decomposition doesn't leave stale hulls from a previous run
+        # (which generate_xml would still load and over-collide).
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
-        for i, (vs, fs) in enumerate(result):
+        else:
+            for stale in os.listdir(output_dir):
+                if stale.endswith(".obj"):
+                    os.remove(os.path.join(output_dir, stale))
+        for i, (vs, fs) in enumerate(hulls):
             mesh_part = trimesh.Trimesh(vs, fs)
             part_filename = f"{output_dir}/{i}.obj"
             mesh_part.export(part_filename)

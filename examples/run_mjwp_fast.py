@@ -50,6 +50,7 @@ from spider.optimizers.sampling_fast import (
 )
 from spider.postprocess.get_success_rate import compute_object_tracking_error
 from spider.simulators.mjwp import (
+    _initial_state_sanity_check,
     copy_sample_state,
     get_qpos,
     get_qvel,
@@ -238,6 +239,25 @@ def main(config: Config):
     mujoco.mj_step(mj_model, mj_data)
     mj_data.time = 0.0
 
+    # Initial-state stability sanity check (CPU MuJoCo only). Disabled when
+    # config.sanity_check_seconds <= 0.0.
+    if config.sanity_check_seconds > 0.0:
+        _initial_state_sanity_check(
+            mj_model,
+            mj_data,
+            qpos_ref,
+            qvel_ref,
+            ctrl_ref,
+            config,
+            save_video_dir=config.output_dir,
+        )
+        # Restore initial scene state after the check.
+        mj_data.qpos[:] = qpos_ref[0].detach().cpu().numpy()
+        mj_data.qvel[:] = qvel_ref[0].detach().cpu().numpy()
+        mj_data.ctrl[:] = ctrl_ref[0].detach().cpu().numpy()
+        mujoco.mj_step(mj_model, mj_data)
+        mj_data.time = 0.0
+
     images = []
     object_trace_site_ids = []
     robot_trace_site_ids = []
@@ -274,6 +294,78 @@ def main(config: Config):
     # setup viewer and renderer
     run_viewer = setup_viewer(config, mj_model, mj_data)
     renderer = setup_renderer(config, mj_model)
+
+    # If viser is enabled and the user wants the recording saved, start
+    # recording NOW so every per-frame transform update from log_frame is
+    # captured to a serializable timeline (a single .viser file).
+    _viser_recording_active = False
+    if "viser" in (config.viewer or "").lower() and config.save_viser:
+        try:
+            from spider.viewers.viser_viewer import start_recording
+
+            start_recording(dt=float(config.render_dt))
+            _viser_recording_active = True
+        except Exception as e:
+            loguru.logger.warning(f"Failed to start viser recording: {e}")
+
+    # Register an atexit + SIGTERM handler so timeout-killed runs still
+    # flush whatever optimization video / viser timeline was captured.
+    # Without this, mp4 + .viser are only written if main() reaches its
+    # end-of-loop save block, which fails-to-converge runs never do.
+    import atexit
+    import os as _os
+    import signal as _signal
+
+    _flushed = {"done": False}
+
+    def _emergency_flush() -> None:
+        if _flushed["done"]:
+            return
+        _flushed["done"] = True
+        # Save partial mp4 if any frames are queued
+        try:
+            if config.save_video and len(images) > 0:
+                video_path = (
+                    f"{config.output_dir}/visualization_mjwp_fast.mp4"
+                )
+                imageio.mimsave(
+                    video_path,
+                    images,
+                    fps=int(1 / config.render_dt),
+                )
+                loguru.logger.warning(
+                    f"[emergency flush] Saved partial video ({len(images)} frames) to {video_path}"
+                )
+        except Exception as e:  # noqa: BLE001
+            loguru.logger.warning(f"[emergency flush] mp4 save failed: {e}")
+        # Save viser timeline if recording was started
+        try:
+            if _viser_recording_active:
+                from spider.viewers.viser_viewer import end_recording_and_save
+
+                viser_path = (
+                    f"{config.output_dir}/visualization_mjwp_fast.viser"
+                )
+                if end_recording_and_save(viser_path):
+                    loguru.logger.warning(
+                        f"[emergency flush] Saved partial viser timeline to {viser_path}"
+                    )
+        except Exception as e:  # noqa: BLE001
+            loguru.logger.warning(f"[emergency flush] viser save failed: {e}")
+
+    atexit.register(_emergency_flush)
+
+    def _on_sigterm(_sig, _frame) -> None:
+        loguru.logger.warning("Received SIGTERM; flushing artifacts.")
+        _emergency_flush()
+        # Re-raise default handler so the process actually exits.
+        _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+        _os.kill(_os.getpid(), _signal.SIGTERM)
+
+    try:
+        _signal.signal(_signal.SIGTERM, _on_sigterm)
+    except Exception:  # noqa: BLE001
+        pass
 
     # setup optimizer — use fast variants
     rollout = make_rollout_fn_fast(
@@ -380,6 +472,15 @@ def main(config: Config):
                     viewer_body_entity_and_ids=config.viewer_body_entity_and_ids,
                     data_ref=mj_data_ref,
                 )
+                # Tick the optimization-process recording so this frame is
+                # placed at its own timestamp on the timeline.
+                if "viser" in config.viewer and config.save_viser:
+                    try:
+                        from spider.viewers.viser_viewer import tick_recording
+
+                        tick_recording()
+                    except Exception:
+                        pass
             si["qpos"].append(mj_data.qpos.copy())
             si["qvel"].append(mj_data.qvel.copy())
             si["time"].append(mj_data.time)
@@ -447,8 +548,10 @@ def main(config: Config):
                     if isinstance(bqp_diag, np.ndarray)
                     else bqp_diag
                 ).to(config.device)
-                avail = min(config.ctrl_steps, ref_slice[0].shape[0] - 1)
-                ref_qpos_diag = ref_slice[0][1 : avail + 1].to(config.device)
+                # Same alignment as in sampling_fast.optimize: recorded_qpos[i]
+                # lives at ref index sim_step+1+i = ref_slice[0][i] (NOT [i+1]).
+                avail = min(config.ctrl_steps, ref_slice[0].shape[0])
+                ref_qpos_diag = ref_slice[0][:avail].to(config.device)
                 _, err_info = check_tracking_error(config, bqp_t[:avail], ref_qpos_diag)
                 infos["step_pos_error"] = np.array([err_info["max_pos_error"]])
                 infos["step_rot_error"] = np.array([err_info["max_rot_error"]])
@@ -478,13 +581,13 @@ def main(config: Config):
                 last_snap_idx = infos["best_idx"]
                 sim_step = _replay_and_advance(sim_step, infos)
 
-            elif ctx.local_retries < config.max_revert_forward_attempts:
+            elif ctx.local_retries < config.max_local_retries:
                 # --- LOCAL_RETRY ---
                 ctx.local_retries += 1
                 loguru.logger.warning(
                     "Local retry {}/{} at sim_step={} (pos={:.4f}, rot={:.4f}).",
                     ctx.local_retries,
-                    config.max_revert_forward_attempts,
+                    config.max_local_retries,
                     sim_step,
                     err_info["max_pos_error"],
                     err_info["max_rot_error"],
@@ -525,7 +628,9 @@ def main(config: Config):
                     break
                 ctx.local_retries = 0
                 _load_checkpoint(ctx.revert_anchor_checkpoint)
-                ctx.boost_level += 1
+                # Reset boost so iters/noise don't compound across anchors —
+                # each new anchor starts a fresh local-retry sweep at level 0.
+                ctx.boost_level = 0
                 _apply_boost(
                     config,
                     ctx.boost_level,
@@ -549,7 +654,9 @@ def main(config: Config):
                 _load_checkpoint(prev_cp)
                 ctx.revert_anchor_step = int(np.round(mj_data.time / config.sim_dt))
                 ctx.revert_attempts_from_anchor = 1
-                ctx.boost_level += 1
+                # Reset boost so iters/noise don't compound across anchors —
+                # each new anchor starts a fresh local-retry sweep at level 0.
+                ctx.boost_level = 0
                 _apply_boost(
                     config,
                     ctx.boost_level,
@@ -663,14 +770,25 @@ def main(config: Config):
     if "viser" in config.viewer and config.save_viser:
         viser_path = f"{config.output_dir}/visualization_mjwp_fast.viser"
         try:
-            from spider.viewers import viser_viewer as _viser_viewer
+            from spider.viewers.viser_viewer import (
+                _STATE as _viser_state,
+                end_recording_and_save,
+            )
 
-            server = _viser_viewer._STATE.server
-            if server is not None:
-                Path(viser_path).write_bytes(
-                    server.get_scene_serializer().serialize()
+            # If a recording was started, prefer the timeline recording.
+            # Falls back to a single-frame snapshot when no recording exists.
+            ok = end_recording_and_save(viser_path)
+            if ok:
+                loguru.logger.info(
+                    f"Saved viser optimization recording to {viser_path}"
                 )
-                loguru.logger.info(f"Saved viser scene to {viser_path}")
+            else:
+                server = _viser_state.server
+                if server is not None:
+                    Path(viser_path).write_bytes(
+                        server.get_scene_serializer().serialize()
+                    )
+                    loguru.logger.info(f"Saved viser scene to {viser_path}")
         except Exception as e:
             loguru.logger.warning(f"Failed to save viser scene: {e}")
 
