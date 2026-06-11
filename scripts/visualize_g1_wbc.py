@@ -57,6 +57,7 @@ def render_panel(
     label,
     camera,
     robot_geom_ids,
+    root_error=None,
 ):
     """Render one MuJoCo scene with executed robot and reference ghost geoms."""
 
@@ -92,6 +93,16 @@ def render_panel(
         (210, 245, 245),
         2,
     )
+    if root_error is not None:
+        cv2.putText(
+            img,
+            f"root err: {float(root_error):.2f} m",
+            (10, 86),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (235, 235, 210),
+            2,
+        )
     return img
 
 
@@ -112,6 +123,18 @@ def make_follow_camera(ref_qpos, sim_qpos, *, distance, azimuth, elevation):
     camera.azimuth = float(azimuth)
     camera.elevation = float(elevation)
     lookat = 0.5 * (ref_qpos[:3] + sim_qpos[:3])
+    lookat[2] = max(float(lookat[2] + 0.15), 0.75)
+    camera.lookat[:] = lookat
+    return camera
+
+
+def make_ref_follow_camera(ref_qpos, *, distance, azimuth, elevation):
+    camera = mujoco.MjvCamera()
+    camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+    camera.distance = float(distance)
+    camera.azimuth = float(azimuth)
+    camera.elevation = float(elevation)
+    lookat = np.asarray(ref_qpos[:3], dtype=np.float64).copy()
     lookat[2] = max(float(lookat[2] + 0.15), 0.75)
     camera.lookat[:] = lookat
     return camera
@@ -138,10 +161,20 @@ def main():
                    default=WbcRolloutConfig.forward_after_step)
     p.add_argument("--output", default=None)
     p.add_argument("--fps", type=float, default=50)
-    p.add_argument("--camera-mode", choices=("follow", "fixed"), default="follow")
+    p.add_argument(
+        "--camera-mode",
+        choices=("follow", "ref-follow", "fixed"),
+        default="follow",
+    )
     p.add_argument("--camera-distance", type=float, default=4.0)
     p.add_argument("--camera-azimuth", type=float, default=135.0)
     p.add_argument("--camera-elevation", type=float, default=-18.0)
+    p.add_argument(
+        "--show-root-error",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Overlay per-frame root position error for each panel.",
+    )
     p.add_argument("--ghost-alpha", type=float, default=float(GHOST_RGBA[3]))
     p.add_argument(
         "--mpc-preset",
@@ -302,6 +335,14 @@ def main():
         for t in range(n):
             panels = []
             d_ref.qpos[:] = ref[t]
+            shared_ref_camera = None
+            if args.camera_mode == "ref-follow":
+                shared_ref_camera = make_ref_follow_camera(
+                    ref[t],
+                    distance=args.camera_distance,
+                    azimuth=args.camera_azimuth,
+                    elevation=args.camera_elevation,
+                )
             for sim_qpos, label in sims:
                 d_sim.qpos[:] = sim_qpos[t]
                 if args.camera_mode == "follow":
@@ -312,8 +353,13 @@ def main():
                         azimuth=args.camera_azimuth,
                         elevation=args.camera_elevation,
                     )
+                elif args.camera_mode == "ref-follow":
+                    camera = shared_ref_camera
                 else:
                     camera = fixed_camera
+                root_error = None
+                if args.show_root_error:
+                    root_error = np.linalg.norm(sim_qpos[t, :3] - ref[t, :3])
                 panels.append(
                     render_panel(
                         renderer,
@@ -323,6 +369,7 @@ def main():
                         label,
                         camera,
                         geom_ids,
+                        root_error=root_error,
                     )
                 )
             frame = np.concatenate(panels, axis=1)
