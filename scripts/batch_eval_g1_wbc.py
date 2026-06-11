@@ -69,6 +69,7 @@ def run_eval(
     mpc_smooth_passes: int | None = None,
     mpc_seed: int | None = None,
     mpc_preset: str = "aggressive",
+    saved_qpos: Path | None = None,
 ) -> dict | None:
     cmd = [
         TRACKING_BFM_PYTHON,
@@ -82,7 +83,11 @@ def run_eval(
         "--nconmax-per-env", str(nconmax_per_env),
         "--njmax-per-env", str(njmax_per_env),
     ]
-    if method != "no_mpc":
+    if method == "static_qpos":
+        if saved_qpos is None:
+            raise ValueError("static_qpos requires saved_qpos.")
+        cmd += ["--saved-qpos", str(saved_qpos)]
+    elif method != "no_mpc":
         cmd += ["--mpc-preset", mpc_preset]
         optional_args = {
             "--mpc-samples": mpc_samples,

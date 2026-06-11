@@ -14,6 +14,7 @@ from spider.tasks.g1_wbc.mpc import G1WbcMpcConfig, mpc_config_from_preset, opti
 from spider.tasks.g1_wbc.motion import load_motion, validate_motion_dims
 from spider.tasks.g1_wbc.policy import load_wbc_actor, resolve_checkpoint_path
 from spider.tasks.g1_wbc.rollout import RolloutResult, WbcRolloutConfig, run_no_mpc_rollout
+from spider.tasks.g1_wbc.rollout import run_static_qpos_rollout
 
 
 def main() -> None:
@@ -24,8 +25,10 @@ def main() -> None:
 
     motion = load_motion(args.motion, motion_type=args.motion_type, device=device)
     validate_motion_dims(motion)
-    actor = load_wbc_actor(args.checkpoint, device=device)
     checkpoint_path = resolve_checkpoint_path(args.checkpoint)
+    actor = None
+    if args.method != "static_qpos":
+        actor = load_wbc_actor(args.checkpoint, device=device)
 
     config = WbcRolloutConfig(
         model_path=args.model_path,
@@ -41,7 +44,14 @@ def main() -> None:
     )
     mpc_payload = None
     mpc_result = None
-    if args.method == "no_mpc":
+    if args.method == "static_qpos":
+        qpos_trajectory = _load_saved_qpos(args.saved_qpos, device=device)
+        rollout = run_static_qpos_rollout(
+            qpos_trajectory,
+            config,
+            max_steps=args.max_steps,
+        )
+    elif args.method == "no_mpc":
         assert actor is not None
         rollout = run_no_mpc_rollout(motion, actor, config)
     else:
@@ -138,6 +148,7 @@ def _parse_args() -> argparse.Namespace:
             "g1_wbc_ee",
             "g1_wbc_joint",
             "g1_wbc_joint_global",
+            "static_qpos",
         ),
         help="Evaluation method to run.",
     )
@@ -186,6 +197,14 @@ def _parse_args() -> argparse.Namespace:
         help="Capture MuJoCo Warp step/forward/reset in CUDA graphs when available.",
     )
     parser.add_argument("--output-dir", default=None, help="Optional result directory.")
+    parser.add_argument(
+        "--saved-qpos",
+        default=None,
+        help=(
+            "Precomputed qpos trajectory for --method static_qpos. "
+            "Accepts .npz keys qpos/refined_qpos/command_qpos_trajectory."
+        ),
+    )
     parser.add_argument(
         "--save-rollout",
         action="store_true",
@@ -308,6 +327,26 @@ def _save_mpc_result(path: Path, result) -> None:
         "command_qvel_trajectory": _cpu_np(result.command.qvel_trajectory),
     }
     np.savez_compressed(path, **arrays)
+
+
+def _load_saved_qpos(path: str | None, *, device: str) -> torch.Tensor:
+    if path is None:
+        raise ValueError("--method static_qpos requires --saved-qpos.")
+    qpos_path = Path(path).expanduser().resolve()
+    with np.load(qpos_path) as data:
+        for key in ("qpos", "refined_qpos", "command_qpos_trajectory"):
+            if key in data.files:
+                qpos = data[key]
+                break
+        else:
+            raise ValueError(
+                f"{qpos_path} is missing qpos/refined_qpos/command_qpos_trajectory."
+            )
+    if qpos.ndim == 3 and qpos.shape[1] == 1:
+        qpos = qpos[:, 0]
+    if qpos.ndim != 2 or qpos.shape[-1] != 36:
+        raise ValueError(f"Expected saved qpos shape (T,36) or (T,1,36), got {qpos.shape}.")
+    return torch.tensor(qpos, dtype=torch.float32, device=device)
 
 
 def _cpu_np(value: torch.Tensor) -> np.ndarray:

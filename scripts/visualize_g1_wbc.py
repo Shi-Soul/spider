@@ -13,6 +13,7 @@ Usage (from tracking_bfm venv):
   python scripts/visualize_g1_wbc.py --motion MOTION.npz --method compare
   python scripts/visualize_g1_wbc.py --motion MOTION.npz --method saved \
     --saved-rollout no_mpc:/path/to/rollout.npz \
+    --saved-qpos spider:/path/to/trajectory_kinematic.npz \
     --saved-command mpc_joint:/path/to/mpc_command.npz
 """
 
@@ -188,6 +189,13 @@ def main():
         help="Append qpos from a saved evaluate.py MPC mpc_command.npz.",
     )
     p.add_argument(
+        "--saved-qpos",
+        action="append",
+        default=[],
+        metavar="LABEL:PATH",
+        help="Append qpos from an arbitrary .npz qpos/refined_qpos trajectory.",
+    )
+    p.add_argument(
         "--saved-env-index",
         type=int,
         default=0,
@@ -243,6 +251,7 @@ def main():
     saved_sims = load_saved_sims(
         args.saved_rollout,
         args.saved_command,
+        args.saved_qpos,
         env_index=args.saved_env_index,
         max_steps=args.max_steps,
     )
@@ -339,6 +348,7 @@ def main():
 def load_saved_sims(
     saved_rollouts,
     saved_commands,
+    saved_qpos,
     *,
     env_index,
     max_steps,
@@ -358,6 +368,21 @@ def load_saved_sims(
             if key not in data.files:
                 raise ValueError(
                     f"Saved command {path} is missing refined_qpos/command_qpos_trajectory."
+                )
+            qpos = select_saved_qpos(data[key], env_index=env_index)
+        sims.append((trim_saved_qpos(qpos, max_steps), label))
+    for item in saved_qpos:
+        label, path = parse_labeled_path(item)
+        with np.load(path) as data:
+            key = "qpos" if "qpos" in data.files else None
+            if key is None:
+                for candidate in ("refined_qpos", "command_qpos_trajectory"):
+                    if candidate in data.files:
+                        key = candidate
+                        break
+            if key is None:
+                raise ValueError(
+                    f"Saved qpos {path} is missing qpos/refined_qpos/command_qpos_trajectory."
                 )
             qpos = select_saved_qpos(data[key], env_index=env_index)
         sims.append((trim_saved_qpos(qpos, max_steps), label))

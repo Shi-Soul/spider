@@ -667,6 +667,83 @@ def run_no_mpc_rollout(
         initial_qvel=motion.qvel()[0],
     )
 
+
+def run_static_qpos_rollout(
+    qpos_trajectory: torch.Tensor,
+    config: WbcRolloutConfig,
+    *,
+    max_steps: int | None = None,
+) -> RolloutResult:
+    """Evaluate a precomputed qpos trajectory as a non-policy baseline trace."""
+
+    device = torch.device(config.device)
+    qpos_trajectory = qpos_trajectory.to(device, dtype=torch.float32)
+    if qpos_trajectory.ndim == 2:
+        qpos_trajectory = qpos_trajectory[:, None, :]
+    if qpos_trajectory.ndim != 3 or qpos_trajectory.shape[-1] != QPOS_DIM:
+        raise ValueError(
+            "Expected qpos trajectory shape (T, N, 36) or (T, 36), "
+            f"got {qpos_trajectory.shape}."
+        )
+    if max_steps is None:
+        total_steps = qpos_trajectory.shape[0] - 1
+    else:
+        total_steps = min(int(max_steps), qpos_trajectory.shape[0] - 1)
+    if total_steps < 1:
+        raise ValueError("Need at least two qpos frames for static rollout.")
+
+    qpos_trajectory = qpos_trajectory[: total_steps + 1].contiguous()
+    num_envs = int(qpos_trajectory.shape[1])
+    qvel_trajectory = qvel_from_qpos_trajectory(qpos_trajectory, dt=POLICY_DT)
+    static_config = replace(config, num_envs=num_envs, max_steps=total_steps)
+    env = G1WbcMujocoWarpEnv(static_config)
+
+    qpos_trace = []
+    qvel_trace = []
+    body_pos_trace = []
+    body_quat_trace = []
+    body_lin_vel_trace = []
+    body_ang_vel_trace = []
+    contact_indicator = []
+    contact_force = []
+    with torch.inference_mode():
+        for frame_idx in range(total_steps + 1):
+            env.reset(qpos_trajectory[frame_idx], qvel_trajectory[frame_idx])
+            state = env.robot_state()
+            foot_contact, foot_force = env.foot_contact()
+            _append_state(
+                state,
+                foot_contact,
+                foot_force,
+                qpos_trace,
+                qvel_trace,
+                body_pos_trace,
+                body_quat_trace,
+                body_lin_vel_trace,
+                body_ang_vel_trace,
+                contact_indicator,
+                contact_force,
+            )
+
+    actions = torch.zeros(total_steps, num_envs, ACTION_DIM, dtype=torch.float32, device=device)
+    controls = qpos_trajectory[:-1, :, 7:].contiguous()
+    ref_indices = torch.arange(total_steps + 1, dtype=torch.long, device=device)
+    ref_indices = ref_indices[:, None].expand(total_steps + 1, num_envs)
+    return RolloutResult(
+        qpos=torch.stack(qpos_trace, dim=0),
+        qvel=torch.stack(qvel_trace, dim=0),
+        body_pos_w=torch.stack(body_pos_trace, dim=0),
+        body_quat_w=torch.stack(body_quat_trace, dim=0),
+        body_lin_vel_w=torch.stack(body_lin_vel_trace, dim=0),
+        body_ang_vel_w=torch.stack(body_ang_vel_trace, dim=0),
+        actions=actions,
+        controls=controls,
+        contact_indicator=torch.stack(contact_indicator, dim=0),
+        contact_force=torch.stack(contact_force, dim=0),
+        ref_indices=ref_indices,
+    )
+
+
 def run_command_rollout(
     command: G1Motion | G1CommandBatch,
     actor: WbcActor,
