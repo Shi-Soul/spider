@@ -55,6 +55,10 @@ def main() -> None:
             smooth_passes=args.mpc_smooth_passes,
             command_reg_weight=args.mpc_command_reg_weight,
             command_smooth_weight=args.mpc_command_smooth_weight,
+            use_guided_candidate=args.mpc_guided_candidate,
+            guided_root_pos_gain=args.mpc_guided_root_pos_gain,
+            guided_root_rot_gain=args.mpc_guided_root_rot_gain,
+            guided_joint_gain=args.mpc_guided_joint_gain,
             seed=args.seed,
         )
         mpc_result = optimize_mpc_command(motion, actor, config, mpc_config)
@@ -71,6 +75,10 @@ def main() -> None:
             "smooth_passes": args.mpc_smooth_passes,
             "command_reg_weight": args.mpc_command_reg_weight,
             "command_smooth_weight": args.mpc_command_smooth_weight,
+            "guided_candidate": args.mpc_guided_candidate,
+            "guided_root_pos_gain": args.mpc_guided_root_pos_gain,
+            "guided_root_rot_gain": args.mpc_guided_root_rot_gain,
+            "guided_joint_gain": args.mpc_guided_joint_gain,
             "history": [vars(item) for item in mpc_result.history],
             "final_scores_mean": _safe_tensor_stat(mpc_result.scores, "mean"),
             "final_scores_max": _safe_tensor_stat(mpc_result.scores, "max"),
@@ -162,6 +170,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mpc-smooth-passes", type=int, default=2)
     parser.add_argument("--mpc-command-reg-weight", type=float, default=0.10)
     parser.add_argument("--mpc-command-smooth-weight", type=float, default=0.0003)
+    parser.add_argument(
+        "--mpc-guided-candidate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include a no-MPC-error feedback candidate in the MPC sample batch.",
+    )
+    parser.add_argument("--mpc-guided-root-pos-gain", type=float, default=0.5)
+    parser.add_argument("--mpc-guided-root-rot-gain", type=float, default=0.5)
+    parser.add_argument("--mpc-guided-joint-gain", type=float, default=0.4)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
