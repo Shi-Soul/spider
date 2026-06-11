@@ -120,9 +120,9 @@ def robot_geom_ids(model):
 def configure_global_lighting(model):
     """Use world-fixed lighting so brightness does not track the robot."""
 
-    model.vis.headlight.ambient[:] = (0.35, 0.35, 0.35)
-    model.vis.headlight.diffuse[:] = (0.45, 0.45, 0.45)
-    model.vis.headlight.specular[:] = (0.05, 0.05, 0.05)
+    model.vis.headlight.ambient[:] = (0.28, 0.28, 0.28)
+    model.vis.headlight.diffuse[:] = (0.0, 0.0, 0.0)
+    model.vis.headlight.specular[:] = (0.0, 0.0, 0.0)
     fixed_lights = (
         ((-3.0, -4.0, 6.0), (3.0, 4.0, -6.0), (0.55, 0.55, 0.55)),
         ((4.0, 2.0, 5.0), (-4.0, -2.0, -5.0), (0.35, 0.35, 0.35)),
@@ -162,6 +162,20 @@ def make_ref_follow_camera(ref_qpos, *, distance, azimuth, elevation):
     return camera
 
 
+def make_world_fixed_camera(args):
+    camera = mujoco.MjvCamera()
+    camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+    camera.distance = float(args.camera_distance)
+    camera.azimuth = float(args.camera_azimuth)
+    camera.elevation = float(args.camera_elevation)
+    camera.lookat[:] = (
+        float(args.camera_lookat_x),
+        float(args.camera_lookat_y),
+        float(args.camera_lookat_z),
+    )
+    return camera
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--motion", required=True)
@@ -191,6 +205,9 @@ def main():
     p.add_argument("--camera-distance", type=float, default=4.0)
     p.add_argument("--camera-azimuth", type=float, default=135.0)
     p.add_argument("--camera-elevation", type=float, default=-18.0)
+    p.add_argument("--camera-lookat-x", type=float, default=0.0)
+    p.add_argument("--camera-lookat-y", type=float, default=0.0)
+    p.add_argument("--camera-lookat-z", type=float, default=1.0)
     p.add_argument(
         "--show-root-error",
         action=argparse.BooleanOptionalAction,
@@ -334,7 +351,7 @@ def main():
     model.vis.global_.offwidth = args.width
     model.vis.global_.offheight = args.height
     renderer = mujoco.Renderer(model, height=args.height, width=args.width)
-    fixed_camera = 0 if model.ncam > 0 else None
+    fixed_camera = make_world_fixed_camera(args)
     geom_ids = robot_geom_ids(model)
 
     ref = motion.qpos().cpu().numpy()
