@@ -193,7 +193,10 @@ SPIDER_G1_SCENE_MODEL_PATH = (
 WXY_G1_MODEL_PATH = (
     Path(spider.ROOT) / "assets" / "robots" / "unitree_g1" / "wxy_g1.xml"
 )
-DEFAULT_G1_MODEL_PATH = WXY_G1_MODEL_PATH
+TBFM_MODEL_PKL_PATH = (
+    Path(spider.ROOT) / "assets" / "robots" / "unitree_g1" / "tbfm_model.pkl"
+)
+DEFAULT_G1_MODEL_PATH = TBFM_MODEL_PKL_PATH
 DEFAULT_WXY_ROOT = Path(spider.ROOT).parents[1] / "wxy"
 DEFAULT_CKPT_DIRS = {
     "bc": DEFAULT_WXY_ROOT / "0608_ckpt_bc",

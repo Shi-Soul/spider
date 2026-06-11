@@ -214,6 +214,10 @@ def load_wbc_model(model_path: str | Path) -> mujoco.MjModel:
     """Load a G1 WBC model with tracking_bfm-compatible physics semantics."""
 
     path = Path(model_path).expanduser()
+    if path.name == "tbfm_model.pkl":
+        import pickle as _pickle
+        with open(path, "rb") as _f:
+            return _pickle.load(_f)
     if path.name == WXY_G1_MODEL_PATH.name:
         return _build_wxy_model()
     model = mujoco.MjModel.from_xml_path(str(path))
