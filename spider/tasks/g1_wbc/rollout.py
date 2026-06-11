@@ -149,13 +149,14 @@ def _add_wxy_terrain_spec(spec: mujoco.MjSpec) -> None:
     )
 
 
-def _add_wxy_position_actuators(spec: mujoco.MjSpec) -> None:
+def _add_wxy_actuators_to_spec(spec: mujoco.MjSpec) -> None:
     existing = {actuator.name for actuator in spec.actuators}
     for joint_name in _wxy_actuator_joint_names():
-        if joint_name in existing:
+        prefixed = f"robot/{joint_name}"
+        if prefixed in existing or joint_name in existing:
             continue
         kp, kd, effort, _ = _match_actuator_group(joint_name)
-        actuator = spec.add_actuator(name=joint_name, target=joint_name)
+        actuator = spec.add_actuator(name=joint_name, target=prefixed)
         actuator.trntype = mujoco.mjtTrn.mjTRN_JOINT
         actuator.dyntype = mujoco.mjtDyn.mjDYN_NONE
         actuator.gaintype = mujoco.mjtGain.mjGAIN_FIXED
@@ -170,22 +171,52 @@ def _add_wxy_position_actuators(spec: mujoco.MjSpec) -> None:
         actuator.biasprm[2] = -float(kd)
 
 
-def _is_wxy_g1_model_path(model_path: str | Path) -> bool:
-    return Path(model_path).expanduser().name == WXY_G1_MODEL_PATH.name
+def _build_wxy_model() -> mujoco.MjModel:
+    """Build a G1 WBC model matching tracking_bfm body/joint/actuator layout."""
+
+    wxy_path = WXY_G1_MODEL_PATH.expanduser().resolve()
+    mesh_dir = str(wxy_path.parent / "meshes")
+
+    # Strip site elements that would auto-generate mocap actuators in MuJoCo 3.7.
+    xml_text = wxy_path.read_text()
+    _SITE_NAMES_TO_STRIP = (
+        "imu_in_pelvis", "left_foot", "right_foot",
+        "imu_in_torso", "left_palm", "right_palm",
+    )
+    for site_name in _SITE_NAMES_TO_STRIP:
+        xml_text = re.sub(
+            rf'[ \t]*<site\s+name="{site_name}"[^>]*/>\s*\n?', "\n", xml_text,
+        )
+    # Also strip the unnamed default site tag.
+    xml_text = re.sub(
+        r'[ \t]*<site group="5" rgba="1 0 0 1"/>\s*\n?', "\n", xml_text,
+    )
+    xml_text = xml_text.replace('meshdir="meshes"', f'meshdir="{mesh_dir}"')
+    robot_spec = mujoco.MjSpec.from_string(xml_text)
+
+    spec = mujoco.MjSpec()
+    spec.compiler.degree = False
+    spec.compiler.meshdir = mesh_dir
+
+    # terrain first, then robot (matches tracking_bfm body ordering)
+    _add_wxy_terrain_spec(spec)
+    spec.attach(robot_spec, prefix="robot/",
+                frame=spec.worldbody.add_frame(name="robot_frame"))
+
+    _configure_wxy_collision_spec(spec)
+    _add_wxy_actuators_to_spec(spec)
+    model = spec.compile()
+    configure_wbc_model(model)
+    return model
 
 
 def load_wbc_model(model_path: str | Path) -> mujoco.MjModel:
     """Load a G1 WBC model with tracking_bfm-compatible physics semantics."""
 
     path = Path(model_path).expanduser()
-    if _is_wxy_g1_model_path(path):
-        spec = mujoco.MjSpec.from_file(str(path))
-        _configure_wxy_collision_spec(spec)
-        _add_wxy_terrain_spec(spec)
-        _add_wxy_position_actuators(spec)
-        model = spec.compile()
-    else:
-        model = mujoco.MjModel.from_xml_path(str(path))
+    if path.name == WXY_G1_MODEL_PATH.name:
+        return _build_wxy_model()
+    model = mujoco.MjModel.from_xml_path(str(path))
     configure_wbc_model(model)
     return model
 
@@ -218,6 +249,18 @@ def joint_actuator_specs(
     }
 
 
+
+def _find_actuator_by_joint(model: mujoco.MjModel, joint_name: str) -> int:
+    """Find actuator index by matching target joint name (with or without robot/ prefix)."""
+    for act_id in range(model.nu):
+        joint_id = int(model.actuator_trnid[act_id, 0])
+        if not (0 <= joint_id < model.njnt):
+            continue
+        jname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+        if jname in (joint_name, f"robot/{joint_name}"):
+            return int(act_id)
+    return -1
+
 def configure_wbc_model(model: mujoco.MjModel) -> None:
     """Mutate a MuJoCo model to match the WXY G1 WBC sim/action settings."""
 
@@ -237,7 +280,7 @@ def configure_wbc_model(model: mujoco.MjModel) -> None:
     for joint_name in MUJOCO_JOINT_NAMES:
         kp, kd, effort, armature = _match_actuator_group(joint_name)
         joint_id = _resolve_name_id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
-        actuator_id = _resolve_name_id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, joint_name)
+        actuator_id = _find_actuator_by_joint(model, joint_name)
         if joint_id < 0 or actuator_id < 0:
             raise ValueError(f"G1 model is missing joint/actuator {joint_name}")
         dof_id = int(model.jnt_dofadr[joint_id])
@@ -254,6 +297,27 @@ def configure_wbc_model(model: mujoco.MjModel) -> None:
         model.actuator_forcerange[actuator_id] = (-effort, effort)
         model.actuator_ctrllimited[actuator_id] = 0
 
+
+
+def _resolve_actuator_ids_by_joint(model: mujoco.MjModel) -> list[int]:
+    """Return actuator indices matching MUJOCO_JOINT_NAMES, by target joint."""
+    joint_name_to_actuator: dict[str, int] = {}
+    for act_id in range(model.nu):
+        joint_id = int(model.actuator_trnid[act_id, 0])
+        if 0 <= joint_id < model.njnt:
+            jname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+            if jname:
+                joint_name_to_actuator[jname] = int(act_id)
+    ids: list[int] = []
+    for joint_name in MUJOCO_JOINT_NAMES:
+        # Try robot/ prefix first (tracking_bfm layout), then bare name.
+        act_id = joint_name_to_actuator.get(f"robot/{joint_name}", -1)
+        if act_id < 0:
+            act_id = joint_name_to_actuator.get(joint_name, -1)
+        if act_id < 0:
+            raise ValueError(f"G1 model is missing actuator for joint {joint_name}")
+        ids.append(act_id)
+    return ids
 
 class G1WbcMujocoWarpEnv:
     """Minimal standalone batched G1 simulator for WBC policy rollout."""
@@ -281,22 +345,10 @@ class G1WbcMujocoWarpEnv:
         self.foot_geom_ids = self._resolve_foot_geoms()
         self.floor_geom_id = self._resolve_ground_geom()
         self.ctrl_actuator_ids = torch.tensor(
-            [
-                _resolve_name_id(self.model_cpu, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
-                for name in MUJOCO_JOINT_NAMES
-            ],
+            _resolve_actuator_ids_by_joint(self.model_cpu),
             dtype=torch.long,
             device=self.torch_device,
         )
-        if torch.any(self.ctrl_actuator_ids < 0):
-            missing = [
-                name
-                for name, actuator_id in zip(
-                    MUJOCO_JOINT_NAMES, self.ctrl_actuator_ids.detach().cpu().tolist()
-                )
-                if actuator_id < 0
-            ]
-            raise ValueError(f"G1 model is missing actuators: {missing}")
 
         wp.set_device(self.device)
         with wp.ScopedDevice(self.device):
