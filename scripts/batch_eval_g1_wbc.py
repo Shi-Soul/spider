@@ -66,6 +66,7 @@ def run_eval(
     mpc_root_pos_sigma: float | None = None,
     mpc_root_rot_sigma: float | None = None,
     mpc_joint_sigma: float | None = None,
+    mpc_smooth_passes: int | None = None,
     mpc_seed: int | None = None,
     mpc_preset: str = "aggressive",
 ) -> dict | None:
@@ -96,11 +97,15 @@ def run_eval(
             "--mpc-root-pos-sigma": mpc_root_pos_sigma,
             "--mpc-root-rot-sigma": mpc_root_rot_sigma,
             "--mpc-joint-sigma": mpc_joint_sigma,
+            "--mpc-smooth-passes": mpc_smooth_passes,
             "--seed": mpc_seed,
         }
         for flag, value in optional_args.items():
             if value is not None:
-                cmd += [flag, str(value)]
+                if isinstance(value, bool):
+                    cmd.append(flag if value else f"--no-{flag[2:]}")
+                else:
+                    cmd += [flag, str(value)]
 
     proc = subprocess.run(
         cmd,
@@ -184,6 +189,7 @@ def main() -> None:
     parser.add_argument("--mpc-root-pos-sigma", type=float, default=None)
     parser.add_argument("--mpc-root-rot-sigma", type=float, default=None)
     parser.add_argument("--mpc-joint-sigma", type=float, default=None)
+    parser.add_argument("--mpc-smooth-passes", type=int, default=None)
     parser.add_argument("--mpc-seed", type=int, default=None)
     parser.add_argument("--output", default=None, help="JSON output path.")
     args = parser.parse_args()
@@ -217,6 +223,7 @@ def main() -> None:
                     mpc_root_pos_sigma=args.mpc_root_pos_sigma,
                     mpc_root_rot_sigma=args.mpc_root_rot_sigma,
                     mpc_joint_sigma=args.mpc_joint_sigma,
+                    mpc_smooth_passes=args.mpc_smooth_passes,
                     mpc_seed=args.mpc_seed,
                     mpc_preset=args.mpc_preset,
                 )

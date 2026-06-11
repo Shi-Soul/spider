@@ -171,6 +171,7 @@ def main():
     p.add_argument("--mpc-root-pos-sigma", type=float, default=None)
     p.add_argument("--mpc-root-rot-sigma", type=float, default=None)
     p.add_argument("--mpc-joint-sigma", type=float, default=None)
+    p.add_argument("--mpc-smooth-passes", type=int, default=None)
     p.add_argument("--seed", type=int, default=G1WbcMpcConfig.seed)
     p.add_argument(
         "--saved-rollout",
@@ -230,6 +231,7 @@ def main():
             "root_pos_sigma": args.mpc_root_pos_sigma,
             "root_rot_sigma": args.mpc_root_rot_sigma,
             "joint_sigma": args.mpc_joint_sigma,
+            "smooth_passes": args.mpc_smooth_passes,
             "seed": args.seed,
         }
         for name, value in overrides.items():
@@ -273,40 +275,8 @@ def main():
     ref = motion.qpos().cpu().numpy()
     n = min(ref.shape[0], *(s.shape[0] for s, _ in sims))
 
-    print(f"Rendering {n} frames, {len(sims)} overlay panels ...")
-    frames = []
-    d_ref = mujoco.MjData(model)
-    d_sim = mujoco.MjData(model)
-    for t in range(n):
-        panels = []
-        d_ref.qpos[:] = ref[t]
-        for sim_qpos, label in sims:
-            d_sim.qpos[:] = sim_qpos[t]
-            if args.camera_mode == "follow":
-                camera = make_follow_camera(
-                    ref[t],
-                    sim_qpos[t],
-                    distance=args.camera_distance,
-                    azimuth=args.camera_azimuth,
-                    elevation=args.camera_elevation,
-                )
-            else:
-                camera = fixed_camera
-            panels.append(
-                render_panel(
-                    renderer,
-                    model,
-                    d_sim,
-                    d_ref,
-                    label,
-                    camera,
-                    geom_ids,
-                )
-            )
-        frames.append(np.concatenate(panels, axis=1))
-        if (t + 1) % 50 == 0:
-            print(f"  {t + 1}/{n}")
-
+    if n <= 0:
+        raise ValueError("No frames to render.")
     if args.output:
         out = Path(args.output).expanduser()
     else:
@@ -315,11 +285,54 @@ def main():
         out = SPIDER_ROOT / "videos" / f"{stem}_{args.checkpoint}_{lbl}.mp4"
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    h, w = frames[0].shape[:2]
-    writer = cv2.VideoWriter(str(out), cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (w, h))
-    for f in frames:
-        writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
-    writer.release()
+    print(f"Rendering {n} frames, {len(sims)} overlay panels ...")
+    writer = None
+    d_ref = mujoco.MjData(model)
+    d_sim = mujoco.MjData(model)
+    try:
+        for t in range(n):
+            panels = []
+            d_ref.qpos[:] = ref[t]
+            for sim_qpos, label in sims:
+                d_sim.qpos[:] = sim_qpos[t]
+                if args.camera_mode == "follow":
+                    camera = make_follow_camera(
+                        ref[t],
+                        sim_qpos[t],
+                        distance=args.camera_distance,
+                        azimuth=args.camera_azimuth,
+                        elevation=args.camera_elevation,
+                    )
+                else:
+                    camera = fixed_camera
+                panels.append(
+                    render_panel(
+                        renderer,
+                        model,
+                        d_sim,
+                        d_ref,
+                        label,
+                        camera,
+                        geom_ids,
+                    )
+                )
+            frame = np.concatenate(panels, axis=1)
+            if writer is None:
+                h, w = frame.shape[:2]
+                writer = cv2.VideoWriter(
+                    str(out),
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    args.fps,
+                    (w, h),
+                )
+                if not writer.isOpened():
+                    raise RuntimeError(f"Failed to open video writer for {out}")
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            if (t + 1) % 50 == 0:
+                print(f"  {t + 1}/{n}")
+    finally:
+        if writer is not None:
+            writer.release()
     print(f"Saved -> {out}")
 
 
