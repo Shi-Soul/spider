@@ -64,6 +64,8 @@ def main() -> None:
             "num_iterations": mpc_config.num_iterations,
             "planning_horizon_steps": mpc_config.planning_horizon_steps,
             "control_steps": mpc_config.control_steps,
+            "sampling_mode": mpc_config.sampling_mode,
+            "knot_count": mpc_config.knot_count,
             "elite_frac": mpc_config.elite_frac,
             "temperature": mpc_config.temperature,
             "root_pos_sigma": mpc_config.root_pos_sigma,
@@ -84,10 +86,6 @@ def main() -> None:
             "guided_root_pos_clip": mpc_config.guided_root_pos_clip,
             "guided_root_rot_clip": mpc_config.guided_root_rot_clip,
             "guided_joint_clip": mpc_config.guided_joint_clip,
-            "use_global_root_rot_bias_candidates":
-                mpc_config.use_global_root_rot_bias_candidates,
-            "global_root_rot_bias_values":
-                list(mpc_config.global_root_rot_bias_values),
             "history": [vars(item) for item in mpc_result.history],
             "final_scores_mean": _safe_tensor_stat(mpc_result.scores, "mean"),
             "final_scores_max": _safe_tensor_stat(mpc_result.scores, "max"),
@@ -220,6 +218,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mpc-iterations", type=int, default=None)
     parser.add_argument("--mpc-planning-horizon-steps", type=int, default=None)
     parser.add_argument("--mpc-control-steps", type=int, default=None)
+    parser.add_argument(
+        "--mpc-sampling-mode",
+        choices=("full", "knot"),
+        default=None,
+        help="Sample full per-step deltas or knot deltas interpolated to the horizon.",
+    )
+    parser.add_argument("--mpc-knot-count", type=int, default=None)
     parser.add_argument("--mpc-elite-frac", type=float, default=None)
     parser.add_argument("--mpc-temperature", type=float, default=None)
     parser.add_argument("--mpc-root-pos-sigma", type=float, default=None)
@@ -275,6 +280,8 @@ def _build_mpc_config(args: argparse.Namespace) -> G1WbcMpcConfig:
         "num_iterations": args.mpc_iterations,
         "planning_horizon_steps": args.mpc_planning_horizon_steps,
         "control_steps": args.mpc_control_steps,
+        "sampling_mode": args.mpc_sampling_mode,
+        "knot_count": args.mpc_knot_count,
         "elite_frac": args.mpc_elite_frac,
         "temperature": args.mpc_temperature,
         "root_pos_sigma": args.mpc_root_pos_sigma,

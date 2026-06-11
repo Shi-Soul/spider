@@ -7,6 +7,7 @@ from typing import Literal
 
 import mujoco
 import torch
+import torch.nn.functional as F
 
 from spider.tasks.g1_wbc.constants import (
     MUJOCO_JOINT_NAMES,
@@ -33,6 +34,7 @@ from spider.tasks.g1_wbc.rollout import (
 
 MpcMode = Literal["g1_wbc_ee", "g1_wbc_joint", "g1_wbc_joint_global"]
 MpcPreset = Literal["aggressive", "conservative", "explore", "rootrot", "wide"]
+MpcSamplingMode = Literal["full", "knot"]
 
 
 @dataclass
@@ -44,6 +46,8 @@ class G1WbcMpcConfig:
     num_iterations: int = 4
     planning_horizon_steps: int = 80
     control_steps: int = 20
+    sampling_mode: MpcSamplingMode = "full"
+    knot_count: int = 4
     elite_frac: float = 0.125
     temperature: float = 0.7
     root_pos_sigma: float = 0.015
@@ -63,8 +67,6 @@ class G1WbcMpcConfig:
     guided_root_pos_clip: float = 0.05
     guided_root_rot_clip: float = 0.12
     guided_joint_clip: float = 0.20
-    use_global_root_rot_bias_candidates: bool = True
-    global_root_rot_bias_values: tuple[float, ...] = (-0.16, -0.08, 0.08, 0.16)
     acceptance_gate: bool = True
     seed: int | None = 0
     freeze_first_frame: bool = True
@@ -77,6 +79,8 @@ class MpcIterationInfo:
     window_start: int
     window_horizon: int
     window_execute_steps: int
+    sampling_mode: str
+    sample_parameter_steps: int
     best_score: float
     mean_score: float
     elite_score: float
@@ -201,18 +205,6 @@ def mpc_config_from_preset(
             guided_root_pos_clip=0.30,
             guided_root_rot_clip=0.75,
             guided_joint_clip=0.80,
-            global_root_rot_bias_values=(
-                -0.48,
-                -0.32,
-                -0.24,
-                -0.16,
-                -0.08,
-                0.08,
-                0.16,
-                0.24,
-                0.32,
-                0.48,
-            ),
             acceptance_gate=False,
         )
     raise ValueError(f"Unknown MPC preset: {preset}")
@@ -234,6 +226,12 @@ def optimize_mpc_command(
         raise ValueError("MPC planning_horizon_steps must be positive.")
     if mpc_config.control_steps < 1:
         raise ValueError("MPC control_steps must be positive.")
+    if mpc_config.sampling_mode not in ("full", "knot"):
+        raise ValueError(
+            f"Unsupported MPC sampling_mode: {mpc_config.sampling_mode!r}."
+        )
+    if mpc_config.knot_count < 2:
+        raise ValueError("MPC knot_count must be at least 2.")
 
     device = torch.device(rollout_config.device)
     motion = motion.to(device)
@@ -460,10 +458,13 @@ def _optimize_mpc_window(
     device = torch.device(rollout_config.device)
     window_motion = _slice_motion(motion, start, horizon)
     base_qpos = window_motion.qpos()[:horizon].contiguous()
-    mean_delta = torch.zeros(horizon, QPOS_DIM - 1, dtype=torch.float32, device=device)
-    sigma = _initial_sigma(horizon, device, mpc_config)
-    min_sigma = _min_sigma(horizon, device, mpc_config)
-    guided_delta = _guided_delta_from_no_mpc(
+    sample_parameter_steps = _sample_parameter_steps(horizon, mpc_config)
+    mean_delta = torch.zeros(
+        sample_parameter_steps, QPOS_DIM - 1, dtype=torch.float32, device=device
+    )
+    sigma = _initial_sigma(sample_parameter_steps, device, mpc_config)
+    min_sigma = _min_sigma(sample_parameter_steps, device, mpc_config)
+    guided_horizon_delta = _guided_delta_from_no_mpc(
         window_motion,
         actor,
         rollout_config,
@@ -475,10 +476,15 @@ def _optimize_mpc_window(
         initial_last_action=initial_last_action,
         initial_history_state=initial_history_state,
     )
+    guided_delta = _delta_to_sampling_parameters(
+        guided_horizon_delta,
+        horizon,
+        mpc_config,
+    )
 
     best_score = torch.tensor(-float("inf"), dtype=torch.float32, device=device)
     best_qpos = base_qpos
-    best_delta = torch.zeros_like(mean_delta)
+    best_delta = torch.zeros(horizon, QPOS_DIM - 1, dtype=torch.float32, device=device)
     best_is_template = True
     final_scores = torch.empty(0, dtype=torch.float32, device=device)
     history: list[MpcIterationInfo] = []
@@ -491,12 +497,17 @@ def _optimize_mpc_window(
     zero_delta_score = -float("inf")
 
     for iteration in range(mpc_config.num_iterations):
-        candidates_delta = _sample_delta(
+        candidates_param_delta = _sample_delta(
             mean_delta,
             sigma,
             mpc_config,
             generator,
             guided_delta=guided_delta,
+        )
+        candidates_delta = _expand_delta_to_horizon(
+            candidates_param_delta,
+            horizon,
+            mpc_config,
         )
         candidates_qpos = _apply_delta_to_qpos(
             base_qpos,
@@ -540,7 +551,7 @@ def _optimize_mpc_window(
 
         elite_count = max(1, int(round(mpc_config.num_samples * mpc_config.elite_frac)))
         elite_scores, elite_indices = torch.topk(scores, k=elite_count, largest=True)
-        elite_delta = candidates_delta[:, elite_indices]
+        elite_delta = candidates_param_delta[:, elite_indices]
         weights = torch.softmax(
             (elite_scores - elite_scores.mean())
             / max(float(mpc_config.temperature), 1.0e-6),
@@ -570,6 +581,8 @@ def _optimize_mpc_window(
                 window_start=start,
                 window_horizon=horizon,
                 window_execute_steps=execute_steps,
+                sampling_mode=mpc_config.sampling_mode,
+                sample_parameter_steps=sample_parameter_steps,
                 best_score=float(scores.max().detach().cpu().item()),
                 mean_score=float(scores.mean().detach().cpu().item()),
                 elite_score=float(elite_scores.mean().detach().cpu().item()),
@@ -658,6 +671,12 @@ def _min_sigma(
     return sigma
 
 
+def _sample_parameter_steps(horizon: int, config: G1WbcMpcConfig) -> int:
+    if config.sampling_mode == "full":
+        return int(horizon)
+    return max(2, min(int(config.knot_count), int(horizon)))
+
+
 def _sample_delta(
     mean_delta: torch.Tensor,
     sigma: torch.Tensor,
@@ -686,15 +705,6 @@ def _sample_delta(
     if config.num_samples > next_reserved and mean_delta.abs().max() > 1.0e-8:
         delta[:, next_reserved, :] = mean_delta
         next_reserved += 1
-    if (
-        config.mode == "g1_wbc_joint_global"
-        and config.use_global_root_rot_bias_candidates
-    ):
-        next_reserved = _add_global_root_rot_bias_candidates(
-            delta,
-            next_reserved,
-            config,
-        )
     if config.smooth_passes > 0:
         delta = _smooth_delta(delta, config.smooth_passes)
     if config.freeze_first_frame:
@@ -702,19 +712,92 @@ def _sample_delta(
     return delta
 
 
-def _add_global_root_rot_bias_candidates(
-    delta: torch.Tensor,
-    next_reserved: int,
+def _delta_to_sampling_parameters(
+    delta: torch.Tensor | None,
+    horizon: int,
     config: G1WbcMpcConfig,
-) -> int:
-    for axis in range(3):
-        for value in config.global_root_rot_bias_values:
-            if next_reserved >= config.num_samples:
-                return next_reserved
-            delta[:, next_reserved, :] = 0.0
-            delta[:, next_reserved, 3 + axis] = float(value)
-            next_reserved += 1
-    return next_reserved
+) -> torch.Tensor | None:
+    if delta is None or config.sampling_mode == "full":
+        return delta
+    knot_count = _sample_parameter_steps(horizon, config)
+    idx = _knot_indices(horizon, knot_count, delta.device)
+    return delta.index_select(0, idx)
+
+
+def _expand_delta_to_horizon(
+    delta: torch.Tensor,
+    horizon: int,
+    config: G1WbcMpcConfig,
+) -> torch.Tensor:
+    if config.sampling_mode == "full" or delta.shape[0] == horizon:
+        return delta
+    if delta.shape[0] <= 1:
+        return delta.expand(horizon, -1, -1)
+
+    root_pos = _linear_interpolate_time_major(delta[..., :3], horizon)
+    root_rot = _slerp_axis_angle_delta(delta[..., 3:6], horizon)
+    joint = _linear_interpolate_time_major(delta[..., 6:], horizon)
+    out = torch.cat([root_pos, root_rot, joint], dim=-1)
+    if config.freeze_first_frame:
+        out[0] = 0.0
+    return out
+
+
+def _linear_interpolate_time_major(value: torch.Tensor, target_steps: int) -> torch.Tensor:
+    if value.shape[0] == target_steps:
+        return value
+    src = value.permute(1, 2, 0)
+    dst = F.interpolate(src, size=int(target_steps), mode="linear", align_corners=True)
+    return dst.permute(2, 0, 1).contiguous()
+
+
+def _slerp_axis_angle_delta(delta_axis_angle: torch.Tensor, target_steps: int) -> torch.Tensor:
+    if delta_axis_angle.shape[0] == target_steps:
+        return delta_axis_angle
+
+    knot_quat = quat_from_axis_angle(delta_axis_angle)
+    knot_count = knot_quat.shape[0]
+    if knot_count <= 1:
+        return delta_axis_angle.expand(target_steps, -1, -1)
+
+    positions = torch.linspace(
+        0,
+        knot_count - 1,
+        target_steps,
+        dtype=delta_axis_angle.dtype,
+        device=delta_axis_angle.device,
+    )
+    left = torch.floor(positions).to(torch.long).clamp(max=knot_count - 1)
+    right = (left + 1).clamp(max=knot_count - 1)
+    blend = (positions - left.to(delta_axis_angle.dtype)).view(target_steps, 1, 1)
+    q0 = knot_quat.index_select(0, left)
+    q1 = knot_quat.index_select(0, right)
+    q = _quat_slerp(q0, q1, blend)
+    return axis_angle_from_quat(q)
+
+
+def _quat_slerp(q0: torch.Tensor, q1: torch.Tensor, blend: torch.Tensor) -> torch.Tensor:
+    q0 = normalize(q0)
+    q1 = normalize(q1)
+    dot = (q0 * q1).sum(dim=-1, keepdim=True)
+    q1 = torch.where(dot < 0.0, -q1, q1)
+    dot = (q0 * q1).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
+    theta = torch.acos(dot)
+    sin_theta = torch.sin(theta)
+    linear = normalize((1.0 - blend) * q0 + blend * q1)
+    s0 = torch.sin((1.0 - blend) * theta) / sin_theta.clamp(min=1.0e-8)
+    s1 = torch.sin(blend * theta) / sin_theta.clamp(min=1.0e-8)
+    spherical = s0 * q0 + s1 * q1
+    return torch.where(sin_theta.abs() < 1.0e-6, linear, normalize(spherical))
+
+
+def _knot_indices(horizon: int, knot_count: int, device: torch.device) -> torch.Tensor:
+    return torch.linspace(
+        0,
+        int(horizon) - 1,
+        int(knot_count),
+        device=device,
+    ).round().to(torch.long)
 
 
 def _guided_delta_from_no_mpc(

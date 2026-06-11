@@ -176,6 +176,18 @@ def make_world_fixed_camera(args):
     return camera
 
 
+def compose_panels(panels, layout):
+    if layout == "row":
+        return np.concatenate(panels, axis=1)
+    if layout == "2x2":
+        if len(panels) != 4:
+            raise ValueError("--panel-layout 2x2 requires exactly 4 panels.")
+        top = np.concatenate(panels[:2], axis=1)
+        bottom = np.concatenate(panels[2:], axis=1)
+        return np.concatenate([top, bottom], axis=0)
+    raise ValueError(f"Unsupported panel layout: {layout}")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--motion", required=True)
@@ -224,6 +236,8 @@ def main():
     p.add_argument("--mpc-iterations", type=int, default=None)
     p.add_argument("--mpc-planning-horizon-steps", type=int, default=None)
     p.add_argument("--mpc-control-steps", type=int, default=None)
+    p.add_argument("--mpc-sampling-mode", choices=("full", "knot"), default=None)
+    p.add_argument("--mpc-knot-count", type=int, default=None)
     p.add_argument("--mpc-elite-frac", type=float, default=None)
     p.add_argument("--mpc-temperature", type=float, default=None)
     p.add_argument(
@@ -275,6 +289,12 @@ def main():
     )
     p.add_argument("--width", type=int, default=960)
     p.add_argument("--height", type=int, default=540)
+    p.add_argument(
+        "--panel-layout",
+        choices=("row", "2x2"),
+        default="row",
+        help="How to arrange rendered panels in the output video.",
+    )
     args = p.parse_args()
     GHOST_RGBA[3] = float(args.ghost_alpha)
 
@@ -303,6 +323,8 @@ def main():
             "num_iterations": args.mpc_iterations,
             "planning_horizon_steps": args.mpc_planning_horizon_steps,
             "control_steps": args.mpc_control_steps,
+            "sampling_mode": args.mpc_sampling_mode,
+            "knot_count": args.mpc_knot_count,
             "elite_frac": args.mpc_elite_frac,
             "temperature": args.mpc_temperature,
             "command_reg_weight": args.mpc_command_reg_weight,
@@ -412,7 +434,7 @@ def main():
                         root_error=root_error,
                     )
                 )
-            frame = np.concatenate(panels, axis=1)
+            frame = compose_panels(panels, args.panel_layout)
             if writer is None:
                 h, w = frame.shape[:2]
                 writer = cv2.VideoWriter(

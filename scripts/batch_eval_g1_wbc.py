@@ -58,6 +58,8 @@ def run_eval(
     mpc_iterations: int | None = None,
     mpc_planning_horizon_steps: int | None = None,
     mpc_control_steps: int | None = None,
+    mpc_sampling_mode: str | None = None,
+    mpc_knot_count: int | None = None,
     mpc_elite_frac: float | None = None,
     mpc_temperature: float | None = None,
     mpc_command_reg_weight: float | None = None,
@@ -94,6 +96,8 @@ def run_eval(
             "--mpc-iterations": mpc_iterations,
             "--mpc-planning-horizon-steps": mpc_planning_horizon_steps,
             "--mpc-control-steps": mpc_control_steps,
+            "--mpc-sampling-mode": mpc_sampling_mode,
+            "--mpc-knot-count": mpc_knot_count,
             "--mpc-elite-frac": mpc_elite_frac,
             "--mpc-temperature": mpc_temperature,
             "--mpc-command-reg-weight": mpc_command_reg_weight,
@@ -174,6 +178,8 @@ def main() -> None:
     parser.add_argument("--mpc-iterations", type=int, default=None)
     parser.add_argument("--mpc-planning-horizon-steps", type=int, default=None)
     parser.add_argument("--mpc-control-steps", type=int, default=None)
+    parser.add_argument("--mpc-sampling-mode", choices=("full", "knot"), default=None)
+    parser.add_argument("--mpc-knot-count", type=int, default=None)
     parser.add_argument("--mpc-elite-frac", type=float, default=None)
     parser.add_argument("--mpc-temperature", type=float, default=None)
     parser.add_argument(
@@ -220,6 +226,8 @@ def main() -> None:
                     mpc_iterations=args.mpc_iterations,
                     mpc_planning_horizon_steps=args.mpc_planning_horizon_steps,
                     mpc_control_steps=args.mpc_control_steps,
+                    mpc_sampling_mode=args.mpc_sampling_mode,
+                    mpc_knot_count=args.mpc_knot_count,
                     mpc_elite_frac=args.mpc_elite_frac,
                     mpc_temperature=args.mpc_temperature,
                     mpc_command_reg_weight=args.mpc_command_reg_weight,
@@ -282,6 +290,8 @@ def _compact_mpc_payload(payload: dict | None) -> dict | None:
         "num_iterations",
         "planning_horizon_steps",
         "control_steps",
+        "sampling_mode",
+        "knot_count",
         "num_windows",
         "accepted_windows",
         "used_baseline_fallback",
