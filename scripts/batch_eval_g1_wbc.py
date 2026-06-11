@@ -152,7 +152,7 @@ def main() -> None:
     parser.add_argument(
         "--mpc-preset",
         default="aggressive",
-        choices=("aggressive", "conservative"),
+        choices=("aggressive", "conservative", "explore", "rootrot"),
     )
     parser.add_argument("--mpc-samples", type=int, default=None)
     parser.add_argument("--mpc-iterations", type=int, default=None)

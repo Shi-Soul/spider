@@ -145,7 +145,7 @@ def main():
     p.add_argument(
         "--mpc-preset",
         default="aggressive",
-        choices=("aggressive", "conservative"),
+        choices=("aggressive", "conservative", "explore", "rootrot"),
     )
     p.add_argument("--mpc-samples", type=int, default=None)
     p.add_argument("--mpc-iterations", type=int, default=None)

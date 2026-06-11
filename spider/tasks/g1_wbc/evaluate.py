@@ -178,7 +178,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mpc-preset",
         default="aggressive",
-        choices=("aggressive", "conservative"),
+        choices=("aggressive", "conservative", "explore", "rootrot"),
         help="Tuned MPC parameter preset. Explicit MPC flags override this.",
     )
     parser.add_argument("--mpc-samples", type=int, default=None)

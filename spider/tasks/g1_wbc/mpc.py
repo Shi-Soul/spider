@@ -32,7 +32,7 @@ from spider.tasks.g1_wbc.rollout import (
 )
 
 MpcMode = Literal["g1_wbc_ee", "g1_wbc_joint", "g1_wbc_joint_global"]
-MpcPreset = Literal["aggressive", "conservative"]
+MpcPreset = Literal["aggressive", "conservative", "explore", "rootrot"]
 
 
 @dataclass
@@ -73,6 +73,16 @@ class MpcIterationInfo:
     elite_score: float
     zero_delta_score: float
     best_index: int
+    raw_best_score: float
+    raw_zero_delta_score: float
+    reg_best: float
+    reg_zero_delta: float
+    root_pos_delta_abs_max: float
+    root_rot_delta_abs_max: float
+    joint_delta_abs_max: float
+    best_root_pos_delta_rms: float
+    best_root_rot_delta_rms: float
+    best_joint_delta_rms: float
 
 
 @dataclass
@@ -108,6 +118,44 @@ def mpc_config_from_preset(
             guided_root_pos_gain=0.25,
             guided_root_rot_gain=0.25,
             guided_joint_gain=0.20,
+        )
+    if preset == "explore":
+        return replace(
+            config,
+            num_samples=128,
+            num_iterations=5,
+            root_pos_sigma=0.05,
+            root_rot_sigma=0.10,
+            joint_sigma=0.15,
+            min_root_pos_sigma=0.01,
+            min_root_rot_sigma=0.02,
+            min_joint_sigma=0.03,
+            sigma_decay=0.90,
+            smooth_passes=0,
+            command_reg_weight=0.0,
+            command_smooth_weight=0.0,
+            guided_root_pos_clip=0.15,
+            guided_root_rot_clip=0.35,
+            guided_joint_clip=0.45,
+        )
+    if preset == "rootrot":
+        return replace(
+            config,
+            num_samples=128,
+            num_iterations=5,
+            root_pos_sigma=0.015,
+            root_rot_sigma=0.12,
+            joint_sigma=0.10,
+            min_root_pos_sigma=0.002,
+            min_root_rot_sigma=0.025,
+            min_joint_sigma=0.02,
+            sigma_decay=0.90,
+            smooth_passes=0,
+            command_reg_weight=0.0,
+            command_smooth_weight=0.0,
+            guided_root_pos_clip=0.05,
+            guided_root_rot_clip=0.40,
+            guided_joint_clip=0.35,
         )
     raise ValueError(f"Unknown MPC preset: {preset}")
 
@@ -196,12 +244,13 @@ def optimize_mpc_command(
             initial_qvel=initial_qvel,
         )
         raw_scores, terms = compute_rollout_scores(motion, rollout)
-        scores = _score_from_terms(terms, mpc_config.mode)
-        scores = scores - _command_regularization(
+        raw_task_scores = _score_from_terms(terms, mpc_config.mode)
+        regularization = _command_regularization(
             candidates_delta,
             mpc_config.command_reg_weight,
             mpc_config.command_smooth_weight,
         )
+        scores = raw_task_scores - regularization
         final_scores = scores.detach().clone()
 
         iteration_best = torch.argmax(scores)
@@ -244,6 +293,28 @@ def optimize_mpc_command(
                 elite_score=float(elite_scores.mean().detach().cpu().item()),
                 zero_delta_score=float(scores[0].detach().cpu().item()),
                 best_index=int(iteration_best.detach().cpu().item()),
+                raw_best_score=float(raw_task_scores[iteration_best].detach().cpu().item()),
+                raw_zero_delta_score=float(raw_task_scores[0].detach().cpu().item()),
+                reg_best=float(regularization[iteration_best].detach().cpu().item()),
+                reg_zero_delta=float(regularization[0].detach().cpu().item()),
+                root_pos_delta_abs_max=float(
+                    candidates_delta[..., :3].abs().max().detach().cpu().item()
+                ),
+                root_rot_delta_abs_max=float(
+                    candidates_delta[..., 3:6].abs().max().detach().cpu().item()
+                ),
+                joint_delta_abs_max=float(
+                    candidates_delta[..., 6:].abs().max().detach().cpu().item()
+                ),
+                best_root_pos_delta_rms=float(
+                    best_delta[..., :3].square().mean().sqrt().detach().cpu().item()
+                ),
+                best_root_rot_delta_rms=float(
+                    best_delta[..., 3:6].square().mean().sqrt().detach().cpu().item()
+                ),
+                best_joint_delta_rms=float(
+                    best_delta[..., 6:].square().mean().sqrt().detach().cpu().item()
+                ),
             )
         )
         del raw_scores
