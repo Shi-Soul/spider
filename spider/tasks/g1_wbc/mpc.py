@@ -32,6 +32,7 @@ from spider.tasks.g1_wbc.rollout import (
 )
 
 MpcMode = Literal["g1_wbc_ee", "g1_wbc_joint"]
+MpcPreset = Literal["aggressive", "conservative"]
 
 
 @dataclass
@@ -40,7 +41,7 @@ class G1WbcMpcConfig:
 
     mode: MpcMode = "g1_wbc_joint"
     num_samples: int = 64
-    num_iterations: int = 3
+    num_iterations: int = 4
     elite_frac: float = 0.125
     temperature: float = 0.7
     root_pos_sigma: float = 0.015
@@ -51,8 +52,8 @@ class G1WbcMpcConfig:
     min_joint_sigma: float = 0.008
     sigma_decay: float = 0.75
     smooth_passes: int = 2
-    command_reg_weight: float = 0.10
-    command_smooth_weight: float = 0.0003
+    command_reg_weight: float = 0.02
+    command_smooth_weight: float = 0.00005
     use_guided_candidate: bool = True
     guided_root_pos_gain: float = 0.5
     guided_root_rot_gain: float = 0.5
@@ -81,6 +82,34 @@ class G1WbcMpcResult:
     refined_qpos: torch.Tensor
     scores: torch.Tensor
     history: list[MpcIterationInfo]
+    accepted: bool = True
+    final_candidate_score: float = 0.0
+    final_baseline_score: float = 0.0
+
+
+def mpc_config_from_preset(
+    mode: MpcMode,
+    preset: MpcPreset = "aggressive",
+) -> G1WbcMpcConfig:
+    """Return tuned MPC defaults for a motion class."""
+
+    config = G1WbcMpcConfig(mode=mode)
+    if preset == "aggressive":
+        return config
+    if preset == "conservative":
+        return replace(
+            config,
+            num_iterations=3,
+            root_pos_sigma=0.003,
+            root_rot_sigma=0.008,
+            joint_sigma=0.012,
+            command_reg_weight=0.20,
+            command_smooth_weight=0.0010,
+            guided_root_pos_gain=0.25,
+            guided_root_rot_gain=0.25,
+            guided_joint_gain=0.20,
+        )
+    raise ValueError(f"Unknown MPC preset: {preset}")
 
 
 def optimize_mpc_command(
@@ -233,12 +262,35 @@ def optimize_mpc_command(
         initial_qpos=initial_qpos,
         initial_qvel=initial_qvel,
     )
+    final_score = _single_rollout_score(motion, final_rollout, mpc_config.mode)
+    baseline_command = command_batch_from_qpos_trajectory(
+        motion,
+        base_qpos[:, None, :],
+        final_config,
+        preserve_template_first=True,
+    )
+    baseline_rollout = run_command_rollout(
+        baseline_command,
+        actor,
+        final_config,
+        initial_qpos=initial_qpos,
+        initial_qvel=initial_qvel,
+    )
+    baseline_score = _single_rollout_score(motion, baseline_rollout, mpc_config.mode)
+    accepted = final_score >= baseline_score
+    if not accepted:
+        final_command = baseline_command
+        final_rollout = baseline_rollout
+        best_qpos = base_qpos
     return G1WbcMpcResult(
         command=final_command,
         rollout=final_rollout,
         refined_qpos=best_qpos,
         scores=final_scores,
         history=history,
+        accepted=accepted,
+        final_candidate_score=final_score,
+        final_baseline_score=baseline_score,
     )
 
 
@@ -406,6 +458,18 @@ def _score_from_terms(
     )
 
 
+def _single_rollout_score(
+    motion: G1Motion,
+    rollout: RolloutResult,
+    mode: MpcMode,
+) -> float:
+    _, terms = compute_rollout_scores(motion, rollout)
+    score = _score_from_terms(terms, mode)
+    if score.numel() == 0:
+        return -float("inf")
+    return float(torch.nan_to_num(score.float()).max().detach().cpu().item())
+
+
 def _command_regularization(
     delta: torch.Tensor,
     reg_weight: float,
@@ -428,6 +492,12 @@ def _joint_limits(
     high = []
     for joint_name in MUJOCO_JOINT_NAMES:
         joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+        if joint_id < 0:
+            joint_id = mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_JOINT, f"robot/{joint_name}"
+            )
+        if joint_id < 0:
+            raise ValueError(f"G1 model is missing joint {joint_name}")
         if int(model.jnt_limited[joint_id]):
             low.append(float(model.jnt_range[joint_id, 0]))
             high.append(float(model.jnt_range[joint_id, 1]))

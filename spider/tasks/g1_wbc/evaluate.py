@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from spider.tasks.g1_wbc.metrics import compute_rollout_metrics
-from spider.tasks.g1_wbc.mpc import G1WbcMpcConfig, optimize_mpc_command
+from spider.tasks.g1_wbc.mpc import G1WbcMpcConfig, mpc_config_from_preset, optimize_mpc_command
 from spider.tasks.g1_wbc.motion import load_motion, validate_motion_dims
 from spider.tasks.g1_wbc.policy import load_wbc_actor, resolve_checkpoint_path
 from spider.tasks.g1_wbc.rollout import RolloutResult, WbcRolloutConfig, run_direct_rollout, run_no_mpc_rollout
@@ -24,8 +24,11 @@ def main() -> None:
 
     motion = load_motion(args.motion, motion_type=args.motion_type, device=device)
     validate_motion_dims(motion)
-    actor = load_wbc_actor(args.checkpoint, device=device)
-    checkpoint_path = resolve_checkpoint_path(args.checkpoint)
+    actor = None
+    checkpoint_path = None
+    if args.method != "direct":
+        actor = load_wbc_actor(args.checkpoint, device=device)
+        checkpoint_path = resolve_checkpoint_path(args.checkpoint)
 
     config = WbcRolloutConfig(
         model_path=args.model_path,
@@ -36,10 +39,13 @@ def main() -> None:
         nconmax_per_env=args.nconmax_per_env,
         njmax_per_env=args.njmax_per_env,
         sync_after_step=args.sync_after_step,
+        forward_after_step=args.forward_after_step,
+        use_cuda_graph=args.use_cuda_graph,
     )
     mpc_payload = None
     mpc_result = None
     if args.method == "no_mpc":
+        assert actor is not None
         rollout = run_no_mpc_rollout(motion, actor, config)
     elif args.method == "direct":
         qpos = motion.qpos()[:config.max_steps or motion.num_frames]
@@ -49,46 +55,33 @@ def main() -> None:
             initial_qvel=motion.qvel()[0],
         )
     else:
-        mpc_config = G1WbcMpcConfig(
-            mode=args.method,
-            num_samples=args.mpc_samples,
-            num_iterations=args.mpc_iterations,
-            elite_frac=args.mpc_elite_frac,
-            temperature=args.mpc_temperature,
-            root_pos_sigma=args.mpc_root_pos_sigma,
-            root_rot_sigma=args.mpc_root_rot_sigma,
-            joint_sigma=args.mpc_joint_sigma,
-            sigma_decay=args.mpc_sigma_decay,
-            smooth_passes=args.mpc_smooth_passes,
-            command_reg_weight=args.mpc_command_reg_weight,
-            command_smooth_weight=args.mpc_command_smooth_weight,
-            use_guided_candidate=args.mpc_guided_candidate,
-            guided_root_pos_gain=args.mpc_guided_root_pos_gain,
-            guided_root_rot_gain=args.mpc_guided_root_rot_gain,
-            guided_joint_gain=args.mpc_guided_joint_gain,
-            seed=args.seed,
-        )
+        assert actor is not None
+        mpc_config = _build_mpc_config(args)
         mpc_result = optimize_mpc_command(motion, actor, config, mpc_config)
         rollout = mpc_result.rollout
         mpc_payload = {
-            "num_samples": args.mpc_samples,
-            "num_iterations": args.mpc_iterations,
-            "elite_frac": args.mpc_elite_frac,
-            "temperature": args.mpc_temperature,
-            "root_pos_sigma": args.mpc_root_pos_sigma,
-            "root_rot_sigma": args.mpc_root_rot_sigma,
-            "joint_sigma": args.mpc_joint_sigma,
-            "sigma_decay": args.mpc_sigma_decay,
-            "smooth_passes": args.mpc_smooth_passes,
-            "command_reg_weight": args.mpc_command_reg_weight,
-            "command_smooth_weight": args.mpc_command_smooth_weight,
-            "guided_candidate": args.mpc_guided_candidate,
-            "guided_root_pos_gain": args.mpc_guided_root_pos_gain,
-            "guided_root_rot_gain": args.mpc_guided_root_rot_gain,
-            "guided_joint_gain": args.mpc_guided_joint_gain,
+            "preset": args.mpc_preset,
+            "num_samples": mpc_config.num_samples,
+            "num_iterations": mpc_config.num_iterations,
+            "elite_frac": mpc_config.elite_frac,
+            "temperature": mpc_config.temperature,
+            "root_pos_sigma": mpc_config.root_pos_sigma,
+            "root_rot_sigma": mpc_config.root_rot_sigma,
+            "joint_sigma": mpc_config.joint_sigma,
+            "sigma_decay": mpc_config.sigma_decay,
+            "smooth_passes": mpc_config.smooth_passes,
+            "command_reg_weight": mpc_config.command_reg_weight,
+            "command_smooth_weight": mpc_config.command_smooth_weight,
+            "guided_candidate": mpc_config.use_guided_candidate,
+            "guided_root_pos_gain": mpc_config.guided_root_pos_gain,
+            "guided_root_rot_gain": mpc_config.guided_root_rot_gain,
+            "guided_joint_gain": mpc_config.guided_joint_gain,
             "history": [vars(item) for item in mpc_result.history],
             "final_scores_mean": _safe_tensor_stat(mpc_result.scores, "mean"),
             "final_scores_max": _safe_tensor_stat(mpc_result.scores, "max"),
+            "accepted": mpc_result.accepted,
+            "final_candidate_score": mpc_result.final_candidate_score,
+            "final_baseline_score": mpc_result.final_baseline_score,
         }
     metrics = compute_rollout_metrics(motion, rollout)
 
@@ -96,7 +89,7 @@ def main() -> None:
         "method": args.method,
         "motion": str(Path(args.motion).expanduser().resolve()),
         "motion_type": motion.motion_type,
-        "checkpoint": str(checkpoint_path),
+        "checkpoint": str(checkpoint_path) if checkpoint_path is not None else None,
         "device": device,
         "num_envs": args.num_envs,
         "max_steps": args.max_steps,
@@ -152,13 +145,35 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="Reference frame offset used when constructing policy command.",
     )
-    parser.add_argument("--nconmax-per-env", type=int, default=96)
-    parser.add_argument("--njmax-per-env", type=int, default=320)
+    parser.add_argument(
+        "--nconmax-per-env",
+        type=int,
+        default=WbcRolloutConfig.nconmax_per_env,
+        help="Per-world MuJoCo contact buffer size.",
+    )
+    parser.add_argument(
+        "--njmax-per-env",
+        type=int,
+        default=WbcRolloutConfig.njmax_per_env,
+        help="Per-world MuJoCo Jacobian buffer size.",
+    )
     parser.add_argument(
         "--sync-after-step",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Synchronize Warp before reading tensors.",
+    )
+    parser.add_argument(
+        "--forward-after-step",
+        action=argparse.BooleanOptionalAction,
+        default=WbcRolloutConfig.forward_after_step,
+        help="Run mj_forward after each policy step before reading derived tensors.",
+    )
+    parser.add_argument(
+        "--use-cuda-graph",
+        action=argparse.BooleanOptionalAction,
+        default=WbcRolloutConfig.use_cuda_graph,
+        help="Capture MuJoCo Warp step/forward/reset in CUDA graphs when available.",
     )
     parser.add_argument("--output-dir", default=None, help="Optional result directory.")
     parser.add_argument(
@@ -166,28 +181,80 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Save rollout tensors to rollout.npz when output-dir is set.",
     )
-    parser.add_argument("--mpc-samples", type=int, default=64)
-    parser.add_argument("--mpc-iterations", type=int, default=3)
-    parser.add_argument("--mpc-elite-frac", type=float, default=0.125)
-    parser.add_argument("--mpc-temperature", type=float, default=0.7)
-    parser.add_argument("--mpc-root-pos-sigma", type=float, default=0.015)
-    parser.add_argument("--mpc-root-rot-sigma", type=float, default=0.035)
-    parser.add_argument("--mpc-joint-sigma", type=float, default=0.06)
-    parser.add_argument("--mpc-sigma-decay", type=float, default=0.75)
-    parser.add_argument("--mpc-smooth-passes", type=int, default=2)
-    parser.add_argument("--mpc-command-reg-weight", type=float, default=0.10)
-    parser.add_argument("--mpc-command-smooth-weight", type=float, default=0.0003)
+    parser.add_argument(
+        "--mpc-preset",
+        default="aggressive",
+        choices=("aggressive", "conservative"),
+        help="Tuned MPC parameter preset. Explicit MPC flags override this.",
+    )
+    parser.add_argument("--mpc-samples", type=int, default=None)
+    parser.add_argument("--mpc-iterations", type=int, default=None)
+    parser.add_argument("--mpc-elite-frac", type=float, default=None)
+    parser.add_argument("--mpc-temperature", type=float, default=None)
+    parser.add_argument("--mpc-root-pos-sigma", type=float, default=None)
+    parser.add_argument("--mpc-root-rot-sigma", type=float, default=None)
+    parser.add_argument("--mpc-joint-sigma", type=float, default=None)
+    parser.add_argument("--mpc-sigma-decay", type=float, default=None)
+    parser.add_argument("--mpc-smooth-passes", type=int, default=None)
+    parser.add_argument(
+        "--mpc-command-reg-weight",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--mpc-command-smooth-weight",
+        type=float,
+        default=None,
+    )
     parser.add_argument(
         "--mpc-guided-candidate",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="Include a no-MPC-error feedback candidate in the MPC sample batch.",
     )
-    parser.add_argument("--mpc-guided-root-pos-gain", type=float, default=0.5)
-    parser.add_argument("--mpc-guided-root-rot-gain", type=float, default=0.5)
-    parser.add_argument("--mpc-guided-joint-gain", type=float, default=0.4)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--mpc-guided-root-pos-gain",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--mpc-guided-root-rot-gain",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--mpc-guided-joint-gain",
+        type=float,
+        default=None,
+    )
+    parser.add_argument("--seed", type=int, default=G1WbcMpcConfig.seed)
     return parser.parse_args()
+
+
+def _build_mpc_config(args: argparse.Namespace) -> G1WbcMpcConfig:
+    config = mpc_config_from_preset(args.method, args.mpc_preset)
+    overrides = {
+        "num_samples": args.mpc_samples,
+        "num_iterations": args.mpc_iterations,
+        "elite_frac": args.mpc_elite_frac,
+        "temperature": args.mpc_temperature,
+        "root_pos_sigma": args.mpc_root_pos_sigma,
+        "root_rot_sigma": args.mpc_root_rot_sigma,
+        "joint_sigma": args.mpc_joint_sigma,
+        "sigma_decay": args.mpc_sigma_decay,
+        "smooth_passes": args.mpc_smooth_passes,
+        "command_reg_weight": args.mpc_command_reg_weight,
+        "command_smooth_weight": args.mpc_command_smooth_weight,
+        "use_guided_candidate": args.mpc_guided_candidate,
+        "guided_root_pos_gain": args.mpc_guided_root_pos_gain,
+        "guided_root_rot_gain": args.mpc_guided_root_rot_gain,
+        "guided_joint_gain": args.mpc_guided_joint_gain,
+        "seed": args.seed,
+    }
+    for name, value in overrides.items():
+        if value is not None:
+            setattr(config, name, value)
+    return config
 
 
 def _save_rollout(path: Path, rollout: RolloutResult) -> None:
