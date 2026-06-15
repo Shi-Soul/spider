@@ -36,6 +36,7 @@ from spider.tasks.g1_wbc.motion import load_motion
 from spider.tasks.g1_wbc.policy import load_wbc_actor
 from spider.tasks.g1_wbc.mpc import (
     G1WbcMpcConfig,
+    load_reward_weights,
     mpc_config_from_preset,
     optimize_mpc_command,
 )
@@ -259,6 +260,14 @@ def main():
     p.add_argument("--mpc-root-rot-sigma", type=float, default=None)
     p.add_argument("--mpc-joint-sigma", type=float, default=None)
     p.add_argument("--mpc-smooth-passes", type=int, default=None)
+    p.add_argument(
+        "--mpc-reward-weights",
+        default=None,
+        help=(
+            "Optional JSON reward weights. Accepts a flat term mapping or a mapping "
+            "keyed by method name."
+        ),
+    )
     p.add_argument("--seed", type=int, default=G1WbcMpcConfig.seed)
     p.add_argument(
         "--saved-rollout",
@@ -339,6 +348,8 @@ def main():
         for name, value in overrides.items():
             if value is not None:
                 setattr(mpc, name, value)
+        if args.mpc_reward_weights is not None:
+            mpc.reward_weights = load_reward_weights(args.mpc_reward_weights, method)
         r = optimize_mpc_command(motion, actor, cfg, mpc)
         return r.rollout.qpos[:, 0].cpu().numpy(), method
 

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+import json
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Literal
 
 import mujoco
@@ -37,6 +39,69 @@ MpcPreset = Literal["aggressive", "conservative", "explore", "rootrot", "wide"]
 MpcSamplingMode = Literal["full", "knot"]
 
 
+REWARD_WEIGHT_PRESETS: dict[MpcMode, dict[str, float]] = {
+    "g1_wbc_joint_global": {
+        # Contact and smoothness first. Reference contact is intentionally weak
+        # because it is estimated from motion, while bad floor contacts and
+        # force/control smoothness are directly observed in simulation.
+        "bad_floor_contact": 45.0,
+        "bad_floor_force_excess": 10.0,
+        "contact_switch": 12.0,
+        "contact_force_delta": 2.5,
+        "contact_false_positive": 1.5,
+        "contact_false_negative": 0.4,
+        "control_delta": 1.8,
+        "action_delta": 0.6,
+        "joint_acc": 0.006,
+        "joint_jerk": 0.0012,
+        "body_global_pos_error": 4.0,
+        "body_global_rot_error": 0.8,
+        "ee_global_pos_error": 1.5,
+        "ee_global_rot_error": 0.3,
+    },
+    "g1_wbc_joint": {
+        "bad_floor_contact": 35.0,
+        "bad_floor_force_excess": 8.0,
+        "contact_switch": 10.0,
+        "contact_force_delta": 2.0,
+        "contact_false_positive": 0.8,
+        "contact_false_negative": 0.3,
+        "control_delta": 1.6,
+        "action_delta": 0.5,
+        "joint_acc": 0.006,
+        "joint_jerk": 0.0012,
+        "body_local_pos_error": 26.0,
+        "body_local_rot_error": 3.0,
+        "joint_pos_error": 2.1,
+        "ee_local_pos_error": 6.0,
+        "ee_local_rot_error": 1.2,
+        "body_global_pos_error": 0.8,
+        "body_global_rot_error": 0.2,
+        "ee_global_pos_error": 0.3,
+    },
+    "g1_wbc_ee": {
+        "bad_floor_contact": 35.0,
+        "bad_floor_force_excess": 8.0,
+        "contact_switch": 10.0,
+        "contact_force_delta": 2.0,
+        "contact_false_positive": 0.5,
+        "contact_false_negative": 0.2,
+        "control_delta": 2.0,
+        "action_delta": 0.6,
+        "joint_acc": 0.006,
+        "joint_jerk": 0.0015,
+        "hand_global_pos_error": 35.0,
+        "hand_global_rot_error": 3.0,
+        "hand_local_pos_error": 8.0,
+        "hand_local_rot_error": 1.5,
+        "ee_global_pos_error": 2.0,
+        "ee_global_rot_error": 0.4,
+        "body_global_pos_error": 0.8,
+        "body_local_pos_error": 0.8,
+    },
+}
+
+
 @dataclass
 class G1WbcMpcConfig:
     """Sampling MPC parameters for refined WBC command optimization."""
@@ -60,6 +125,7 @@ class G1WbcMpcConfig:
     smooth_passes: int = 2
     command_reg_weight: float = 0.02
     command_smooth_weight: float = 0.00005
+    reward_weights: dict[str, float] | None = field(default=None)
     use_guided_candidate: bool = True
     guided_root_pos_gain: float = 0.5
     guided_root_rot_gain: float = 0.5
@@ -210,6 +276,27 @@ def mpc_config_from_preset(
     raise ValueError(f"Unknown MPC preset: {preset}")
 
 
+def load_reward_weights(path: str | Path, mode: MpcMode) -> dict[str, float]:
+    """Load reward weights from JSON.
+
+    Accepted forms:
+    - a flat mapping from term name to scalar weight
+    - a mapping keyed by method name, e.g. {"g1_wbc_ee": {...}}
+    """
+
+    raw = json.loads(Path(path).expanduser().read_text())
+    if mode in raw and isinstance(raw[mode], dict):
+        raw = raw[mode]
+    if not isinstance(raw, dict):
+        raise ValueError(f"Reward weight file must contain a JSON object: {path}")
+    weights: dict[str, float] = {}
+    for key, value in raw.items():
+        if not isinstance(value, (int, float)):
+            raise ValueError(f"Reward weight {key!r} must be numeric, got {value!r}.")
+        weights[str(key)] = float(value)
+    return weights
+
+
 def optimize_mpc_command(
     motion: G1Motion,
     actor: WbcActor,
@@ -264,6 +351,8 @@ def optimize_mpc_command(
     controls: list[torch.Tensor] = []
     contact_indicator: list[torch.Tensor] = []
     contact_force: list[torch.Tensor] = []
+    floor_contact_indicator: list[torch.Tensor] = []
+    floor_contact_force: list[torch.Tensor] = []
     ref_indices: list[torch.Tensor] = []
 
     current_qpos = motion.qpos()[0].detach().clone()
@@ -334,6 +423,12 @@ def optimize_mpc_command(
                 window_rollout.contact_indicator[0, 0].detach().clone()
             )
             contact_force.append(window_rollout.contact_force[0, 0].detach().clone())
+            floor_contact_indicator.append(
+                _floor_contact_indicator(window_rollout)[0, 0].detach().clone()
+            )
+            floor_contact_force.append(
+                _floor_contact_force(window_rollout)[0, 0].detach().clone()
+            )
             ref_indices.append(window_rollout.ref_indices[0, 0].detach().clone())
 
         qpos_trace.extend(t.detach().clone() for t in window_rollout.qpos[1:, 0])
@@ -355,6 +450,12 @@ def optimize_mpc_command(
         )
         contact_force.extend(
             t.detach().clone() for t in window_rollout.contact_force[1:, 0]
+        )
+        floor_contact_indicator.extend(
+            t.detach().clone() for t in _floor_contact_indicator(window_rollout)[1:, 0]
+        )
+        floor_contact_force.extend(
+            t.detach().clone() for t in _floor_contact_force(window_rollout)[1:, 0]
         )
         ref_indices.extend(t.detach().clone() for t in window_rollout.ref_indices[1:, 0])
         actions.extend(t.detach().clone() for t in window_rollout.actions[:, 0])
@@ -389,9 +490,16 @@ def optimize_mpc_command(
         controls=torch.stack(controls, dim=0)[:, None, :],
         contact_indicator=torch.stack(contact_indicator, dim=0)[:, None, :],
         contact_force=torch.stack(contact_force, dim=0)[:, None, :],
+        floor_contact_indicator=torch.stack(floor_contact_indicator, dim=0)[:, None, :],
+        floor_contact_force=torch.stack(floor_contact_force, dim=0)[:, None, :],
         ref_indices=torch.stack(ref_indices, dim=0)[:, None],
     )
-    final_score = _single_rollout_score(motion, rollout, mpc_config.mode)
+    final_score = _single_rollout_score(
+        motion,
+        rollout,
+        mpc_config.mode,
+        mpc_config.reward_weights,
+    )
 
     base_qpos = motion.qpos()[: total_steps + 1].contiguous()
     baseline_config = replace(rollout_config, num_envs=1, max_steps=total_steps)
@@ -408,7 +516,12 @@ def optimize_mpc_command(
         initial_qpos=motion.qpos()[0],
         initial_qvel=motion.qvel()[0],
     )
-    baseline_score = _single_rollout_score(motion, baseline_rollout, mpc_config.mode)
+    baseline_score = _single_rollout_score(
+        motion,
+        baseline_rollout,
+        mpc_config.mode,
+        mpc_config.reward_weights,
+    )
     accepted = final_score >= baseline_score
     used_baseline_fallback = bool(mpc_config.acceptance_gate and not accepted)
     if used_baseline_fallback:
@@ -531,8 +644,12 @@ def _optimize_mpc_window(
             initial_history_state=initial_history_state,
             ref_start=start,
         )
-        raw_scores, terms = compute_rollout_scores(motion, rollout)
-        raw_task_scores = _score_from_terms(terms, mpc_config.mode)
+        _, terms = compute_rollout_scores(motion, rollout)
+        raw_task_scores = _score_from_terms(
+            terms,
+            mpc_config.mode,
+            mpc_config.reward_weights,
+        )
         regularization = _command_regularization(
             candidates_delta,
             mpc_config.command_reg_weight,
@@ -612,8 +729,6 @@ def _optimize_mpc_window(
                 ),
             )
         )
-        del raw_scores
-
     return _MpcWindowOptimizeResult(
         best_qpos=best_qpos,
         best_delta=best_delta,
@@ -834,11 +949,7 @@ def _guided_delta_from_no_mpc(
     )
     quat_err = quat_mul(base_qpos[:, 3:7], quat_inv(executed[:, 3:7]))
     guided[:, 3:6] = axis_angle_from_quat(quat_err) * float(config.guided_root_rot_gain)
-    joint_gain = (
-        0.0
-        if config.mode in ("g1_wbc_ee", "g1_wbc_joint_global")
-        else float(config.guided_joint_gain)
-    )
+    joint_gain = float(config.guided_joint_gain)
     guided[:, 6:] = (base_qpos[:, 7:] - executed[:, 7:]) * float(
         joint_gain
     )
@@ -887,66 +998,57 @@ def _apply_delta_to_qpos(
 def _score_from_terms(
     terms: dict[str, torch.Tensor],
     mode: MpcMode,
+    reward_weights: dict[str, float] | None = None,
 ) -> torch.Tensor:
-    if mode == "g1_wbc_ee":
-        return -(
-            4.0 * terms["contact_false_positive"]
-            + 3.0 * terms["contact_false_negative"]
-            + 3.0 * terms["contact_switch"]
-            + 0.6 * terms["contact_force_excess"]
-            + 0.3 * terms["contact_force_delta"]
-            + 5.0 * terms["ee_global_pos_error"]
-            + 2.5 * terms["ee_local_pos_error"]
-            + 0.6 * terms["ee_global_rot_error"]
-            + 0.3 * terms["ee_local_rot_error"]
-            + 1.0 * terms["root_pos_error"]
-            + 0.4 * terms["root_rot_error"]
-            + 0.40 * terms["control_delta"]
-            + 0.0030 * terms["joint_acc"]
-        )
-    if mode == "g1_wbc_joint_global":
-        return -(
-            4.0 * terms["contact_false_positive"]
-            + 3.0 * terms["contact_false_negative"]
-            + 3.0 * terms["contact_switch"]
-            + 0.5 * terms["contact_force_excess"]
-            + 0.25 * terms["contact_force_delta"]
-            + 2.5 * terms["body_global_pos_error"]
-            + 0.8 * terms["body_global_rot_error"]
-            + 2.0 * terms["ee_global_pos_error"]
-            + 0.8 * terms["ee_global_rot_error"]
-            + 1.5 * terms["root_pos_error"]
-            + 0.4 * terms["root_rot_error"]
-            + 0.20 * terms["control_delta"]
-            + 0.0015 * terms["joint_acc"]
-        )
-    return -(
-        4.0 * terms["contact_false_positive"]
-        + 3.0 * terms["contact_false_negative"]
-        + 3.0 * terms["contact_switch"]
-        + 0.5 * terms["contact_force_excess"]
-        + 0.25 * terms["contact_force_delta"]
-        + 2.0 * terms["body_global_pos_error"]
-        + 0.6 * terms["body_global_rot_error"]
-        + 1.2 * terms["joint_pos_error"]
-        + 1.5 * terms["ee_global_pos_error"]
-        + 1.5 * terms["root_pos_error"]
-        + 0.4 * terms["root_rot_error"]
-        + 0.20 * terms["control_delta"]
-        + 0.0015 * terms["joint_acc"]
-    )
+    weights = reward_weights or REWARD_WEIGHT_PRESETS[mode]
+    missing = sorted(key for key in weights if key not in terms)
+    if missing:
+        raise KeyError(f"Reward weights reference missing terms: {missing}")
+    loss = None
+    for key, weight in weights.items():
+        term = terms[key] * float(weight)
+        loss = term if loss is None else loss + term
+    if loss is None:
+        first = next(iter(terms.values()))
+        loss = torch.zeros_like(first)
+    return -loss
 
 
 def _single_rollout_score(
     motion: G1Motion,
     rollout: RolloutResult,
     mode: MpcMode,
+    reward_weights: dict[str, float] | None = None,
 ) -> float:
     _, terms = compute_rollout_scores(motion, rollout)
-    score = _score_from_terms(terms, mode)
+    score = _score_from_terms(terms, mode, reward_weights)
     if score.numel() == 0:
         return -float("inf")
     return float(torch.nan_to_num(score.float()).max().detach().cpu().item())
+
+
+def _floor_contact_indicator(rollout: RolloutResult) -> torch.Tensor:
+    if rollout.floor_contact_indicator is not None:
+        return rollout.floor_contact_indicator
+    other = torch.zeros(
+        *rollout.contact_indicator.shape[:-1],
+        1,
+        dtype=rollout.contact_indicator.dtype,
+        device=rollout.contact_indicator.device,
+    )
+    return torch.cat([rollout.contact_indicator, other], dim=-1)
+
+
+def _floor_contact_force(rollout: RolloutResult) -> torch.Tensor:
+    if rollout.floor_contact_force is not None:
+        return rollout.floor_contact_force
+    other = torch.zeros(
+        *rollout.contact_force.shape[:-1],
+        1,
+        dtype=rollout.contact_force.dtype,
+        device=rollout.contact_force.device,
+    )
+    return torch.cat([rollout.contact_force, other], dim=-1)
 
 
 def _command_regularization(

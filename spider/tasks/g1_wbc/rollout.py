@@ -72,6 +72,8 @@ class RolloutResult:
     contact_indicator: torch.Tensor
     contact_force: torch.Tensor
     ref_indices: torch.Tensor
+    floor_contact_indicator: torch.Tensor | None = None
+    floor_contact_force: torch.Tensor | None = None
     dt: float = POLICY_DT
     final_last_action: torch.Tensor | None = None
     final_history_state: dict | None = None
@@ -107,6 +109,14 @@ def _resolve_name_id(model: mujoco.MjModel, objtype: mujoco.mjtObj, name: str) -
     prefixed = f"robot/{name}"
     obj_id = mujoco.mj_name2id(model, objtype, prefixed)
     return int(obj_id)
+
+
+def _geom_is_robot_collision(model: mujoco.MjModel, geom_id: int) -> bool:
+    name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(geom_id)) or ""
+    if name in ("terrain", "floor"):
+        return False
+    bare_name = name.removeprefix("robot/")
+    return bare_name.endswith("_collision")
 
 
 def _wxy_actuator_joint_names() -> tuple[str, ...]:
@@ -400,6 +410,7 @@ class G1WbcMujocoWarpEnv:
             raise ValueError(f"G1 model is missing bodies: {missing}")
         self.root_body_id = self.body_ids[0]
         self.foot_geom_ids = self._resolve_foot_geoms()
+        self.floor_contact_geom_groups = self._resolve_floor_contact_geom_groups()
         self.floor_geom_id = self._resolve_ground_geom()
         self.imu_ang_vel_slice = self._resolve_sensor_slice("robot/imu_ang_vel")
         self.ctrl_actuator_ids = torch.tensor(
@@ -457,6 +468,20 @@ class G1WbcMujocoWarpEnv:
                 torch.tensor(geom_ids, dtype=torch.long, device=self.torch_device)
             )
         return foot_ids[0], foot_ids[1]
+
+    def _resolve_floor_contact_geom_groups(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        left_foot, right_foot = self._resolve_foot_geoms()
+        foot_set = set(left_foot.detach().cpu().tolist()) | set(
+            right_foot.detach().cpu().tolist()
+        )
+        other_ids = [
+            geom_id
+            for geom_id in range(self.model_cpu.ngeom)
+            if geom_id not in foot_set
+            and _geom_is_robot_collision(self.model_cpu, geom_id)
+        ]
+        other = torch.tensor(other_ids, dtype=torch.long, device=self.torch_device)
+        return left_foot, right_foot, other
 
     def _resolve_ground_geom(self) -> int:
         for geom_name in ("terrain", "floor"):
@@ -595,7 +620,13 @@ class G1WbcMujocoWarpEnv:
     def foot_contact(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return per-world foot contact indicators and approximate normal forces."""
 
-        indicator = torch.zeros(self.num_envs, 2, dtype=torch.float32, device=self.torch_device)
+        floor_indicator, floor_force = self.floor_contact()
+        return floor_indicator[:, :2], floor_force[:, :2]
+
+    def floor_contact(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return floor contact for left foot, right foot, and non-foot robot geoms."""
+
+        indicator = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=self.torch_device)
         force = torch.zeros_like(indicator)
         if self.floor_geom_id < 0:
             return indicator, force
@@ -619,16 +650,18 @@ class G1WbcMujocoWarpEnv:
             return indicator, force
 
         floor = torch.tensor(self.floor_geom_id, device=self.torch_device)
-        for foot_idx, foot_geoms in enumerate(self.foot_geom_ids):
+        for contact_idx, contact_geoms in enumerate(self.floor_contact_geom_groups):
+            if contact_geoms.numel() == 0:
+                continue
             has_floor = (geom[:, 0] == floor) | (geom[:, 1] == floor)
-            has_foot = torch.isin(geom[:, 0], foot_geoms) | torch.isin(
-                geom[:, 1], foot_geoms
+            has_robot_part = torch.isin(geom[:, 0], contact_geoms) | torch.isin(
+                geom[:, 1], contact_geoms
             )
-            mask = active_indicator & has_floor & has_foot
+            mask = active_indicator & has_floor & has_robot_part
             if not torch.any(mask):
                 continue
             env_ids = worldid[mask]
-            indicator[:, foot_idx].scatter_reduce_(
+            indicator[:, contact_idx].scatter_reduce_(
                 0,
                 env_ids,
                 torch.ones(env_ids.shape[0], dtype=torch.float32, device=self.torch_device),
@@ -641,7 +674,7 @@ class G1WbcMujocoWarpEnv:
             force_env_ids = worldid[force_mask]
             addr = address[force_mask].clamp(min=0, max=efc_force.shape[1] - 1)
             normal_force = efc_force[force_env_ids, addr].clamp(min=0.0)
-            force[:, foot_idx].scatter_add_(0, force_env_ids, normal_force)
+            force[:, contact_idx].scatter_add_(0, force_env_ids, normal_force)
         return indicator.clamp(max=1.0), force
 
     def action_to_control(self, action: torch.Tensor) -> torch.Tensor:
@@ -706,15 +739,19 @@ def run_static_qpos_rollout(
     body_ang_vel_trace = []
     contact_indicator = []
     contact_force = []
+    floor_contact_indicator = []
+    floor_contact_force = []
     with torch.inference_mode():
         for frame_idx in range(total_steps + 1):
             env.reset(qpos_trajectory[frame_idx], qvel_trajectory[frame_idx])
             state = env.robot_state()
-            foot_contact, foot_force = env.foot_contact()
+            floor_contact, floor_force = env.floor_contact()
             _append_state(
                 state,
-                foot_contact,
-                foot_force,
+                floor_contact[:, :2],
+                floor_force[:, :2],
+                floor_contact,
+                floor_force,
                 qpos_trace,
                 qvel_trace,
                 body_pos_trace,
@@ -723,6 +760,8 @@ def run_static_qpos_rollout(
                 body_ang_vel_trace,
                 contact_indicator,
                 contact_force,
+                floor_contact_indicator,
+                floor_contact_force,
             )
 
     actions = torch.zeros(total_steps, num_envs, ACTION_DIM, dtype=torch.float32, device=device)
@@ -740,6 +779,8 @@ def run_static_qpos_rollout(
         controls=controls,
         contact_indicator=torch.stack(contact_indicator, dim=0),
         contact_force=torch.stack(contact_force, dim=0),
+        floor_contact_indicator=torch.stack(floor_contact_indicator, dim=0),
+        floor_contact_force=torch.stack(floor_contact_force, dim=0),
         ref_indices=ref_indices,
     )
 
@@ -808,14 +849,18 @@ def run_command_rollout(
     controls = []
     contact_indicator = []
     contact_force = []
+    floor_contact_indicator = []
+    floor_contact_force = []
     ref_indices = []
 
     state = env.robot_state()
-    foot_contact, foot_force = env.foot_contact()
+    floor_contact, floor_force = env.floor_contact()
     _append_state(
         state,
-        foot_contact,
-        foot_force,
+        floor_contact[:, :2],
+        floor_force[:, :2],
+        floor_contact,
+        floor_force,
         qpos_trace,
         qvel_trace,
         body_pos_trace,
@@ -824,6 +869,8 @@ def run_command_rollout(
         body_ang_vel_trace,
         contact_indicator,
         contact_force,
+        floor_contact_indicator,
+        floor_contact_force,
     )
     ref_indices.append(
         torch.full(
@@ -848,11 +895,13 @@ def run_command_rollout(
             env.step_control(ctrl)
 
             state = env.robot_state()
-            foot_contact, foot_force = env.foot_contact()
+            floor_contact, floor_force = env.floor_contact()
             _append_state(
                 state,
-                foot_contact,
-                foot_force,
+                floor_contact[:, :2],
+                floor_force[:, :2],
+                floor_contact,
+                floor_force,
                 qpos_trace,
                 qvel_trace,
                 body_pos_trace,
@@ -861,6 +910,8 @@ def run_command_rollout(
                 body_ang_vel_trace,
                 contact_indicator,
                 contact_force,
+                floor_contact_indicator,
+                floor_contact_force,
             )
             actions.append(action.detach().clone())
             controls.append(ctrl.detach().clone())
@@ -878,6 +929,8 @@ def run_command_rollout(
         controls=torch.stack(controls, dim=0),
         contact_indicator=torch.stack(contact_indicator, dim=0),
         contact_force=torch.stack(contact_force, dim=0),
+        floor_contact_indicator=torch.stack(floor_contact_indicator, dim=0),
+        floor_contact_force=torch.stack(floor_contact_force, dim=0),
         ref_indices=torch.stack(ref_indices, dim=0),
         final_last_action=last_action.detach().clone(),
         final_history_state=obs_builder.history_state_dict(),
@@ -959,6 +1012,8 @@ def _append_state(
     state: RobotState,
     foot_contact: torch.Tensor,
     foot_force: torch.Tensor,
+    floor_contact: torch.Tensor,
+    floor_force: torch.Tensor,
     qpos_trace: list[torch.Tensor],
     qvel_trace: list[torch.Tensor],
     body_pos_trace: list[torch.Tensor],
@@ -967,6 +1022,8 @@ def _append_state(
     body_ang_vel_trace: list[torch.Tensor],
     contact_indicator: list[torch.Tensor],
     contact_force: list[torch.Tensor],
+    floor_contact_indicator: list[torch.Tensor],
+    floor_contact_force: list[torch.Tensor],
 ) -> None:
     qpos_trace.append(state.qpos.detach().clone())
     qvel_trace.append(state.qvel.detach().clone())
@@ -976,3 +1033,5 @@ def _append_state(
     body_ang_vel_trace.append(state.body_ang_vel_w.detach().clone())
     contact_indicator.append(foot_contact.detach().clone())
     contact_force.append(foot_force.detach().clone())
+    floor_contact_indicator.append(floor_contact.detach().clone())
+    floor_contact_force.append(floor_force.detach().clone())

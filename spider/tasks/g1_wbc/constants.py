@@ -171,6 +171,10 @@ LIMB_EE_BODY_NAMES: tuple[str, ...] = (
     "left_ankle_roll_link",
     "right_ankle_roll_link",
 )
+HAND_EE_BODY_NAMES: tuple[str, ...] = (
+    "left_wrist_yaw_link",
+    "right_wrist_yaw_link",
+)
 TASK_EE_BODY_NAMES: tuple[str, ...] = (*LIMB_EE_BODY_NAMES, "torso_link")
 LEFT_FOOT_BODY_NAME = "left_ankle_roll_link"
 RIGHT_FOOT_BODY_NAME = "right_ankle_roll_link"

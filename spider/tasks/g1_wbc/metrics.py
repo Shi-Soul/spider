@@ -8,6 +8,7 @@ import torch
 
 from spider.tasks.g1_wbc.constants import (
     ANCHOR_BODY_NAME,
+    HAND_EE_BODY_NAMES,
     MUJOCO_BODY_NAMES,
     TASK_EE_BODY_NAMES,
 )
@@ -56,10 +57,11 @@ def compute_rollout_metrics(
     body_pos_err = torch.linalg.norm(rollout.body_pos_w - ref_body_pos, dim=-1)
     body_rot_err = quat_error_magnitude(rollout.body_quat_w, ref_body_quat)
 
-    ee_indices = torch.tensor(
-        [MUJOCO_BODY_NAMES.index(name) for name in TASK_EE_BODY_NAMES],
-        dtype=torch.long,
-        device=device,
+    ee_indices = _body_indices(TASK_EE_BODY_NAMES, device)
+    hand_indices = _body_indices(HAND_EE_BODY_NAMES, device)
+    local_body_indices = _body_indices(
+        tuple(name for name in MUJOCO_BODY_NAMES if name != ANCHOR_BODY_NAME),
+        device,
     )
     ee_pos_err = body_pos_err.index_select(-1, ee_indices)
     ee_rot_err = body_rot_err.index_select(-1, ee_indices)
@@ -69,6 +71,22 @@ def compute_rollout_metrics(
         ref_body_pos,
         ref_body_quat,
         ee_indices,
+    )
+    hand_pos_err = body_pos_err.index_select(-1, hand_indices)
+    hand_rot_err = body_rot_err.index_select(-1, hand_indices)
+    hand_local_pos_err, hand_local_rot_err = _local_body_errors(
+        rollout.body_pos_w,
+        rollout.body_quat_w,
+        ref_body_pos,
+        ref_body_quat,
+        hand_indices,
+    )
+    body_local_pos_err, body_local_rot_err = _local_body_errors(
+        rollout.body_pos_w,
+        rollout.body_quat_w,
+        ref_body_pos,
+        ref_body_quat,
+        local_body_indices,
     )
 
     sim_contact_eval = rollout.contact_indicator[1:]
@@ -81,6 +99,11 @@ def compute_rollout_metrics(
     contact_force = rollout.contact_force[1:]
     contact_force_excess = _contact_force_excess(contact_force)
     contact_force_delta = _diff_norm(contact_force) / _contact_force_scale()
+    floor_contact = _floor_contact_indicator(rollout)[1:]
+    floor_force = _floor_contact_force(rollout)[1:]
+    bad_floor_contact = floor_contact[..., 2:]
+    bad_floor_force = floor_force[..., 2:]
+    bad_floor_force_excess = bad_floor_force / _contact_force_scale()
 
     action_delta = _diff_norm(rollout.actions)
     ctrl_delta = _diff_norm(rollout.controls)
@@ -102,6 +125,12 @@ def compute_rollout_metrics(
         "ee_global_rot_error_mean": _mean(ee_rot_err),
         "ee_local_pos_error_mean": _mean(local_pos_err),
         "ee_local_rot_error_mean": _mean(local_rot_err),
+        "hand_global_pos_error_mean": _mean(hand_pos_err),
+        "hand_global_rot_error_mean": _mean(hand_rot_err),
+        "hand_local_pos_error_mean": _mean(hand_local_pos_err),
+        "hand_local_rot_error_mean": _mean(hand_local_rot_err),
+        "body_local_pos_error_mean": _mean(body_local_pos_err),
+        "body_local_rot_error_mean": _mean(body_local_rot_err),
         "contact_mismatch_rate": _mean(contact_err),
         "contact_false_positive_rate": _mean(false_positive),
         "contact_false_negative_rate": _mean(false_negative),
@@ -113,6 +142,9 @@ def compute_rollout_metrics(
         "contact_force_peak": _max(contact_force),
         "contact_force_excess_mean": _mean(contact_force_excess),
         "contact_force_delta_mean": _mean(contact_force_delta),
+        "bad_floor_contact_rate": _mean(bad_floor_contact),
+        "bad_floor_force_mean": _mean(bad_floor_force),
+        "bad_floor_force_excess_mean": _mean(bad_floor_force_excess),
         "action_delta_mean": _mean(action_delta),
         "control_delta_mean": _mean(ctrl_delta),
         "joint_acc_mean": _mean(joint_acc),
@@ -161,10 +193,11 @@ def compute_rollout_scores(
 
     body_pos_err = torch.linalg.norm(rollout.body_pos_w - ref_body_pos, dim=-1)
     body_rot_err = quat_error_magnitude(rollout.body_quat_w, ref_body_quat)
-    ee_indices = torch.tensor(
-        [MUJOCO_BODY_NAMES.index(name) for name in TASK_EE_BODY_NAMES],
-        dtype=torch.long,
-        device=device,
+    ee_indices = _body_indices(TASK_EE_BODY_NAMES, device)
+    hand_indices = _body_indices(HAND_EE_BODY_NAMES, device)
+    local_body_indices = _body_indices(
+        tuple(name for name in MUJOCO_BODY_NAMES if name != ANCHOR_BODY_NAME),
+        device,
     )
     ee_pos_err = body_pos_err.index_select(-1, ee_indices)
     ee_rot_err = body_rot_err.index_select(-1, ee_indices)
@@ -174,6 +207,22 @@ def compute_rollout_scores(
         ref_body_pos,
         ref_body_quat,
         ee_indices,
+    )
+    hand_pos_err = body_pos_err.index_select(-1, hand_indices)
+    hand_rot_err = body_rot_err.index_select(-1, hand_indices)
+    hand_local_pos_err, hand_local_rot_err = _local_body_errors(
+        rollout.body_pos_w,
+        rollout.body_quat_w,
+        ref_body_pos,
+        ref_body_quat,
+        hand_indices,
+    )
+    body_local_pos_err, body_local_rot_err = _local_body_errors(
+        rollout.body_pos_w,
+        rollout.body_quat_w,
+        ref_body_pos,
+        ref_body_quat,
+        local_body_indices,
     )
 
     sim_contact_eval = rollout.contact_indicator[1:]
@@ -185,8 +234,20 @@ def compute_rollout_scores(
     contact_force = rollout.contact_force[1:]
     contact_force_excess = _contact_force_excess(contact_force)
     contact_force_delta = _diff_norm(contact_force) / _contact_force_scale()
+    floor_contact = _floor_contact_indicator(rollout)[1:]
+    floor_force = _floor_contact_force(rollout)[1:]
+    bad_floor_contact = floor_contact[..., 2:]
+    bad_floor_force = floor_force[..., 2:]
+    bad_floor_force_excess = bad_floor_force / _contact_force_scale()
+    action_delta = _diff_norm(rollout.actions)
     ctrl_delta = _diff_norm(rollout.controls)
     joint_acc = _diff_norm(rollout.qvel[..., 6:]) / max(float(rollout.dt), 1.0e-6)
+    if rollout.qvel.shape[0] > 2:
+        joint_jerk = _diff_norm(torch.diff(rollout.qvel[..., 6:], dim=0)) / max(
+            float(rollout.dt), 1.0e-6
+        )
+    else:
+        joint_jerk = torch.zeros_like(joint_acc)
 
     terms = {
         "root_pos_error": _per_env_mean(root_pos_err),
@@ -198,14 +259,24 @@ def compute_rollout_scores(
         "ee_global_rot_error": _per_env_mean(ee_rot_err),
         "ee_local_pos_error": _per_env_mean(local_pos_err),
         "ee_local_rot_error": _per_env_mean(local_rot_err),
+        "hand_global_pos_error": _per_env_mean(hand_pos_err),
+        "hand_global_rot_error": _per_env_mean(hand_rot_err),
+        "hand_local_pos_error": _per_env_mean(hand_local_pos_err),
+        "hand_local_rot_error": _per_env_mean(hand_local_rot_err),
+        "body_local_pos_error": _per_env_mean(body_local_pos_err),
+        "body_local_rot_error": _per_env_mean(body_local_rot_err),
         "contact_mismatch": _per_env_mean(contact_err),
         "contact_false_positive": _per_env_mean(false_positive),
         "contact_false_negative": _per_env_mean(false_negative),
         "contact_switch": _per_env_mean(contact_switch),
         "contact_force_excess": _per_env_mean(contact_force_excess),
         "contact_force_delta": _per_env_mean(contact_force_delta),
+        "bad_floor_contact": _per_env_mean(bad_floor_contact),
+        "bad_floor_force_excess": _per_env_mean(bad_floor_force_excess),
+        "action_delta": _per_env_mean(action_delta),
         "control_delta": _per_env_mean(ctrl_delta),
         "joint_acc": _per_env_mean(joint_acc),
+        "joint_jerk": _per_env_mean(joint_jerk),
     }
     score = -(
         4.0 * terms["contact_mismatch"]
@@ -218,6 +289,38 @@ def compute_rollout_scores(
         + 0.05 * terms["control_delta"]
     )
     return score, terms
+
+
+def _body_indices(names: tuple[str, ...], device: torch.device) -> torch.Tensor:
+    return torch.tensor(
+        [MUJOCO_BODY_NAMES.index(name) for name in names],
+        dtype=torch.long,
+        device=device,
+    )
+
+
+def _floor_contact_indicator(rollout: RolloutResult) -> torch.Tensor:
+    if rollout.floor_contact_indicator is not None:
+        return rollout.floor_contact_indicator
+    other = torch.zeros(
+        *rollout.contact_indicator.shape[:-1],
+        1,
+        dtype=rollout.contact_indicator.dtype,
+        device=rollout.contact_indicator.device,
+    )
+    return torch.cat([rollout.contact_indicator, other], dim=-1)
+
+
+def _floor_contact_force(rollout: RolloutResult) -> torch.Tensor:
+    if rollout.floor_contact_force is not None:
+        return rollout.floor_contact_force
+    other = torch.zeros(
+        *rollout.contact_force.shape[:-1],
+        1,
+        dtype=rollout.contact_force.dtype,
+        device=rollout.contact_force.device,
+    )
+    return torch.cat([rollout.contact_force, other], dim=-1)
 
 
 def _local_body_errors(

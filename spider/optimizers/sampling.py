@@ -21,7 +21,26 @@ import torch
 import torch.nn.functional as F
 
 from spider.config import Config
-from spider.interp import interp
+
+
+def _interpolate_knot_samples(
+    knot_samples: torch.Tensor, target_steps: int
+) -> torch.Tensor:
+    """Interpolate endpoint knots to a dense control horizon."""
+
+    target_steps = int(target_steps)
+    if target_steps < 1:
+        raise ValueError(f"target_steps must be positive, got {target_steps}.")
+    if knot_samples.shape[1] <= 1:
+        return knot_samples.repeat(1, target_steps, 1)
+
+    dense = F.interpolate(
+        knot_samples.permute(0, 2, 1),
+        size=target_steps + 1,
+        mode="linear",
+        align_corners=True,
+    ).permute(0, 2, 1)
+    return dense[:, :target_steps]
 
 
 def _sample_ctrls_impl(
@@ -45,8 +64,8 @@ def _sample_ctrls_impl(
         * config.noise_scale
         * global_noise_scale
     )
-    # interp to horizon_steps
-    delta_ctrl_samples = interp(knot_samples, config.knot_steps)
+    # Interpolate endpoint knots to the current dense horizon.
+    delta_ctrl_samples = _interpolate_knot_samples(knot_samples, ctrls.shape[0])
     # add to ctrls
     ctrls_samples = ctrls + delta_ctrl_samples
     return ctrls_samples

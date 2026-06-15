@@ -10,7 +10,13 @@ import numpy as np
 import torch
 
 from spider.tasks.g1_wbc.metrics import compute_rollout_metrics
-from spider.tasks.g1_wbc.mpc import G1WbcMpcConfig, mpc_config_from_preset, optimize_mpc_command
+from spider.tasks.g1_wbc.mpc import (
+    REWARD_WEIGHT_PRESETS,
+    G1WbcMpcConfig,
+    load_reward_weights,
+    mpc_config_from_preset,
+    optimize_mpc_command,
+)
 from spider.tasks.g1_wbc.motion import load_motion, validate_motion_dims
 from spider.tasks.g1_wbc.policy import load_wbc_actor, resolve_checkpoint_path
 from spider.tasks.g1_wbc.rollout import RolloutResult, WbcRolloutConfig, run_no_mpc_rollout
@@ -78,6 +84,12 @@ def main() -> None:
             "smooth_passes": mpc_config.smooth_passes,
             "command_reg_weight": mpc_config.command_reg_weight,
             "command_smooth_weight": mpc_config.command_smooth_weight,
+            "reward_weight_source": (
+                str(Path(args.mpc_reward_weights).expanduser().resolve())
+                if args.mpc_reward_weights is not None
+                else "default"
+            ),
+            "reward_weights": _effective_reward_weights(mpc_config),
             "acceptance_gate": mpc_config.acceptance_gate,
             "guided_candidate": mpc_config.use_guided_candidate,
             "guided_root_pos_gain": mpc_config.guided_root_pos_gain,
@@ -243,6 +255,14 @@ def _parse_args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument(
+        "--mpc-reward-weights",
+        default=None,
+        help=(
+            "Optional JSON reward weights. Accepts a flat term mapping or a mapping "
+            "keyed by method name."
+        ),
+    )
+    parser.add_argument(
         "--mpc-guided-candidate",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -266,6 +286,21 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mpc-guided-joint-gain",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--mpc-guided-root-pos-clip",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--mpc-guided-root-rot-clip",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--mpc-guided-joint-clip",
         type=float,
         default=None,
     )
@@ -296,12 +331,24 @@ def _build_mpc_config(args: argparse.Namespace) -> G1WbcMpcConfig:
         "guided_root_pos_gain": args.mpc_guided_root_pos_gain,
         "guided_root_rot_gain": args.mpc_guided_root_rot_gain,
         "guided_joint_gain": args.mpc_guided_joint_gain,
+        "guided_root_pos_clip": args.mpc_guided_root_pos_clip,
+        "guided_root_rot_clip": args.mpc_guided_root_rot_clip,
+        "guided_joint_clip": args.mpc_guided_joint_clip,
         "seed": args.seed,
     }
     for name, value in overrides.items():
         if value is not None:
             setattr(config, name, value)
+    if args.mpc_reward_weights is not None:
+        config.reward_weights = load_reward_weights(args.mpc_reward_weights, args.method)
     return config
+
+
+def _effective_reward_weights(config: G1WbcMpcConfig) -> dict[str, float]:
+    weights = config.reward_weights
+    if weights is None:
+        weights = REWARD_WEIGHT_PRESETS[config.mode]
+    return {key: float(value) for key, value in weights.items()}
 
 
 def _save_rollout(path: Path, rollout: RolloutResult) -> None:
@@ -319,6 +366,10 @@ def _save_rollout(path: Path, rollout: RolloutResult) -> None:
         "ref_indices": _cpu_np(rollout.ref_indices),
         "dt": np.array(rollout.dt, dtype=np.float32),
     }
+    if rollout.floor_contact_indicator is not None:
+        arrays["floor_contact_indicator"] = _cpu_np(rollout.floor_contact_indicator)
+    if rollout.floor_contact_force is not None:
+        arrays["floor_contact_force"] = _cpu_np(rollout.floor_contact_force)
     np.savez_compressed(path, **arrays)
 
 

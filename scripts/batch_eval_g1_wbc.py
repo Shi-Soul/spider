@@ -70,6 +70,7 @@ def run_eval(
     mpc_joint_sigma: float | None = None,
     mpc_smooth_passes: int | None = None,
     mpc_seed: int | None = None,
+    mpc_reward_weights: Path | None = None,
     mpc_preset: str = "aggressive",
     saved_qpos: Path | None = None,
 ) -> dict | None:
@@ -91,6 +92,8 @@ def run_eval(
         cmd += ["--saved-qpos", str(saved_qpos)]
     elif method != "no_mpc":
         cmd += ["--mpc-preset", mpc_preset]
+        if mpc_reward_weights is not None:
+            cmd += ["--mpc-reward-weights", str(mpc_reward_weights)]
         optional_args = {
             "--mpc-samples": mpc_samples,
             "--mpc-iterations": mpc_iterations,
@@ -202,6 +205,14 @@ def main() -> None:
     parser.add_argument("--mpc-joint-sigma", type=float, default=None)
     parser.add_argument("--mpc-smooth-passes", type=int, default=None)
     parser.add_argument("--mpc-seed", type=int, default=None)
+    parser.add_argument(
+        "--mpc-reward-weights",
+        default=None,
+        help=(
+            "Optional JSON reward weights passed to evaluate.py. Accepts a flat "
+            "mapping or a mapping keyed by method name."
+        ),
+    )
     parser.add_argument("--output", default=None, help="JSON output path.")
     args = parser.parse_args()
 
@@ -238,6 +249,11 @@ def main() -> None:
                     mpc_joint_sigma=args.mpc_joint_sigma,
                     mpc_smooth_passes=args.mpc_smooth_passes,
                     mpc_seed=args.mpc_seed,
+                    mpc_reward_weights=(
+                        Path(args.mpc_reward_weights).expanduser()
+                        if args.mpc_reward_weights is not None
+                        else None
+                    ),
                     mpc_preset=args.mpc_preset,
                 )
                 if payload is None:
@@ -306,6 +322,7 @@ def _compact_mpc_payload(payload: dict | None) -> dict | None:
         "smooth_passes",
         "command_reg_weight",
         "command_smooth_weight",
+        "reward_weight_source",
     )
     return {
         key: payload[key]
