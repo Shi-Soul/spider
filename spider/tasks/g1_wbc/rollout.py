@@ -942,7 +942,9 @@ def command_batch_from_qpos_trajectory(
     qpos_trajectory: torch.Tensor,
     config: WbcRolloutConfig,
     *,
+    qvel_trajectory: torch.Tensor | None = None,
     preserve_template_first: bool = False,
+    kinematics_batch_size: int = 128,
 ) -> G1CommandBatch:
     """Convert batched refined qpos trajectories into WBC command fields."""
 
@@ -958,29 +960,69 @@ def command_batch_from_qpos_trajectory(
         )
 
     num_envs = int(qpos_trajectory.shape[1])
-    qvel_trajectory = qvel_from_qpos_trajectory(qpos_trajectory, dt=POLICY_DT)
-    kin_config = replace(config, num_envs=num_envs, max_steps=None)
+    if qvel_trajectory is None:
+        qvel_trajectory = qvel_from_qpos_trajectory(qpos_trajectory, dt=POLICY_DT)
+    else:
+        qvel_trajectory = qvel_trajectory.to(device, dtype=torch.float32)
+        if qvel_trajectory.ndim == 2:
+            qvel_trajectory = qvel_trajectory[:, None, :]
+        if qvel_trajectory.shape != qpos_trajectory.shape[:-1] + (QVEL_DIM,):
+            raise ValueError(
+                "Expected qvel trajectory shape "
+                f"{qpos_trajectory.shape[:-1] + (QVEL_DIM,)}, got {qvel_trajectory.shape}."
+            )
+
+    flat_count = int(qpos_trajectory.shape[0] * num_envs)
+    kin_batch_size = max(1, min(int(kinematics_batch_size), flat_count))
+    kin_config = replace(
+        config,
+        num_envs=kin_batch_size,
+        max_steps=None,
+        use_cuda_graph=False,
+    )
     env = G1WbcMujocoWarpEnv(kin_config)
 
     body_pos = []
     body_quat = []
     body_lin_vel = []
     body_ang_vel = []
+    qpos_flat = qpos_trajectory.reshape(flat_count, QPOS_DIM)
+    qvel_flat = qvel_trajectory.reshape(flat_count, QVEL_DIM)
     with torch.inference_mode():
-        for frame_idx in range(qpos_trajectory.shape[0]):
-            env.reset(qpos_trajectory[frame_idx], qvel_trajectory[frame_idx])
+        for start in range(0, flat_count, kin_batch_size):
+            end = min(start + kin_batch_size, flat_count)
+            count = end - start
+            qpos_chunk = qpos_flat[start:end]
+            qvel_chunk = qvel_flat[start:end]
+            if count < kin_batch_size:
+                pad_count = kin_batch_size - count
+                qpos_chunk = torch.cat(
+                    [qpos_chunk, qpos_chunk[-1:].expand(pad_count, -1)], dim=0
+                )
+                qvel_chunk = torch.cat(
+                    [qvel_chunk, qvel_chunk[-1:].expand(pad_count, -1)], dim=0
+                )
+            env.reset(qpos_chunk, qvel_chunk)
             state = env.robot_state()
-            body_pos.append(state.body_pos_w.detach().clone())
-            body_quat.append(state.body_quat_w.detach().clone())
-            body_lin_vel.append(state.body_lin_vel_w.detach().clone())
-            body_ang_vel.append(state.body_ang_vel_w.detach().clone())
+            body_pos.append(state.body_pos_w[:count].detach().clone())
+            body_quat.append(state.body_quat_w[:count].detach().clone())
+            body_lin_vel.append(state.body_lin_vel_w[:count].detach().clone())
+            body_ang_vel.append(state.body_ang_vel_w[:count].detach().clone())
 
     joint_pos = qpos_trajectory[..., 7:].contiguous()
     joint_vel = qvel_trajectory[..., 6:].contiguous()
-    body_pos_w = torch.stack(body_pos, dim=0)
-    body_quat_w = torch.stack(body_quat, dim=0)
-    body_lin_vel_w = torch.stack(body_lin_vel, dim=0)
-    body_ang_vel_w = torch.stack(body_ang_vel, dim=0)
+    body_pos_w = torch.cat(body_pos, dim=0).reshape(
+        qpos_trajectory.shape[0], num_envs, -1, 3
+    )
+    body_quat_w = torch.cat(body_quat, dim=0).reshape(
+        qpos_trajectory.shape[0], num_envs, -1, 4
+    )
+    body_lin_vel_w = torch.cat(body_lin_vel, dim=0).reshape(
+        qpos_trajectory.shape[0], num_envs, -1, 3
+    )
+    body_ang_vel_w = torch.cat(body_ang_vel, dim=0).reshape(
+        qpos_trajectory.shape[0], num_envs, -1, 3
+    )
 
     if preserve_template_first:
         frame_count = qpos_trajectory.shape[0]

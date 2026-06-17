@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -22,10 +23,21 @@ from spider.simulators.g1_wbc import (
     load_reward_weights,
     reward_weights_for,
 )
-from spider.tasks.g1_wbc.motion import load_motion, validate_motion_dims
+from spider.tasks.g1_wbc.motion import (
+    G1CommandBatch,
+    G1Motion,
+    load_motion,
+    validate_motion_dims,
+)
 from spider.tasks.g1_wbc.policy import load_wbc_actor, resolve_checkpoint_path
-from spider.tasks.g1_wbc.rollout import RolloutResult, WbcRolloutConfig, run_no_mpc_rollout
-from spider.tasks.g1_wbc.rollout import run_static_qpos_rollout
+from spider.tasks.g1_wbc.rollout import (
+    RolloutResult,
+    WbcRolloutConfig,
+    command_batch_from_qpos_trajectory,
+    run_command_rollout,
+    run_no_mpc_rollout,
+    run_static_qpos_rollout,
+)
 
 
 def main() -> None:
@@ -62,6 +74,32 @@ def main() -> None:
             config,
             max_steps=args.max_steps,
         )
+    elif args.method == "replay_command":
+        assert actor is not None
+        command = _load_saved_command_batch(
+            args.saved_command,
+            motion,
+            config,
+            device=device,
+        )
+        total_steps = command.num_frames - 1
+        if args.max_steps is not None:
+            total_steps = min(total_steps, int(args.max_steps))
+        replay_config = replace(config, num_envs=command.num_envs, max_steps=total_steps)
+        rollout = run_command_rollout(
+            command,
+            actor,
+            replay_config,
+            initial_qpos=motion.qpos()[0],
+            initial_qvel=motion.qvel()[0],
+        )
+        mpc_payload = {
+            "backend": "spider.tasks.g1_wbc.rollout.run_command_rollout",
+            "saved_command": str(Path(args.saved_command).expanduser().resolve()),
+            "replay_mode": "full_sequence",
+            "num_command_frames": command.num_frames,
+            "num_replay_steps": total_steps,
+        }
     elif args.method == "no_mpc":
         assert actor is not None
         rollout = run_no_mpc_rollout(motion, actor, config)
@@ -153,6 +191,7 @@ def _parse_args() -> argparse.Namespace:
             "g1_wbc_ee",
             "g1_wbc_joint",
             "g1_wbc_joint_global",
+            "replay_command",
             "static_qpos",
         ),
         help="Evaluation method to run.",
@@ -208,6 +247,14 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Precomputed qpos trajectory for --method static_qpos. "
             "Accepts .npz keys qpos/refined_qpos/command_qpos_trajectory."
+        ),
+    )
+    parser.add_argument(
+        "--saved-command",
+        default=None,
+        help=(
+            "Precomputed command NPZ for --method replay_command. "
+            "Accepts .npz keys command_qpos_trajectory/refined_qpos/qpos."
         ),
     )
     parser.add_argument(
@@ -393,6 +440,106 @@ def _load_saved_qpos(path: str | None, *, device: str) -> torch.Tensor:
     if qpos.ndim != 2 or qpos.shape[-1] != 36:
         raise ValueError(f"Expected saved qpos shape (T,36) or (T,1,36), got {qpos.shape}.")
     return torch.tensor(qpos, dtype=torch.float32, device=device)
+
+
+def _load_saved_command_batch(
+    path: str | None,
+    template_motion: G1Motion,
+    config: WbcRolloutConfig,
+    *,
+    device: str,
+) -> G1CommandBatch:
+    if path is None:
+        raise ValueError("--method replay_command requires --saved-command.")
+    command_path = Path(path).expanduser().resolve()
+    with np.load(command_path) as data:
+        full_keys = (
+            "command_joint_pos",
+            "command_joint_vel",
+            "command_body_pos_w",
+            "command_body_quat_w",
+            "command_body_lin_vel_w",
+            "command_body_ang_vel_w",
+            "command_qpos_trajectory",
+            "command_qvel_trajectory",
+        )
+        if all(key in data.files for key in full_keys):
+            return G1CommandBatch(
+                path=template_motion.path,
+                motion_type=template_motion.motion_type,
+                fps=template_motion.fps,
+                joint_pos=_saved_command_tensor(data["command_joint_pos"], device=device),
+                joint_vel=_saved_command_tensor(data["command_joint_vel"], device=device),
+                body_pos_w=_saved_command_tensor(
+                    data["command_body_pos_w"], device=device
+                ),
+                body_quat_w=_saved_command_tensor(
+                    data["command_body_quat_w"], device=device
+                ),
+                body_lin_vel_w=_saved_command_tensor(
+                    data["command_body_lin_vel_w"], device=device
+                ),
+                body_ang_vel_w=_saved_command_tensor(
+                    data["command_body_ang_vel_w"], device=device
+                ),
+                qpos_trajectory=_saved_command_tensor(
+                    data["command_qpos_trajectory"], device=device
+                ),
+                qvel_trajectory=_saved_command_tensor(
+                    data["command_qvel_trajectory"], device=device
+                ),
+            )
+
+    qpos_trajectory, qvel_trajectory = _load_saved_command_trajectory(path, device=device)
+    return command_batch_from_qpos_trajectory(
+        template_motion,
+        qpos_trajectory,
+        config,
+        qvel_trajectory=qvel_trajectory,
+        preserve_template_first=False,
+    )
+
+
+def _saved_command_tensor(value: np.ndarray, *, device: str) -> torch.Tensor:
+    tensor = torch.tensor(value, dtype=torch.float32, device=device)
+    if tensor.ndim >= 2:
+        return tensor.contiguous()
+    raise ValueError(f"Expected saved command tensor to have at least 2 dims, got {value.shape}.")
+
+
+def _load_saved_command_trajectory(
+    path: str | None,
+    *,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if path is None:
+        raise ValueError("--method replay_command requires --saved-command.")
+    command_path = Path(path).expanduser().resolve()
+    with np.load(command_path) as data:
+        for key in ("command_qpos_trajectory", "refined_qpos", "qpos"):
+            if key in data.files:
+                qpos = data[key]
+                break
+        else:
+            raise ValueError(
+                f"{command_path} is missing command_qpos_trajectory/refined_qpos/qpos."
+            )
+        qvel = (
+            data["command_qvel_trajectory"]
+            if "command_qvel_trajectory" in data.files
+            else None
+        )
+    if qpos.ndim not in (2, 3) or qpos.shape[-1] != QPOS_DIM:
+        raise ValueError(f"Expected saved command qpos shape (T,36), got {qpos.shape}.")
+    if qvel is not None and (qvel.ndim not in (2, 3) or qvel.shape[-1] != QVEL_DIM):
+        raise ValueError(f"Expected saved command qvel shape (T,35), got {qvel.shape}.")
+    qpos_tensor = torch.tensor(qpos, dtype=torch.float32, device=device)
+    qvel_tensor = (
+        None
+        if qvel is None
+        else torch.tensor(qvel, dtype=torch.float32, device=device)
+    )
+    return qpos_tensor, qvel_tensor
 
 
 def _cpu_np(value: torch.Tensor) -> np.ndarray:

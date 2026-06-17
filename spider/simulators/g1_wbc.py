@@ -227,11 +227,33 @@ class G1WbcSamplingTask:
         execute_steps = int(controls.shape[0])
         base_qpos = _slice_qpos_padded(self.motion.qpos(), sim_step, execute_steps)
         qpos = self.controls_to_qpos(controls[:, None, :], base_qpos)
+        info = self.execute_qpos_command(qpos, sim_step)
+        self._executed_controls.extend(t.detach().clone() for t in controls)
+        return {
+            **info,
+            "executed_controls_rms": torch.stack(
+                [t.square().mean().sqrt() for t in controls]
+            ).mean().detach().cpu().numpy(),
+        }
+
+    def execute_qpos_command(self, qpos: torch.Tensor, sim_step: int) -> dict[str, Any]:
+        """Execute a precomputed qpos command chunk through the MPC rollout path."""
+
+        qpos = qpos.to(self.device, dtype=torch.float32)
+        if qpos.ndim == 3:
+            if qpos.shape[1] != 1:
+                raise ValueError(f"Expected single-env command qpos, got {qpos.shape}.")
+            qpos = qpos[:, 0]
+        if qpos.ndim != 2 or qpos.shape[-1] != QPOS_DIM:
+            raise ValueError(f"Expected command qpos shape (T, {QPOS_DIM}), got {qpos.shape}.")
+
+        execute_steps = int(qpos.shape[0])
         command = command_batch_from_qpos_trajectory(
             self._window_motion(sim_step, execute_steps),
-            qpos,
+            qpos[:, None, :],
             self.rollout_config,
             preserve_template_first=False,
+            kinematics_batch_size=1,
         )
         rollout = run_command_rollout(
             command,
@@ -244,7 +266,6 @@ class G1WbcSamplingTask:
             ref_start=sim_step,
         )
         self._append_rollout(rollout)
-        self._executed_controls.extend(t.detach().clone() for t in controls)
         self.current_qpos = rollout.qpos[-1, 0].detach().clone()
         self.current_qvel = rollout.qvel[-1, 0].detach().clone()
         self.current_last_action = (
@@ -253,11 +274,7 @@ class G1WbcSamplingTask:
             else rollout.final_last_action[0].detach().clone()
         )
         self.current_history_state = rollout.final_history_state
-        return {
-            "executed_controls_rms": torch.stack(
-                [t.square().mean().sqrt() for t in controls]
-            ).mean().detach().cpu().numpy(),
-        }
+        return {}
 
     def controls_to_qpos(
         self,
