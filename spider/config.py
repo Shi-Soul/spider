@@ -17,14 +17,22 @@ import os
 import random
 from dataclasses import dataclass, field, fields
 
-import loguru
 import mujoco
 import numpy as np
 import torch
-from omegaconf import OmegaConf
 
 import spider
 from spider.io import get_processed_data_dir
+
+try:
+    import loguru
+except ModuleNotFoundError:
+    from spider._loguru import loguru
+
+try:
+    from omegaconf import OmegaConf
+except ModuleNotFoundError:
+    OmegaConf = None
 
 
 @dataclass
@@ -62,6 +70,7 @@ class Config:
     render_dt: float = 0.02  # rendering timestep
     horizon: float = 1.6  # planning horizon
     knot_dt: float = 0.4  # knot point spacing
+    num_knot_points: int = 0  # explicit sampled-MPC endpoint knots; 0 uses knot_dt
     max_sim_steps: int = -1  # maximum simulation steps (-1 for unlimited)
     # Simulation constraints
     nconmax_per_env: int = 100  # max contacts per environment
@@ -112,7 +121,9 @@ class Config:
     # === OPTIMIZER CONFIGURATION ===
     # Sampling parameters
     num_samples: int = 2048
+    rollout_batch_size: int = 0  # split sampled rollouts; 0 means one batch
     temperature: float = 0.3
+    control_update_mode: str = "weighted_mean"
     max_num_iterations: int = 16
     improvement_threshold: float = 0.01
     improvement_check_steps: int = 1
@@ -235,6 +246,8 @@ def load_config_yaml(path: str) -> dict:
     """Load a config YAML into a plain dict, resolving OmegaConf types."""
     if not path:
         return {}
+    if OmegaConf is None:
+        raise ModuleNotFoundError("omegaconf is required to load config YAML files.")
     abs_path = os.path.abspath(os.path.expanduser(path))
     if not os.path.isfile(abs_path):
         raise FileNotFoundError(f"Config file not found: {abs_path}")
@@ -345,7 +358,21 @@ def get_noise_scale(config: Config) -> torch.Tensor:
     Returns:
         Noise scale, shape (num_samples, num_knot_points, nu)
     """
-    num_knot_intervals = max(1, int(round(config.horizon / config.knot_dt)))
+    num_samples = int(config.num_samples)
+    if num_samples < 1:
+        raise ValueError(f"num_samples must be positive, got {config.num_samples}.")
+    exploit_ratio = float(config.exploit_ratio)
+    if not 0.0 <= exploit_ratio <= 1.0:
+        raise ValueError(f"exploit_ratio must be in [0, 1], got {config.exploit_ratio}.")
+    num_knot_points = int(config.num_knot_points)
+    if num_knot_points > 0:
+        if num_knot_points < 2:
+            raise ValueError(
+                f"num_knot_points must be at least 2 when set, got {num_knot_points}."
+            )
+        num_knot_intervals = num_knot_points - 1
+    else:
+        num_knot_intervals = max(1, int(round(config.horizon / config.knot_dt)))
     noise_profile = torch.logspace(
         start=torch.log10(torch.tensor(config.first_ctrl_noise_scale)),
         end=torch.log10(torch.tensor(config.last_ctrl_noise_scale)),
@@ -355,7 +382,11 @@ def get_noise_scale(config: Config) -> torch.Tensor:
     )
     noise_scale = noise_profile[None, :, None]  # Shape: (1, num_knot_points, 1)
     noise_scale = noise_scale.repeat(1, 1, config.nu)
-    if config.embodiment_type in ["bimanual", "right", "left"]:
+    if config.embodiment_type == "humanoid":
+        noise_scale[:, :, :3] *= config.pos_noise_scale
+        noise_scale[:, :, 3:6] *= config.rot_noise_scale
+        noise_scale[:, :, 6:] *= config.joint_noise_scale
+    elif config.embodiment_type in ["bimanual", "right", "left"]:
         object_action_dims = max(int(config.object_action_dims), 0)
         robot_nu = max(int(config.nu - object_action_dims), 0)
         noise_scale[:, :, :3] *= config.pos_noise_scale
@@ -376,12 +407,13 @@ def get_noise_scale(config: Config) -> torch.Tensor:
         )
         noise_scale[:, :, object_ids] *= 0.0
     # repeat to match num_samples; same samples used across DR groups
-    noise_scale = noise_scale.repeat(config.num_samples, 1, 1)
+    noise_scale = noise_scale.repeat(num_samples, 1, 1)
     # set first sample to 0
     noise_scale[0] *= 0.0
     # set last few samples to exploit_noise_scale
-    num_exploit_samples = int(config.num_samples * config.exploit_ratio)
-    noise_scale[-num_exploit_samples:] *= config.exploit_noise_scale
+    num_exploit_samples = int(num_samples * exploit_ratio)
+    if num_exploit_samples > 0:
+        noise_scale[-num_exploit_samples:] *= config.exploit_noise_scale
     return noise_scale
 
 
@@ -410,6 +442,94 @@ def compute_noise_schedule(config: Config) -> Config:
     else:
         config.beta_traj = 1.0
     return config
+
+
+def build_sampling_mpc_config(
+    *,
+    robot_type: str,
+    embodiment_type: str,
+    simulator: str,
+    device: str,
+    sim_dt: float,
+    horizon_steps: int,
+    ctrl_steps: int,
+    knot_count: int,
+    num_samples: int,
+    max_num_iterations: int,
+    temperature: float,
+    nq: int,
+    nv: int,
+    nu: int,
+    rollout_batch_size: int = 0,
+    ref_steps: int = 1,
+    first_ctrl_noise_scale: float = 0.5,
+    last_ctrl_noise_scale: float = 1.0,
+    final_noise_scale: float = 0.1,
+    exploit_ratio: float = 0.01,
+    exploit_noise_scale: float = 0.01,
+    pos_noise_scale: float = 0.03,
+    rot_noise_scale: float = 0.03,
+    joint_noise_scale: float = 0.15,
+    terminate_resample: bool = False,
+    use_torch_compile: bool = False,
+    control_update_mode: str = "weighted_mean",
+    seed: int = 0,
+) -> Config:
+    """Build a generic sampled-MPC Config from discrete horizon settings."""
+
+    horizon_steps = int(horizon_steps)
+    ctrl_steps = int(ctrl_steps)
+    knot_count = int(knot_count)
+    if horizon_steps < 1 or ctrl_steps < 1:
+        raise ValueError("horizon_steps and ctrl_steps must be positive.")
+    if knot_count < 2:
+        raise ValueError("knot_count must be at least 2.")
+    if control_update_mode not in {"weighted_mean", "best"}:
+        raise ValueError(
+            "control_update_mode must be one of: weighted_mean, best."
+        )
+
+    config = Config(
+        robot_type=robot_type,
+        embodiment_type=embodiment_type,
+        simulator=simulator,
+        device=device,
+        sim_dt=float(sim_dt),
+        ref_dt=float(sim_dt) * int(ref_steps),
+        render_dt=float(sim_dt),
+        horizon=horizon_steps * float(sim_dt),
+        ctrl_dt=ctrl_steps * float(sim_dt),
+        knot_dt=max(1, int(round(horizon_steps / max(knot_count - 1, 1))))
+        * float(sim_dt),
+        num_knot_points=knot_count,
+        num_samples=int(num_samples),
+        rollout_batch_size=int(rollout_batch_size),
+        max_num_iterations=int(max_num_iterations),
+        temperature=float(temperature),
+        control_update_mode=str(control_update_mode),
+        first_ctrl_noise_scale=float(first_ctrl_noise_scale),
+        last_ctrl_noise_scale=float(last_ctrl_noise_scale),
+        final_noise_scale=float(final_noise_scale),
+        exploit_ratio=float(exploit_ratio),
+        exploit_noise_scale=float(exploit_noise_scale),
+        pos_noise_scale=float(pos_noise_scale),
+        rot_noise_scale=float(rot_noise_scale),
+        joint_noise_scale=float(joint_noise_scale),
+        terminate_resample=bool(terminate_resample),
+        use_torch_compile=bool(use_torch_compile),
+        seed=int(seed),
+        show_viewer=False,
+        save_video=False,
+    )
+    config.horizon_steps = horizon_steps
+    config.ctrl_steps = ctrl_steps
+    config.knot_steps = max(1, int(round(config.knot_dt / float(sim_dt))))
+    config.ref_steps = int(ref_steps)
+    config.nq = int(nq)
+    config.nv = int(nv)
+    config.nu = int(nu)
+    config.env_params_list = [[{}] for _ in range(int(max_num_iterations))]
+    return compute_noise_schedule(config)
 
 
 def process_config(config: Config):

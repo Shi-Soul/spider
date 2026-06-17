@@ -15,7 +15,6 @@ Date: 2025-04-16
 
 from __future__ import annotations
 
-import loguru
 import numpy as np
 import torch
 import warp as wp
@@ -23,10 +22,15 @@ import warp as wp
 from spider.config import Config
 from spider.math import quat_sub
 from spider.optimizers.sampling import (
-    _compute_weights_compiled,
+    _compiled_compute_weights,
     _compute_weights_impl,
     sample_ctrls,
 )
+
+try:
+    import loguru
+except ModuleNotFoundError:
+    from spider._loguru import loguru
 
 _MAX_ATTEMPTS = 4
 
@@ -367,7 +371,7 @@ def make_optimize_once_fn_fast(rollout):  # noqa: D103
         rews = min_rew
 
         if config.use_torch_compile:
-            weights, nan_mask = _compute_weights_compiled(
+            weights, nan_mask = _compiled_compute_weights()(
                 rews, config.num_samples, config.temperature
             )
         else:
@@ -380,11 +384,17 @@ def make_optimize_once_fn_fast(rollout):  # noqa: D103
                 f"NaNs or infs in rews: {nan_mask.sum()}/{config.num_samples}"
             )
 
-        if select_best:
+        control_update_mode = getattr(config, "control_update_mode", "weighted_mean")
+        if select_best or control_update_mode == "best":
             best_idx = torch.argmax(rews).item()
             ctrls_out = ctrls_samples[best_idx]
-        else:
+        elif control_update_mode == "weighted_mean":
             ctrls_out = (weights[:, None, None] * ctrls_samples).sum(dim=0)
+            best_idx = None
+        else:
+            raise ValueError(
+                f"Unsupported control_update_mode: {control_update_mode}"
+            )
 
         # trace downsampling for visualization
         n_uni = max(0, min(config.num_trace_uniform_samples, config.num_samples))
@@ -430,12 +440,14 @@ def make_optimize_once_fn_fast(rollout):  # noqa: D103
         info["rew_min"] = rews_np.min()
         info["rew_median"] = np.median(rews_np)
         info["rew_mean"] = rews_np.mean()
+        info["control_update_mode"] = np.array([control_update_mode])
 
         if "trace" in rollout_info:
             info["trace_sample"] = rollout_info["trace"][sel_idx].cpu().numpy()
             info["trace_cost"] = -rews[sel_idx].cpu().numpy()
 
         if select_best:
+            assert best_idx is not None
             info["recorded_qpos"] = rollout_info["recorded_qpos"][best_idx]
             info["recorded_qvel"] = rollout_info["recorded_qvel"][best_idx]
             info["state_snapshot"] = rollout_info["state_snapshot"]

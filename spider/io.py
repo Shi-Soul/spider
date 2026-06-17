@@ -15,11 +15,15 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
-import loguru
 import numpy as np
 import torch
 
 from spider.interp import interp
+
+try:
+    import loguru
+except ModuleNotFoundError:
+    from spider._loguru import loguru
 
 if TYPE_CHECKING:
     from spider.config import Config

@@ -15,12 +15,18 @@ Date: 2025-08-10
 
 from __future__ import annotations
 
-import loguru
+from dataclasses import replace
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from spider.config import Config
+
+try:
+    import loguru
+except ModuleNotFoundError:
+    from spider._loguru import loguru
 
 
 def _interpolate_knot_samples(
@@ -31,16 +37,18 @@ def _interpolate_knot_samples(
     target_steps = int(target_steps)
     if target_steps < 1:
         raise ValueError(f"target_steps must be positive, got {target_steps}.")
+    if target_steps == 1:
+        return knot_samples[:, :1, :]
     if knot_samples.shape[1] <= 1:
         return knot_samples.repeat(1, target_steps, 1)
 
     dense = F.interpolate(
         knot_samples.permute(0, 2, 1),
-        size=target_steps + 1,
+        size=target_steps,
         mode="linear",
         align_corners=True,
     ).permute(0, 2, 1)
-    return dense[:, :target_steps]
+    return dense
 
 
 def _sample_ctrls_impl(
@@ -57,6 +65,7 @@ def _sample_ctrls_impl(
         Control actions, shape (num_samples, horizon_steps, nu)
     """
     # decode sample_params
+    sample_params = sample_params or {}
     global_noise_scale = sample_params.get("global_noise_scale", 1.0)
     # sample knot with shape (num_samples, num_knots, nu)
     knot_samples = (
@@ -71,11 +80,18 @@ def _sample_ctrls_impl(
     return ctrls_samples
 
 
-# Compiled version (torch.compile requires PyTorch 2.0+)
-if hasattr(torch, "compile"):
-    _sample_ctrls_compiled = torch.compile(_sample_ctrls_impl)
-else:
-    _sample_ctrls_compiled = _sample_ctrls_impl
+_sample_ctrls_compiled = None
+
+
+def _compiled_sample_ctrls():
+    global _sample_ctrls_compiled
+    if _sample_ctrls_compiled is None:
+        _sample_ctrls_compiled = (
+            torch.compile(_sample_ctrls_impl)
+            if hasattr(torch, "compile")
+            else _sample_ctrls_impl
+        )
+    return _sample_ctrls_compiled
 
 
 def sample_ctrls(
@@ -92,7 +108,7 @@ def sample_ctrls(
         Control actions, shape (num_samples, horizon_steps, nu)
     """
     if config.use_torch_compile:
-        return _sample_ctrls_compiled(config, ctrls, sample_params)
+        return _compiled_sample_ctrls()(config, ctrls, sample_params)
     else:
         return _sample_ctrls_impl(config, ctrls, sample_params)
 
@@ -249,18 +265,28 @@ def _compute_weights_impl(
     # Initialize weights as zeros and compute softmax only for top samples
     weights = torch.zeros_like(rews)
     top_rews = rews[top_indices]
-    top_rews_normalized = (top_rews - top_rews.mean()) / (top_rews.std() + 1e-2)
+    top_rews_normalized = (
+        (top_rews - top_rews.mean())
+        / (top_rews.std(unbiased=False) + 1e-2)
+    )
     top_weights = F.softmax(top_rews_normalized / temperature, dim=0)
     weights[top_indices] = top_weights
 
     return weights, nan_mask
 
 
-# Compiled version (torch.compile requires PyTorch 2.0+)
-if hasattr(torch, "compile"):
-    _compute_weights_compiled = torch.compile(_compute_weights_impl)
-else:
-    _compute_weights_compiled = _compute_weights_impl
+_compute_weights_compiled = None
+
+
+def _compiled_compute_weights():
+    global _compute_weights_compiled
+    if _compute_weights_compiled is None:
+        _compute_weights_compiled = (
+            torch.compile(_compute_weights_impl)
+            if hasattr(torch, "compile")
+            else _compute_weights_impl
+        )
+    return _compute_weights_compiled
 
 
 def make_optimize_once_fn(
@@ -295,12 +321,13 @@ def make_optimize_once_fn(
         # domain randomization: pick the minimum reward across all DR parameter sets
         min_rew = torch.full((config.num_samples,), float("inf"), device=config.device)
         for env_param in env_params:
-            ctrls_samples, rews, terminate, rollout_info = rollout(
+            ctrls_samples, rews, terminate, rollout_info = _rollout_samples(
                 config,
                 env,
                 ctrls_samples,
                 ref_slice,
                 env_param,
+                rollout,
             )
             min_rew = torch.minimum(min_rew, rews)
         # Use worst-case rewards across DR parameter sets
@@ -310,7 +337,7 @@ def make_optimize_once_fn(
 
         # Compute weights using compiled or non-compiled version
         if config.use_torch_compile:
-            weights, nan_mask = _compute_weights_compiled(
+            weights, nan_mask = _compiled_compute_weights()(
                 rews, config.num_samples, config.temperature
             )
         else:
@@ -323,7 +350,15 @@ def make_optimize_once_fn(
                 f"NaNs or infs in rews: {nan_mask.sum()}/{config.num_samples}"
             )
 
-        ctrls_mean = (weights[:, None, None] * ctrls_samples).sum(dim=0)
+        control_update_mode = getattr(config, "control_update_mode", "weighted_mean")
+        if control_update_mode == "best":
+            ctrls_mean = ctrls_samples[torch.argmax(rews).item()]
+        elif control_update_mode == "weighted_mean":
+            ctrls_mean = (weights[:, None, None] * ctrls_samples).sum(dim=0)
+        else:
+            raise ValueError(
+                f"Unsupported control_update_mode: {control_update_mode}"
+            )
 
         # down sample traces by selecting topk and uniform samples for visualization
         n_uni = max(0, min(config.num_trace_uniform_samples, config.num_samples))
@@ -369,6 +404,7 @@ def make_optimize_once_fn(
         info["rew_min"] = rews_np.min()
         info["rew_median"] = np.median(rews_np)
         info["rew_mean"] = rews_np.mean()
+        info["control_update_mode"] = np.array([control_update_mode])
 
         # Downsample and store trace site positions for selected sample trajectories
         if "trace" in rollout_info:
@@ -380,6 +416,72 @@ def make_optimize_once_fn(
         return ctrls_mean, terminate, info
 
     return optimize_once
+
+
+def _rollout_samples(
+    config: Config,
+    env,
+    ctrls_samples: torch.Tensor,
+    ref_slice: tuple[torch.Tensor, ...],
+    env_param: dict,
+    rollout,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    batch_size = int(getattr(config, "rollout_batch_size", 0))
+    num_samples = int(ctrls_samples.shape[0])
+    if batch_size <= 0 or batch_size >= num_samples:
+        return rollout(config, env, ctrls_samples, ref_slice, env_param)
+
+    ctrl_chunks = []
+    rew_chunks = []
+    terminate_chunks = []
+    info_chunks = []
+    for start in range(0, num_samples, batch_size):
+        end = min(start + batch_size, num_samples)
+        chunk_config = replace(config, num_samples=end - start)
+        chunk_ctrls, chunk_rews, chunk_terminate, chunk_info = rollout(
+            chunk_config,
+            env,
+            ctrls_samples[start:end],
+            ref_slice,
+            env_param,
+        )
+        ctrl_chunks.append(chunk_ctrls)
+        rew_chunks.append(chunk_rews)
+        terminate_chunks.append(chunk_terminate)
+        info_chunks.append(chunk_info)
+
+    return (
+        torch.cat(ctrl_chunks, dim=0),
+        torch.cat(rew_chunks, dim=0),
+        torch.cat(terminate_chunks, dim=0),
+        _concat_rollout_info(info_chunks),
+    )
+
+
+def _concat_rollout_info(info_chunks: list[dict]) -> dict:
+    if not info_chunks:
+        return {}
+    info = {}
+    for key in info_chunks[0].keys():
+        values = [chunk[key] for chunk in info_chunks if key in chunk]
+        if not values:
+            continue
+        first = values[0]
+        if isinstance(first, torch.Tensor):
+            info[key] = (
+                torch.cat(values, dim=0)
+                if first.ndim > 0
+                else torch.stack(values, dim=0)
+            )
+        elif isinstance(first, np.ndarray):
+            info[key] = (
+                np.concatenate(values, axis=0)
+                if first.ndim > 0
+                else np.stack(values, axis=0)
+            )
+        else:
+            info[key] = values[0]
+    return info
 
 
 def make_optimize_fn(
