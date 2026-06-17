@@ -155,14 +155,7 @@ The controlled benchmark setting used for the old-vs-Spider comparison is:
 - checkpoint: `bc`
 - max steps: `800`
 
-The current completed comparison has 7 of 9 rows finished. The two pending rows are:
-
-- `qixing/g1_wbc_joint`
-- `qixing/g1_wbc_ee`
-
-They are pending because no legal GPU was available at the time of writing. A local supervisor was left running to resume them once GPU 0 becomes free.
-
-## Partial Quantitative Result
+## Quantitative Result
 
 Completed score rows:
 
@@ -175,17 +168,41 @@ Completed score rows:
 | jump | `g1_wbc_joint` | -6.402408 | -6.375596 | +0.026812 |
 | jump | `g1_wbc_ee` | -2.196199 | -2.094176 | +0.102023 |
 | qixing | `g1_wbc_joint_global` | -1.513477 | -1.372239 | +0.141238 |
+| qixing | `g1_wbc_joint` | -1.716258 | -1.532574 | +0.183684 |
+| qixing | `g1_wbc_ee` | -1.528400 | -1.403355 | +0.125045 |
 
-Summary for completed rows:
+Summary:
 
-- 6 of 7 completed score rows improved.
-- 1 of 7 completed score rows regressed slightly.
-- Completed score sum improved by `+1.222236`.
-- Across completed quality metrics, 103 improved, 22 regressed, and 22 were unchanged.
+- 8 of 9 score rows improved.
+- 1 of 9 score rows regressed slightly: `walk/g1_wbc_ee`, by `-0.011698`.
+- Aggregate score improved from `-19.365301` to `-17.834335`, delta `+1.530966`.
+- Missing candidate quality metrics: `0`.
+- Worse quality metrics: `24` across all rows.
+
+Runtime summary:
+
+| motion | method | old min | Spider min | speedup |
+|---|---:|---:|---:|---:|
+| walk | `g1_wbc_joint_global` | 27.70 | 23.33 | 1.187 |
+| walk | `g1_wbc_joint` | 38.50 | 29.75 | 1.294 |
+| walk | `g1_wbc_ee` | 26.93 | 31.13 | 0.865 |
+| jump | `g1_wbc_joint_global` | 27.73 | 29.18 | 0.950 |
+| jump | `g1_wbc_joint` | 41.30 | 29.13 | 1.418 |
+| jump | `g1_wbc_ee` | 26.87 | 30.68 | 0.876 |
+| qixing | `g1_wbc_joint_global` | 28.00 | 22.82 | 1.227 |
+| qixing | `g1_wbc_joint` | 40.18 | 22.63 | 1.775 |
+| qixing | `g1_wbc_ee` | 26.62 | 25.30 | 1.052 |
+
+Full tables:
+
+- `/home/bai/MPC-RL/spider_retarget_work_20260611/eval_reward_method_spider_native_current_knotfix_v14_20260617_local4090/spider_native_3method_vs_v14_score_summary.csv`
+- `/home/bai/MPC-RL/spider_retarget_work_20260611/eval_reward_method_spider_native_current_knotfix_v14_20260617_local4090/spider_native_3method_vs_v14_full_delta.csv`
+- `/home/bai/MPC-RL/spider_retarget_work_20260611/eval_reward_method_spider_native_current_knotfix_v14_20260617_local4090/spider_native_3method_vs_v14_speed.csv`
+- `/home/bai/MPC-RL/spider_retarget_work_20260611/eval_reward_method_spider_native_current_knotfix_v14_20260617_local4090/spider_native_3method_vs_v14_summary.md`
 
 ## Videos
 
-Old-vs-Spider videos were rendered from saved rollouts, without rerunning MPC. The available videos cover the same 7 completed rows and use the same reference ghost, camera, and setting.
+Old-vs-Spider videos were rendered from saved rollouts, without rerunning MPC. The available videos cover all 9 rows and use the same reference ghost, camera, and setting.
 
 Output directory in the local workspace:
 
