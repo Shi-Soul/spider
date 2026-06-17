@@ -5,17 +5,22 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 
+from spider.config import Config, build_sampling_mpc_config
+from spider.optimizers.receding import (
+    run_sampling_receding_mpc,
+    sampling_mpc_metadata,
+)
+from spider.tasks.g1_wbc.constants import POLICY_DT, QPOS_DIM, QVEL_DIM
 from spider.tasks.g1_wbc.metrics import compute_rollout_metrics
-from spider.tasks.g1_wbc.mpc import (
-    REWARD_WEIGHT_PRESETS,
-    G1WbcMpcConfig,
+from spider.simulators.g1_wbc import (
+    G1WbcSamplingTask,
     load_reward_weights,
-    mpc_config_from_preset,
-    optimize_mpc_command,
+    reward_weights_for,
 )
 from spider.tasks.g1_wbc.motion import load_motion, validate_motion_dims
 from spider.tasks.g1_wbc.policy import load_wbc_actor, resolve_checkpoint_path
@@ -61,52 +66,42 @@ def main() -> None:
         assert actor is not None
         rollout = run_no_mpc_rollout(motion, actor, config)
     else:
-        mpc_config = _build_mpc_config(args)
-        mpc_result = optimize_mpc_command(motion, actor, config, mpc_config)
+        assert actor is not None
+        spider_config = _build_sampling_config(args)
+        reward_weights = _load_method_reward_weights(args)
+        task = G1WbcSamplingTask(
+            motion,
+            actor,
+            config,
+            mode=args.method,
+            reward_weights=reward_weights,
+        )
+        total_steps = motion.num_frames - 1
+        if args.max_steps is not None:
+            total_steps = min(total_steps, int(args.max_steps))
+        receding_result = run_sampling_receding_mpc(
+            spider_config,
+            task,
+            total_steps=total_steps,
+        )
+        mpc_result = task.build_result(
+            receding_result.controls,
+            receding_result.infos,
+            total_steps=total_steps,
+        )
         rollout = mpc_result.rollout
         mpc_payload = {
-            "preset": args.mpc_preset,
-            "num_samples": mpc_config.num_samples,
-            "num_iterations": mpc_config.num_iterations,
-            "planning_horizon_steps": mpc_config.planning_horizon_steps,
-            "control_steps": mpc_config.control_steps,
-            "sampling_mode": mpc_config.sampling_mode,
-            "knot_count": mpc_config.knot_count,
-            "elite_frac": mpc_config.elite_frac,
-            "temperature": mpc_config.temperature,
-            "root_pos_sigma": mpc_config.root_pos_sigma,
-            "root_rot_sigma": mpc_config.root_rot_sigma,
-            "joint_sigma": mpc_config.joint_sigma,
-            "min_root_pos_sigma": mpc_config.min_root_pos_sigma,
-            "min_root_rot_sigma": mpc_config.min_root_rot_sigma,
-            "min_joint_sigma": mpc_config.min_joint_sigma,
-            "sigma_decay": mpc_config.sigma_decay,
-            "smooth_passes": mpc_config.smooth_passes,
-            "command_reg_weight": mpc_config.command_reg_weight,
-            "command_smooth_weight": mpc_config.command_smooth_weight,
+            **sampling_mpc_metadata(spider_config),
             "reward_weight_source": (
                 str(Path(args.mpc_reward_weights).expanduser().resolve())
                 if args.mpc_reward_weights is not None
                 else "default"
             ),
-            "reward_weights": _effective_reward_weights(mpc_config),
-            "acceptance_gate": mpc_config.acceptance_gate,
-            "guided_candidate": mpc_config.use_guided_candidate,
-            "guided_root_pos_gain": mpc_config.guided_root_pos_gain,
-            "guided_root_rot_gain": mpc_config.guided_root_rot_gain,
-            "guided_joint_gain": mpc_config.guided_joint_gain,
-            "guided_root_pos_clip": mpc_config.guided_root_pos_clip,
-            "guided_root_rot_clip": mpc_config.guided_root_rot_clip,
-            "guided_joint_clip": mpc_config.guided_joint_clip,
-            "history": [vars(item) for item in mpc_result.history],
+            "reward_weights": _effective_reward_weights(args.method, reward_weights),
+            "history": _jsonable_infos(receding_result.infos),
             "final_scores_mean": _safe_tensor_stat(mpc_result.scores, "mean"),
             "final_scores_max": _safe_tensor_stat(mpc_result.scores, "max"),
-            "accepted": mpc_result.accepted,
-            "used_baseline_fallback": mpc_result.used_baseline_fallback,
             "num_windows": mpc_result.num_windows,
-            "accepted_windows": mpc_result.accepted_windows,
-            "final_candidate_score": mpc_result.final_candidate_score,
-            "final_baseline_score": mpc_result.final_baseline_score,
         }
     metrics = compute_rollout_metrics(motion, rollout)
 
@@ -220,40 +215,31 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Save rollout tensors to rollout.npz when output-dir is set.",
     )
-    parser.add_argument(
-        "--mpc-preset",
-        default="aggressive",
-        choices=("aggressive", "conservative", "explore", "rootrot", "wide"),
-        help="Tuned MPC parameter preset. Explicit MPC flags override this.",
-    )
     parser.add_argument("--mpc-samples", type=int, default=None)
+    parser.add_argument("--mpc-rollout-batch-size", type=int, default=0)
     parser.add_argument("--mpc-iterations", type=int, default=None)
     parser.add_argument("--mpc-planning-horizon-steps", type=int, default=None)
     parser.add_argument("--mpc-control-steps", type=int, default=None)
-    parser.add_argument(
-        "--mpc-sampling-mode",
-        choices=("full", "knot"),
-        default=None,
-        help="Sample full per-step deltas or knot deltas interpolated to the horizon.",
-    )
     parser.add_argument("--mpc-knot-count", type=int, default=None)
-    parser.add_argument("--mpc-elite-frac", type=float, default=None)
     parser.add_argument("--mpc-temperature", type=float, default=None)
+    parser.add_argument(
+        "--mpc-control-update-mode",
+        choices=("weighted_mean", "best"),
+        default="weighted_mean",
+        help="Generic sampled-MPC control update rule.",
+    )
+    parser.add_argument("--mpc-first-ctrl-noise-scale", type=float, default=None)
+    parser.add_argument("--mpc-last-ctrl-noise-scale", type=float, default=None)
+    parser.add_argument("--mpc-final-noise-scale", type=float, default=None)
+    parser.add_argument(
+        "--mpc-torch-compile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use torch.compile in SPIDER's generic sampling optimizer.",
+    )
     parser.add_argument("--mpc-root-pos-sigma", type=float, default=None)
     parser.add_argument("--mpc-root-rot-sigma", type=float, default=None)
     parser.add_argument("--mpc-joint-sigma", type=float, default=None)
-    parser.add_argument("--mpc-sigma-decay", type=float, default=None)
-    parser.add_argument("--mpc-smooth-passes", type=int, default=None)
-    parser.add_argument(
-        "--mpc-command-reg-weight",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--mpc-command-smooth-weight",
-        type=float,
-        default=None,
-    )
     parser.add_argument(
         "--mpc-reward-weights",
         default=None,
@@ -262,93 +248,95 @@ def _parse_args() -> argparse.Namespace:
             "keyed by method name."
         ),
     )
-    parser.add_argument(
-        "--mpc-guided-candidate",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Include a no-MPC-error feedback candidate in the MPC sample batch.",
-    )
-    parser.add_argument(
-        "--mpc-acceptance-gate",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Fall back to the unmodified reference command when final MPC score is worse.",
-    )
-    parser.add_argument(
-        "--mpc-guided-root-pos-gain",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--mpc-guided-root-rot-gain",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--mpc-guided-joint-gain",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--mpc-guided-root-pos-clip",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--mpc-guided-root-rot-clip",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--mpc-guided-joint-clip",
-        type=float,
-        default=None,
-    )
-    parser.add_argument("--seed", type=int, default=G1WbcMpcConfig.seed)
+    parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
 
-def _build_mpc_config(args: argparse.Namespace) -> G1WbcMpcConfig:
-    config = mpc_config_from_preset(args.method, args.mpc_preset)
-    overrides = {
-        "num_samples": args.mpc_samples,
-        "num_iterations": args.mpc_iterations,
-        "planning_horizon_steps": args.mpc_planning_horizon_steps,
-        "control_steps": args.mpc_control_steps,
-        "sampling_mode": args.mpc_sampling_mode,
-        "knot_count": args.mpc_knot_count,
-        "elite_frac": args.mpc_elite_frac,
-        "temperature": args.mpc_temperature,
-        "root_pos_sigma": args.mpc_root_pos_sigma,
-        "root_rot_sigma": args.mpc_root_rot_sigma,
-        "joint_sigma": args.mpc_joint_sigma,
-        "sigma_decay": args.mpc_sigma_decay,
-        "smooth_passes": args.mpc_smooth_passes,
-        "command_reg_weight": args.mpc_command_reg_weight,
-        "command_smooth_weight": args.mpc_command_smooth_weight,
-        "acceptance_gate": args.mpc_acceptance_gate,
-        "use_guided_candidate": args.mpc_guided_candidate,
-        "guided_root_pos_gain": args.mpc_guided_root_pos_gain,
-        "guided_root_rot_gain": args.mpc_guided_root_rot_gain,
-        "guided_joint_gain": args.mpc_guided_joint_gain,
-        "guided_root_pos_clip": args.mpc_guided_root_pos_clip,
-        "guided_root_rot_clip": args.mpc_guided_root_rot_clip,
-        "guided_joint_clip": args.mpc_guided_joint_clip,
-        "seed": args.seed,
-    }
-    for name, value in overrides.items():
-        if value is not None:
-            setattr(config, name, value)
-    if args.mpc_reward_weights is not None:
-        config.reward_weights = load_reward_weights(args.mpc_reward_weights, args.method)
-    return config
+def _build_sampling_config(args: argparse.Namespace) -> Config:
+    if args.mpc_samples is None:
+        raise ValueError("--mpc-samples is required.")
+    if args.mpc_iterations is None:
+        raise ValueError("--mpc-iterations is required.")
+    if args.mpc_planning_horizon_steps is None:
+        raise ValueError("--mpc-planning-horizon-steps is required.")
+    if args.mpc_control_steps is None:
+        raise ValueError("--mpc-control-steps is required.")
+    if args.mpc_knot_count is None:
+        raise ValueError("--mpc-knot-count is required.")
+    if args.mpc_temperature is None:
+        raise ValueError("--mpc-temperature is required.")
+    if args.mpc_root_pos_sigma is None:
+        raise ValueError("--mpc-root-pos-sigma is required.")
+    if args.mpc_root_rot_sigma is None:
+        raise ValueError("--mpc-root-rot-sigma is required.")
+    if args.mpc_joint_sigma is None:
+        raise ValueError("--mpc-joint-sigma is required.")
+    if args.mpc_final_noise_scale is None:
+        final_noise_scale = 0.1
+    else:
+        final_noise_scale = float(args.mpc_final_noise_scale)
+    first_ctrl_noise_scale = (
+        0.5 if args.mpc_first_ctrl_noise_scale is None else float(args.mpc_first_ctrl_noise_scale)
+    )
+    last_ctrl_noise_scale = (
+        1.0 if args.mpc_last_ctrl_noise_scale is None else float(args.mpc_last_ctrl_noise_scale)
+    )
+    return build_sampling_mpc_config(
+        robot_type="g1",
+        embodiment_type="humanoid",
+        simulator="g1_wbc",
+        device=args.device,
+        num_samples=int(args.mpc_samples),
+        rollout_batch_size=int(args.mpc_rollout_batch_size),
+        max_num_iterations=int(args.mpc_iterations),
+        horizon_steps=int(args.mpc_planning_horizon_steps),
+        ctrl_steps=int(args.mpc_control_steps),
+        knot_count=int(args.mpc_knot_count),
+        temperature=float(args.mpc_temperature),
+        control_update_mode=args.mpc_control_update_mode,
+        sim_dt=POLICY_DT,
+        nq=QPOS_DIM,
+        nv=QVEL_DIM,
+        nu=QPOS_DIM - 1,
+        pos_noise_scale=float(args.mpc_root_pos_sigma),
+        rot_noise_scale=float(args.mpc_root_rot_sigma),
+        joint_noise_scale=float(args.mpc_joint_sigma),
+        first_ctrl_noise_scale=first_ctrl_noise_scale,
+        last_ctrl_noise_scale=last_ctrl_noise_scale,
+        final_noise_scale=final_noise_scale,
+        use_torch_compile=bool(args.mpc_torch_compile),
+        seed=int(args.seed),
+    )
 
 
-def _effective_reward_weights(config: G1WbcMpcConfig) -> dict[str, float]:
-    weights = config.reward_weights
-    if weights is None:
-        weights = REWARD_WEIGHT_PRESETS[config.mode]
-    return {key: float(value) for key, value in weights.items()}
+def _load_method_reward_weights(args: argparse.Namespace) -> dict[str, float] | None:
+    if args.mpc_reward_weights is None:
+        return None
+    return load_reward_weights(args.mpc_reward_weights, args.method)
+
+
+def _effective_reward_weights(method: str, weights: dict[str, float] | None) -> dict[str, float]:
+    return {key: float(value) for key, value in reward_weights_for(method, weights).items()}
+
+
+def _jsonable_infos(infos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for info in infos:
+        row: dict[str, Any] = {}
+        for key, value in info.items():
+            if isinstance(value, torch.Tensor):
+                if value.ndim == 0:
+                    row[key] = float(value.detach().cpu().item())
+                else:
+                    row[key] = value.detach().cpu().numpy().tolist()
+            elif isinstance(value, np.ndarray):
+                row[key] = value.tolist()
+            elif isinstance(value, (int, float, bool, str)):
+                row[key] = value
+            else:
+                row[key] = str(value)
+        out.append(row)
+    return out
 
 
 def _save_rollout(path: Path, rollout: RolloutResult) -> None:
