@@ -15,6 +15,7 @@ Date: 2025-04-16
 
 from __future__ import annotations
 
+import loguru
 import numpy as np
 import torch
 import warp as wp
@@ -26,11 +27,6 @@ from spider.optimizers.sampling import (
     _compute_weights_impl,
     sample_ctrls,
 )
-
-try:
-    import loguru
-except ModuleNotFoundError:
-    from spider._loguru import loguru
 
 _MAX_ATTEMPTS = 4
 

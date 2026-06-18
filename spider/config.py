@@ -17,22 +17,14 @@ import os
 import random
 from dataclasses import dataclass, field, fields
 
+import loguru
 import mujoco
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 import spider
 from spider.io import get_processed_data_dir
-
-try:
-    import loguru
-except ModuleNotFoundError:
-    from spider._loguru import loguru
-
-try:
-    from omegaconf import OmegaConf
-except ModuleNotFoundError:
-    OmegaConf = None
 
 
 @dataclass
@@ -243,8 +235,6 @@ def load_config_yaml(path: str) -> dict:
     """Load a config YAML into a plain dict, resolving OmegaConf types."""
     if not path:
         return {}
-    if OmegaConf is None:
-        raise ModuleNotFoundError("omegaconf is required to load config YAML files.")
     abs_path = os.path.abspath(os.path.expanduser(path))
     if not os.path.isfile(abs_path):
         raise FileNotFoundError(f"Config file not found: {abs_path}")

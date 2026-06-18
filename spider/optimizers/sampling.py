@@ -17,17 +17,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import loguru
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from spider.config import Config
 from spider.interp import interp
-
-try:
-    import loguru
-except ModuleNotFoundError:
-    from spider._loguru import loguru
 
 
 def _interpolate_knot_samples(
