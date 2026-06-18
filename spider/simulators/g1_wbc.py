@@ -165,7 +165,9 @@ class G1WbcBackend:
         self._append_current_state(action, ctrl, ref_idx + self.ref_start)
 
     def save_state(self) -> G1WbcBackendState:
-        self.sim.save_state()
+        if self.last_robot_state is None:
+            self.last_robot_state = self.sim.robot_state()
+            self.last_floor_contact, self.last_floor_force = self.sim.floor_contact()
         return G1WbcBackendState(
             last_action=self.last_action.detach().clone(),
             history_state=(
@@ -184,7 +186,11 @@ class G1WbcBackend:
         )
 
     def load_state(self, state: G1WbcBackendState) -> "G1WbcBackend":
-        self.sim.load_state()
+        if state.last_robot_state is not None:
+            self.sim.reset(
+                state.last_robot_state.qpos,
+                state.last_robot_state.qvel,
+            )
         self.command = state.command
         self.task_context = _clone_task_context(state.task_context)
         if self.command is not None:
