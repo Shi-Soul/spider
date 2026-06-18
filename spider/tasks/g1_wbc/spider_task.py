@@ -10,7 +10,7 @@ from typing import Any, Literal
 import mujoco
 import torch
 
-from spider.config import Config, build_sampling_mpc_config
+from spider.config import Config
 from spider.optimizers.receding import (
     RecedingHorizonResult,
     run_receding_horizon,
@@ -179,23 +179,31 @@ def build_g1_wbc_sampling_config(
 ) -> Config:
     """Build the SPIDER sampling config for the G1 WBC task adapter."""
 
-    return build_sampling_mpc_config(
+    horizon_steps = int(horizon_steps)
+    ctrl_steps = int(ctrl_steps)
+    knot_count = int(knot_count)
+    if horizon_steps < 1 or ctrl_steps < 1:
+        raise ValueError("horizon_steps and ctrl_steps must be positive.")
+    if knot_count < 2:
+        raise ValueError("knot_count must be at least 2.")
+    if control_update_mode not in {"weighted_mean", "best"}:
+        raise ValueError("control_update_mode must be one of: weighted_mean, best.")
+
+    config = Config(
         robot_type="g1",
         embodiment_type="humanoid",
         simulator="g1_wbc",
         device=device,
-        num_samples=int(num_samples),
-        rollout_batch_size=int(rollout_batch_size),
-        max_num_iterations=int(max_num_iterations),
-        horizon_steps=int(horizon_steps),
-        ctrl_steps=int(ctrl_steps),
-        knot_count=int(knot_count),
-        temperature=float(temperature),
-        control_update_mode=control_update_mode,
         sim_dt=POLICY_DT,
-        nq=QPOS_DIM,
-        nv=QVEL_DIM,
-        nu=QPOS_DIM - 1,
+        ref_dt=POLICY_DT,
+        render_dt=POLICY_DT,
+        horizon=horizon_steps * POLICY_DT,
+        ctrl_dt=ctrl_steps * POLICY_DT,
+        knot_dt=max(1, int(round(horizon_steps / max(knot_count - 1, 1))))
+        * POLICY_DT,
+        num_samples=int(num_samples),
+        max_num_iterations=int(max_num_iterations),
+        temperature=float(temperature),
         pos_noise_scale=float(pos_noise_scale),
         rot_noise_scale=float(rot_noise_scale),
         joint_noise_scale=float(joint_noise_scale),
@@ -204,7 +212,46 @@ def build_g1_wbc_sampling_config(
         final_noise_scale=float(final_noise_scale),
         use_torch_compile=bool(use_torch_compile),
         seed=int(seed),
+        show_viewer=False,
+        save_video=False,
     )
+    config.horizon_steps = horizon_steps
+    config.ctrl_steps = ctrl_steps
+    config.knot_steps = max(1, int(round(config.knot_dt / POLICY_DT)))
+    config.ref_steps = 1
+    config.nq = QPOS_DIM
+    config.nv = QVEL_DIM
+    config.nu = QPOS_DIM - 1
+    config.env_params_list = [[{}] for _ in range(int(max_num_iterations))]
+    config.num_knot_points = knot_count
+    config.rollout_batch_size = int(rollout_batch_size)
+    config.control_update_mode = str(control_update_mode)
+    config.noise_scale = _g1_wbc_noise_scale(config, knot_count)
+    config.beta_traj = (
+        config.final_noise_scale ** (1 / config.max_num_iterations)
+        if config.max_num_iterations > 0
+        else 1.0
+    )
+    return config
+
+
+def _g1_wbc_noise_scale(config: Config, knot_count: int) -> torch.Tensor:
+    noise_profile = torch.logspace(
+        start=torch.log10(torch.tensor(config.first_ctrl_noise_scale)),
+        end=torch.log10(torch.tensor(config.last_ctrl_noise_scale)),
+        steps=int(knot_count),
+        device=config.device,
+        base=10,
+    )
+    noise_scale = noise_profile[None, :, None].repeat(1, 1, config.nu)
+    noise_scale[:, :, :3] *= config.pos_noise_scale
+    noise_scale[:, :, 3:6] *= config.rot_noise_scale
+    noise_scale[:, :, 6:] *= config.joint_noise_scale
+    noise_scale = noise_scale.repeat(config.num_samples, 1, 1)
+    noise_scale[0] *= 0.0
+    num_exploit_samples = int(config.num_samples * config.exploit_ratio)
+    noise_scale[-num_exploit_samples:] *= config.exploit_noise_scale
+    return noise_scale
 
 
 def run_g1_wbc_sampling_mpc(

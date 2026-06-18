@@ -2,32 +2,33 @@ from __future__ import annotations
 
 import torch
 
-from spider.config import build_sampling_mpc_config
+from spider.config import Config, compute_noise_schedule
 from spider.interp import interp
 from spider.optimizers.sampling import _interpolate_knot_samples, _sample_ctrls_impl
 
 
-def test_build_sampling_mpc_config_uses_explicit_endpoint_knot_count() -> None:
-    config = build_sampling_mpc_config(
+def test_sample_ctrls_explicit_endpoint_path_matches_endpoint_interpolation() -> None:
+    config = Config(
         robot_type="g1",
         embodiment_type="humanoid",
         simulator="dummy",
         device="cpu",
-        sim_dt=0.02,
-        horizon_steps=160,
-        ctrl_steps=40,
-        knot_count=4,
-        num_samples=8,
-        max_num_iterations=2,
-        temperature=0.7,
-        nq=35,
-        nv=34,
-        nu=34,
+        num_samples=2,
+    )
+    config.nu = 1
+    config.num_knot_points = 4
+    config.noise_scale = torch.ones(2, 4, 1)
+    ctrls = torch.zeros(10, 1)
+
+    torch.manual_seed(123)
+    actual = _sample_ctrls_impl(config, ctrls)
+    torch.manual_seed(123)
+    expected = ctrls + _interpolate_knot_samples(
+        torch.randn_like(config.noise_scale) * config.noise_scale,
+        ctrls.shape[0],
     )
 
-    assert config.horizon_steps == 160
-    assert config.ctrl_steps == 40
-    assert config.noise_scale.shape == (8, 4, 34)
+    assert torch.allclose(actual, expected)
 
 
 def test_interpolate_knot_samples_expands_endpoint_knots_to_dense_horizon() -> None:
@@ -42,24 +43,29 @@ def test_interpolate_knot_samples_expands_endpoint_knots_to_dense_horizon() -> N
 
 
 def test_sample_ctrls_legacy_path_matches_old_interp_behavior() -> None:
-    config = build_sampling_mpc_config(
+    config = Config(
         robot_type="g1",
         embodiment_type="bimanual",
         simulator="dummy",
         device="cpu",
         sim_dt=0.02,
-        horizon_steps=12,
-        ctrl_steps=4,
-        knot_count=4,
+        ref_dt=0.02,
+        render_dt=0.02,
+        horizon=0.24,
+        ctrl_dt=0.08,
+        knot_dt=0.06,
         num_samples=2,
         max_num_iterations=2,
         temperature=0.7,
-        nq=35,
-        nv=34,
-        nu=6,
     )
-    config.num_knot_points = 0
+    config.horizon_steps = 12
+    config.ctrl_steps = 4
     config.knot_steps = 3
+    config.ref_steps = 1
+    config.nq = 35
+    config.nv = 34
+    config.nu = 6
+    config = compute_noise_schedule(config)
     ctrls = torch.zeros(12, 6)
 
     torch.manual_seed(123)
