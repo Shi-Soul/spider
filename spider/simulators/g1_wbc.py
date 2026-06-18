@@ -1,380 +1,311 @@
-"""G1 WBC task adapter for SPIDER's generic sampling optimizer."""
+"""G1 WBC simulator backend for SPIDER's generic sampling optimizer."""
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Literal
+from dataclasses import replace
+from typing import Any
 
 import torch
-import mujoco
 
 from spider.config import Config
-from spider.tasks.g1_wbc.constants import MUJOCO_JOINT_NAMES, POLICY_DT, QPOS_DIM, QVEL_DIM
-from spider.tasks.g1_wbc.math_utils import (
-    normalize,
-    quat_from_axis_angle,
-    quat_mul,
+from spider.tasks.g1_wbc.constants import (
+    ACTION_DIM,
 )
-from spider.tasks.g1_wbc.metrics import compute_rollout_metrics, compute_rollout_scores
+from spider.tasks.g1_wbc.metrics import compute_rollout_scores
 from spider.tasks.g1_wbc.motion import G1CommandBatch, G1Motion
+from spider.tasks.g1_wbc.obs import G1WbcObservationBuilder, RobotState
 from spider.tasks.g1_wbc.policy import WbcActor
 from spider.tasks.g1_wbc.rollout import (
+    G1WbcMujocoWarpEnv,
     RolloutResult,
     WbcRolloutConfig,
-    command_batch_from_qpos_trajectory,
-    load_wbc_model,
-    run_command_rollout,
 )
-
-G1WbcObjective = Literal["g1_wbc_ee", "g1_wbc_joint", "g1_wbc_joint_global"]
-
-REWARD_WEIGHT_PRESETS: dict[G1WbcObjective, dict[str, float]] = {
-    "g1_wbc_joint_global": {
-        "bad_floor_contact": 45.0,
-        "bad_floor_force_excess": 10.0,
-        "contact_switch": 12.0,
-        "contact_force_delta": 2.5,
-        "contact_false_positive": 1.5,
-        "contact_false_negative": 0.4,
-        "control_delta": 1.8,
-        "action_delta": 0.6,
-        "joint_acc": 0.006,
-        "joint_jerk": 0.0012,
-        "body_global_pos_error": 4.0,
-        "body_global_rot_error": 0.8,
-        "ee_global_pos_error": 1.5,
-        "ee_global_rot_error": 0.3,
-    },
-    "g1_wbc_joint": {
-        "bad_floor_contact": 35.0,
-        "bad_floor_force_excess": 8.0,
-        "contact_switch": 10.0,
-        "contact_force_delta": 2.0,
-        "contact_false_positive": 0.8,
-        "contact_false_negative": 0.3,
-        "control_delta": 1.6,
-        "action_delta": 0.5,
-        "joint_acc": 0.006,
-        "joint_jerk": 0.0012,
-        "body_local_pos_error": 26.0,
-        "body_local_rot_error": 3.0,
-        "joint_pos_error": 2.1,
-        "ee_local_pos_error": 6.0,
-        "ee_local_rot_error": 1.2,
-        "body_global_pos_error": 0.8,
-        "body_global_rot_error": 0.2,
-        "ee_global_pos_error": 0.3,
-    },
-    "g1_wbc_ee": {
-        "bad_floor_contact": 35.0,
-        "bad_floor_force_excess": 8.0,
-        "contact_switch": 10.0,
-        "contact_force_delta": 2.0,
-        "contact_false_positive": 0.5,
-        "contact_false_negative": 0.2,
-        "control_delta": 2.0,
-        "action_delta": 0.6,
-        "joint_acc": 0.006,
-        "joint_jerk": 0.0015,
-        "hand_global_pos_error": 35.0,
-        "hand_global_rot_error": 3.0,
-        "hand_local_pos_error": 8.0,
-        "hand_local_rot_error": 1.5,
-        "ee_global_pos_error": 2.0,
-        "ee_global_rot_error": 0.4,
-        "body_global_pos_error": 0.8,
-        "body_local_pos_error": 0.8,
-    },
-}
 
 
 @dataclass
-class G1WbcSpiderResult:
-    command: G1CommandBatch
-    rollout: RolloutResult
-    refined_qpos: torch.Tensor
-    controls: torch.Tensor
-    infos: list[dict[str, Any]]
-    scores: torch.Tensor
-    num_windows: int = 0
+class G1WbcBackendState:
+    last_action: torch.Tensor
+    history_state: dict | None
+    step_index: int
+    command: G1CommandBatch | G1Motion | None
+    ref_start: int
+    task_context: dict[str, Any] | None
+    trace: dict[str, list[torch.Tensor]]
+    last_robot_state: RobotState | None
+    last_floor_contact: torch.Tensor | None
+    last_floor_force: torch.Tensor | None
 
 
-def load_reward_weights(path: str | Path, mode: G1WbcObjective) -> dict[str, float]:
-    raw = json.loads(Path(path).expanduser().read_text())
-    if mode in raw and isinstance(raw[mode], dict):
-        raw = raw[mode]
-    if not isinstance(raw, dict):
-        raise ValueError(f"Reward weight file must contain a JSON object: {path}")
-    return {str(key): float(value) for key, value in raw.items()}
-
-
-def reward_weights_for(
-    mode: G1WbcObjective,
-    weights: dict[str, float] | None,
-) -> dict[str, float]:
-    return weights or REWARD_WEIGHT_PRESETS[mode]
-
-
-class G1WbcSamplingTask:
-    """Task adapter consumed by SPIDER's generic sampling optimizer."""
+class G1WbcBackend:
+    """Simulation backend implementing SPIDER's rollout lifecycle for G1 WBC."""
 
     def __init__(
         self,
-        motion: G1Motion,
         actor: WbcActor,
         rollout_config: WbcRolloutConfig,
         *,
-        mode: G1WbcObjective,
-        reward_weights: dict[str, float] | None = None,
+        initial_qpos: torch.Tensor,
+        initial_qvel: torch.Tensor,
+        command: G1CommandBatch | G1Motion | None = None,
     ) -> None:
         self.device = torch.device(rollout_config.device)
-        self.motion = motion.to(self.device)
-        self.actor = actor.to(self.device).eval()
         self.rollout_config = rollout_config
-        self.mode = mode
-        self.reward_weights = reward_weights
-        self.joint_low, self.joint_high = _joint_limits(rollout_config, self.device)
-        self.current_qpos = self.motion.qpos()[0].detach().clone()
-        self.current_qvel = self.motion.qvel()[0].detach().clone()
-        self.current_last_action: torch.Tensor | None = None
-        self.current_history_state = None
-        self._qpos_trace: list[torch.Tensor] = []
-        self._qvel_trace: list[torch.Tensor] = []
-        self._body_pos_trace: list[torch.Tensor] = []
-        self._body_quat_trace: list[torch.Tensor] = []
-        self._body_lin_vel_trace: list[torch.Tensor] = []
-        self._body_ang_vel_trace: list[torch.Tensor] = []
-        self._actions: list[torch.Tensor] = []
-        self._controls: list[torch.Tensor] = []
-        self._contact_indicator: list[torch.Tensor] = []
-        self._contact_force: list[torch.Tensor] = []
-        self._floor_contact_indicator: list[torch.Tensor] = []
-        self._floor_contact_force: list[torch.Tensor] = []
-        self._ref_indices: list[torch.Tensor] = []
-        self._executed_controls: list[torch.Tensor] = []
-        self._last_scores = torch.empty(0, dtype=torch.float32, device=self.device)
-
-    def initial_controls(self, config: Config) -> torch.Tensor:
-        return torch.zeros(
-            int(config.horizon_steps),
-            int(config.nu),
+        self.sim = G1WbcMujocoWarpEnv(rollout_config)
+        self.actor = actor.to(self.device).eval()
+        self.command = command.to(self.device) if command is not None else None
+        self.obs_builder: G1WbcObservationBuilder | None = None
+        self.task_context: dict[str, Any] | None = None
+        self.last_action = torch.zeros(
+            int(rollout_config.num_envs),
+            ACTION_DIM,
             dtype=torch.float32,
             device=self.device,
         )
+        self.step_index = 0
+        self.ref_start = 0
+        self.trace = _empty_trace()
+        self.last_robot_state: RobotState | None = None
+        self.last_floor_contact: torch.Tensor | None = None
+        self.last_floor_force: torch.Tensor | None = None
 
-    def tail_controls(self, _sim_step: int, steps: int) -> torch.Tensor:
-        return torch.zeros(
-            int(steps),
-            QPOS_DIM - 1,
-            dtype=torch.float32,
-            device=self.device,
-        )
+        self.sim.reset(initial_qpos, initial_qvel)
+        self._refresh_initial_trace(ref_index=0)
+        if self.command is not None:
+            self.set_command(self.command, ref_start=0)
 
-    def ref_slice(self, start: int, horizon: int) -> tuple[torch.Tensor, ...]:
-        base_qpos = _slice_qpos_padded(self.motion.qpos(), start, horizon)
-        return (
-            torch.tensor([int(start)], dtype=torch.long, device=self.device),
-            base_qpos,
-        )
+    @property
+    def num_envs(self) -> int:
+        return int(self.rollout_config.num_envs)
 
-    def rollout(
+    def reset_physical_state(
         self,
-        config: Config,
-        _env,
-        controls: torch.Tensor,
-        ref_slice: tuple[torch.Tensor, ...],
-        _env_param: dict,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        start = int(ref_slice[0].detach().cpu().item())
-        base_qpos = ref_slice[1].to(self.device)
-        horizon = int(controls.shape[1])
-        qpos = self.controls_to_qpos(controls.permute(1, 0, 2), base_qpos[:horizon])
-        command = command_batch_from_qpos_trajectory(
-            self._window_motion(start, horizon),
-            qpos,
-            self.rollout_config,
-            preserve_template_first=True,
-        )
-        rollout = run_command_rollout(
-            command,
-            self.actor,
-            _replace_rollout_config(self.rollout_config, config.num_samples, horizon),
-            initial_qpos=self.current_qpos,
-            initial_qvel=self.current_qvel,
-            initial_last_action=self.current_last_action,
-            initial_history_state=self.current_history_state,
-            ref_start=start,
-        )
-        _, terms = compute_rollout_scores(self.motion, rollout)
-        scores = _score_from_terms(
-            terms,
-            self.mode,
-            self.reward_weights,
-        )
-        self._last_scores = scores.detach().clone()
-        terminate = torch.zeros(
-            int(config.num_samples),
-            dtype=torch.bool,
-            device=self.device,
-        )
-        info = {key: value.detach() for key, value in terms.items()}
-        info["task_score"] = scores.detach()
-        return controls, scores, terminate, info
-
-    def execute(self, controls: torch.Tensor, sim_step: int) -> dict[str, Any]:
-        execute_steps = int(controls.shape[0])
-        base_qpos = _slice_qpos_padded(self.motion.qpos(), sim_step, execute_steps)
-        qpos = self.controls_to_qpos(controls[:, None, :], base_qpos)
-        info = self.execute_qpos_command(qpos, sim_step)
-        self._executed_controls.extend(t.detach().clone() for t in controls)
-        return {
-            **info,
-            "executed_controls_rms": torch.stack(
-                [t.square().mean().sqrt() for t in controls]
-            ).mean().detach().cpu().numpy(),
-        }
-
-    def execute_qpos_command(self, qpos: torch.Tensor, sim_step: int) -> dict[str, Any]:
-        """Execute a precomputed qpos command chunk through the MPC rollout path."""
-
-        qpos = qpos.to(self.device, dtype=torch.float32)
-        if qpos.ndim == 3:
-            if qpos.shape[1] != 1:
-                raise ValueError(f"Expected single-env command qpos, got {qpos.shape}.")
-            qpos = qpos[:, 0]
-        if qpos.ndim != 2 or qpos.shape[-1] != QPOS_DIM:
-            raise ValueError(f"Expected command qpos shape (T, {QPOS_DIM}), got {qpos.shape}.")
-
-        execute_steps = int(qpos.shape[0])
-        command = command_batch_from_qpos_trajectory(
-            self._window_motion(sim_step, execute_steps),
-            qpos[:, None, :],
-            self.rollout_config,
-            preserve_template_first=False,
-            kinematics_batch_size=1,
-        )
-        rollout = run_command_rollout(
-            command,
-            self.actor,
-            _replace_rollout_config(self.rollout_config, 1, execute_steps),
-            initial_qpos=self.current_qpos,
-            initial_qvel=self.current_qvel,
-            initial_last_action=self.current_last_action,
-            initial_history_state=self.current_history_state,
-            ref_start=sim_step,
-        )
-        self._append_rollout(rollout)
-        self.current_qpos = rollout.qpos[-1, 0].detach().clone()
-        self.current_qvel = rollout.qvel[-1, 0].detach().clone()
-        self.current_last_action = (
-            None
-            if rollout.final_last_action is None
-            else rollout.final_last_action[0].detach().clone()
-        )
-        self.current_history_state = rollout.final_history_state
-        return {}
-
-    def controls_to_qpos(
-        self,
-        controls_time_major: torch.Tensor,
-        base_qpos: torch.Tensor,
-    ) -> torch.Tensor:
-        base = base_qpos[:, None, :].expand(
-            -1,
-            int(controls_time_major.shape[1]),
-            -1,
-        ).clone()
-        base[..., :3] = base[..., :3] + controls_time_major[..., :3]
-        delta_quat = quat_from_axis_angle(controls_time_major[..., 3:6])
-        base[..., 3:7] = normalize(quat_mul(delta_quat, base[..., 3:7]))
-        base[..., 7:] = torch.clamp(
-            base[..., 7:] + controls_time_major[..., 6:],
-            self.joint_low,
-            self.joint_high,
-        )
-        return base.contiguous()
-
-    def build_result(
-        self,
-        controls: torch.Tensor,
-        infos: list[dict[str, Any]],
+        initial_qpos: torch.Tensor,
+        initial_qvel: torch.Tensor,
         *,
-        total_steps: int,
-    ) -> G1WbcSpiderResult:
-        rollout = self._stack_rollout()
-        refined_qpos = self.motion.qpos()[: total_steps + 1].detach().clone()
-        if self._executed_controls:
-            executed = torch.stack(self._executed_controls, dim=0)
-            base = self.motion.qpos()[: executed.shape[0]]
-            refined_qpos[: executed.shape[0]] = self.controls_to_qpos(
-                executed[:, None, :],
-                base,
-            )[:, 0]
-        command = command_batch_from_qpos_trajectory(
-            self.motion,
-            refined_qpos[:, None, :],
-            _replace_rollout_config(self.rollout_config, 1, total_steps),
-            preserve_template_first=False,
+        ref_index: int = 0,
+    ) -> None:
+        """Reset backend-owned physical state before a new independent run."""
+
+        self.sim.reset(initial_qpos, initial_qvel)
+        self.command = None
+        self.obs_builder = None
+        self.task_context = None
+        self.last_action = torch.zeros(
+            self.num_envs,
+            ACTION_DIM,
+            dtype=torch.float32,
+            device=self.device,
         )
-        return G1WbcSpiderResult(
-            command=command,
-            rollout=rollout,
-            refined_qpos=refined_qpos,
-            controls=controls.detach().clone(),
-            infos=infos,
-            scores=self._last_scores.detach().clone(),
-            num_windows=len(infos),
+        self.step_index = 0
+        self.ref_start = int(ref_index)
+        self._refresh_initial_trace(ref_index=int(ref_index))
+
+    def set_command(
+        self,
+        command: G1CommandBatch | G1Motion,
+        *,
+        ref_start: int,
+        initial_last_action: torch.Tensor | None = None,
+        initial_history_state: dict | None = None,
+    ) -> None:
+        command = command.to(self.device)
+        if isinstance(command, G1CommandBatch) and command.num_envs != self.num_envs:
+            raise ValueError(
+                f"Command batch has {command.num_envs} envs, backend has {self.num_envs}."
+            )
+        self.command = command
+        self.obs_builder = G1WbcObservationBuilder(
+            motion=command,
+            num_envs=self.num_envs,
+            default_joint_pos=self.sim.default_joint_pos,
+            device=self.device,
+        )
+        self.obs_builder.load_history_state_dict(initial_history_state)
+        if initial_last_action is None:
+            self.last_action = torch.zeros(
+                self.num_envs,
+                ACTION_DIM,
+                dtype=torch.float32,
+                device=self.device,
+            )
+        else:
+            self.last_action = _batch_last_action(
+                initial_last_action,
+                self.num_envs,
+                self.device,
+            )
+        self.step_index = 0
+        self.ref_start = int(ref_start)
+        self.trace = _empty_trace()
+        self._refresh_initial_trace(ref_index=self.ref_start)
+
+    def step(self) -> None:
+        if self.command is None or self.obs_builder is None:
+            raise RuntimeError("G1 WBC backend command is not configured.")
+        state = self.sim.robot_state()
+        ref_idx_scalar = min(
+            max(self.step_index + int(self.rollout_config.ref_offset), 0),
+            self.command.num_frames - 1,
+        )
+        ref_idx = torch.full(
+            (self.num_envs,),
+            ref_idx_scalar,
+            dtype=torch.long,
+            device=self.device,
+        )
+        with torch.inference_mode():
+            obs = self.obs_builder.compute(state, ref_idx, self.last_action)
+            action = self.actor(obs)
+            ctrl = self.sim.action_to_control(action)
+            self.sim.step_control(ctrl)
+
+        self.step_index += 1
+        self.last_action = action.detach().clone()
+        self._append_current_state(action, ctrl, ref_idx + self.ref_start)
+
+    def save_state(self) -> G1WbcBackendState:
+        self.sim.save_state()
+        return G1WbcBackendState(
+            last_action=self.last_action.detach().clone(),
+            history_state=(
+                None
+                if self.obs_builder is None
+                else self.obs_builder.history_state_dict()
+            ),
+            step_index=int(self.step_index),
+            command=self.command,
+            ref_start=int(self.ref_start),
+            task_context=_clone_task_context(self.task_context),
+            trace=_clone_trace(self.trace),
+            last_robot_state=_clone_robot_state(self.last_robot_state),
+            last_floor_contact=_clone_optional_tensor(self.last_floor_contact),
+            last_floor_force=_clone_optional_tensor(self.last_floor_force),
         )
 
-    def _window_motion(self, start: int, length: int) -> G1Motion:
-        return _slice_motion_padded(self.motion, start, length)
+    def load_state(self, state: G1WbcBackendState) -> "G1WbcBackend":
+        self.sim.load_state()
+        self.command = state.command
+        self.task_context = _clone_task_context(state.task_context)
+        if self.command is not None:
+            self.obs_builder = G1WbcObservationBuilder(
+                motion=self.command,
+                num_envs=self.num_envs,
+                default_joint_pos=self.sim.default_joint_pos,
+                device=self.device,
+            )
+            self.obs_builder.load_history_state_dict(state.history_state)
+        else:
+            self.obs_builder = None
+        self.last_action = state.last_action.detach().clone()
+        self.step_index = int(state.step_index)
+        self.ref_start = int(state.ref_start)
+        self.trace = _clone_trace(state.trace)
+        self.last_robot_state = _clone_robot_state(state.last_robot_state)
+        self.last_floor_contact = _clone_optional_tensor(state.last_floor_contact)
+        self.last_floor_force = _clone_optional_tensor(state.last_floor_force)
+        return self
 
-    def _append_rollout(self, rollout: RolloutResult) -> None:
-        if not self._qpos_trace:
-            self._qpos_trace.append(rollout.qpos[0, 0].detach().clone())
-            self._qvel_trace.append(rollout.qvel[0, 0].detach().clone())
-            self._body_pos_trace.append(rollout.body_pos_w[0, 0].detach().clone())
-            self._body_quat_trace.append(rollout.body_quat_w[0, 0].detach().clone())
-            self._body_lin_vel_trace.append(rollout.body_lin_vel_w[0, 0].detach().clone())
-            self._body_ang_vel_trace.append(rollout.body_ang_vel_w[0, 0].detach().clone())
-            self._contact_indicator.append(rollout.contact_indicator[0, 0].detach().clone())
-            self._contact_force.append(rollout.contact_force[0, 0].detach().clone())
-            self._floor_contact_indicator.append(_floor_contact_indicator(rollout)[0, 0].detach().clone())
-            self._floor_contact_force.append(_floor_contact_force(rollout)[0, 0].detach().clone())
-            self._ref_indices.append(rollout.ref_indices[0, 0].detach().clone())
-
-        self._qpos_trace.extend(t.detach().clone() for t in rollout.qpos[1:, 0])
-        self._qvel_trace.extend(t.detach().clone() for t in rollout.qvel[1:, 0])
-        self._body_pos_trace.extend(t.detach().clone() for t in rollout.body_pos_w[1:, 0])
-        self._body_quat_trace.extend(t.detach().clone() for t in rollout.body_quat_w[1:, 0])
-        self._body_lin_vel_trace.extend(t.detach().clone() for t in rollout.body_lin_vel_w[1:, 0])
-        self._body_ang_vel_trace.extend(t.detach().clone() for t in rollout.body_ang_vel_w[1:, 0])
-        self._contact_indicator.extend(t.detach().clone() for t in rollout.contact_indicator[1:, 0])
-        self._contact_force.extend(t.detach().clone() for t in rollout.contact_force[1:, 0])
-        self._floor_contact_indicator.extend(t.detach().clone() for t in _floor_contact_indicator(rollout)[1:, 0])
-        self._floor_contact_force.extend(t.detach().clone() for t in _floor_contact_force(rollout)[1:, 0])
-        self._ref_indices.extend(t.detach().clone() for t in rollout.ref_indices[1:, 0])
-        self._actions.extend(t.detach().clone() for t in rollout.actions[:, 0])
-        self._controls.extend(t.detach().clone() for t in rollout.controls[:, 0])
-
-    def _stack_rollout(self) -> RolloutResult:
+    def rollout_result(self) -> RolloutResult:
+        if not self.trace["qpos"]:
+            raise RuntimeError("No WBC rollout trace has been recorded.")
+        actions = self.trace["actions"]
+        controls = self.trace["controls"]
+        if not actions:
+            actions_tensor = torch.empty(
+                0,
+                self.num_envs,
+                ACTION_DIM,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            controls_tensor = torch.empty_like(actions_tensor)
+        else:
+            actions_tensor = torch.stack(actions, dim=0)
+            controls_tensor = torch.stack(controls, dim=0)
         return RolloutResult(
-            qpos=torch.stack(self._qpos_trace, dim=0)[:, None, :],
-            qvel=torch.stack(self._qvel_trace, dim=0)[:, None, :],
-            body_pos_w=torch.stack(self._body_pos_trace, dim=0)[:, None, :, :],
-            body_quat_w=torch.stack(self._body_quat_trace, dim=0)[:, None, :, :],
-            body_lin_vel_w=torch.stack(self._body_lin_vel_trace, dim=0)[:, None, :, :],
-            body_ang_vel_w=torch.stack(self._body_ang_vel_trace, dim=0)[:, None, :, :],
-            actions=torch.stack(self._actions, dim=0)[:, None, :],
-            controls=torch.stack(self._controls, dim=0)[:, None, :],
-            contact_indicator=torch.stack(self._contact_indicator, dim=0)[:, None, :],
-            contact_force=torch.stack(self._contact_force, dim=0)[:, None, :],
-            floor_contact_indicator=torch.stack(self._floor_contact_indicator, dim=0)[:, None, :],
-            floor_contact_force=torch.stack(self._floor_contact_force, dim=0)[:, None, :],
-            ref_indices=torch.stack(self._ref_indices, dim=0)[:, None],
+            qpos=torch.stack(self.trace["qpos"], dim=0),
+            qvel=torch.stack(self.trace["qvel"], dim=0),
+            body_pos_w=torch.stack(self.trace["body_pos_w"], dim=0),
+            body_quat_w=torch.stack(self.trace["body_quat_w"], dim=0),
+            body_lin_vel_w=torch.stack(self.trace["body_lin_vel_w"], dim=0),
+            body_ang_vel_w=torch.stack(self.trace["body_ang_vel_w"], dim=0),
+            actions=actions_tensor,
+            controls=controls_tensor,
+            contact_indicator=torch.stack(self.trace["contact_indicator"], dim=0),
+            contact_force=torch.stack(self.trace["contact_force"], dim=0),
+            floor_contact_indicator=torch.stack(
+                self.trace["floor_contact_indicator"], dim=0
+            ),
+            floor_contact_force=torch.stack(self.trace["floor_contact_force"], dim=0),
+            ref_indices=torch.stack(self.trace["ref_indices"], dim=0),
+            final_last_action=self.last_action.detach().clone(),
+            final_history_state=(
+                None
+                if self.obs_builder is None
+                else self.obs_builder.history_state_dict()
+            ),
         )
+
+    def _refresh_initial_trace(self, *, ref_index: int) -> None:
+        state = self.sim.robot_state()
+        floor_contact, floor_force = self.sim.floor_contact()
+        self.last_robot_state = state
+        self.last_floor_contact = floor_contact
+        self.last_floor_force = floor_force
+        self.trace = _empty_trace()
+        _append_backend_state(
+            self.trace,
+            state,
+            floor_contact,
+            floor_force,
+            torch.full(
+                (self.num_envs,),
+                int(ref_index),
+                dtype=torch.long,
+                device=self.device,
+            ),
+        )
+
+    def _append_current_state(
+        self,
+        action: torch.Tensor,
+        ctrl: torch.Tensor,
+        ref_indices: torch.Tensor,
+    ) -> None:
+        state = self.sim.robot_state()
+        floor_contact, floor_force = self.sim.floor_contact()
+        self.last_robot_state = state
+        self.last_floor_contact = floor_contact
+        self.last_floor_force = floor_force
+        _append_backend_state(
+            self.trace,
+            state,
+            floor_contact,
+            floor_force,
+            ref_indices,
+        )
+        self.trace["actions"].append(action.detach().clone())
+        self.trace["controls"].append(ctrl.detach().clone())
+
+
+def setup_env(
+    config: Config,
+    ref_data: dict[str, Any],
+) -> G1WbcBackend:
+    motion = ref_data["motion"]
+    actor = ref_data["actor"]
+    rollout_config = _replace_rollout_config(
+        ref_data["rollout_config"],
+        int(config.num_samples),
+        None,
+    )
+    return G1WbcBackend(
+        actor,
+        rollout_config,
+        initial_qpos=motion.qpos()[0],
+        initial_qvel=motion.qvel()[0],
+    )
 
 
 def _replace_rollout_config(
@@ -382,22 +313,109 @@ def _replace_rollout_config(
     num_envs: int,
     max_steps: int | None,
 ) -> WbcRolloutConfig:
-    from dataclasses import replace
-
     return replace(config, num_envs=int(num_envs), max_steps=max_steps)
+
+
+def save_state(env: G1WbcBackend) -> G1WbcBackendState:
+    return env.save_state()
+
+
+def load_state(env: G1WbcBackend, state: G1WbcBackendState) -> G1WbcBackend:
+    return env.load_state(state)
+
+
+def step_env(_config: Config, env: G1WbcBackend, _ctrl: torch.Tensor) -> None:
+    env.step()
+
+
+def get_reward(
+    config: Config,
+    env: G1WbcBackend,
+    _ref,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    zeros = torch.zeros(int(config.num_samples), dtype=torch.float32, device=config.device)
+    return zeros, _zero_score_info(zeros)
+
+
+def get_terminal_reward(
+    config: Config,
+    env: G1WbcBackend,
+    _ref,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if env.task_context is None:
+        raise RuntimeError("G1 WBC backend is missing task_context.")
+    rollout = env.rollout_result()
+    _, terms = compute_rollout_scores(env.task_context["motion"], rollout)
+    scores = _score_from_terms(
+        terms,
+        env.task_context["reward_weights"],
+    )
+    env.task_context["last_scores"] = scores.detach().clone()
+    horizon = max(int(env.step_index), 1)
+    reward = scores * horizon
+    info = {key: value.detach() * horizon for key, value in terms.items()}
+    info["task_score"] = scores.detach() * horizon
+    return reward, info
+
+
+def get_terminate(config: Config, _env: G1WbcBackend, _ref) -> torch.Tensor:
+    return torch.zeros(int(config.num_samples), dtype=torch.bool, device=config.device)
+
+
+def get_trace(config: Config, _env: G1WbcBackend) -> torch.Tensor:
+    return torch.empty(
+        int(config.num_samples),
+        0,
+        3,
+        dtype=torch.float32,
+        device=config.device,
+    )
+
+
+def save_env_params(_config: Config, env: G1WbcBackend) -> dict[str, Any]:
+    return {}
+
+
+def load_env_params(
+    config: Config,
+    env: G1WbcBackend,
+    env_param: dict[str, Any],
+) -> G1WbcBackend:
+    if not env_param:
+        return env
+    command = env_param.get("command")
+    if command is None:
+        return env
+    task_context = env_param.get("task_context")
+    if task_context is not None:
+        env.task_context = task_context
+    env.set_command(
+        command,
+        ref_start=int(env_param.get("ref_start", 0)),
+        initial_last_action=env_param.get("initial_last_action"),
+        initial_history_state=env_param.get("initial_history_state"),
+    )
+    return env
+
+
+def copy_sample_state(
+    _config: Config,
+    _env: G1WbcBackend,
+    _src_indices: torch.Tensor,
+    _dst_indices: torch.Tensor,
+) -> None:
+    raise NotImplementedError("G1 WBC does not enable terminate_resample.")
 
 
 def _score_from_terms(
     terms: dict[str, torch.Tensor],
-    mode: G1WbcObjective,
-    reward_weights: dict[str, float] | None,
+    reward_weights: dict[str, float],
 ) -> torch.Tensor:
-    weights = reward_weights_for(mode, reward_weights)
-    missing = sorted(key for key in weights if key not in terms)
+    missing = sorted(key for key in reward_weights if key not in terms)
     if missing:
         raise KeyError(f"Reward weights reference missing terms: {missing}")
     loss = None
-    for key, weight in weights.items():
+    for key, weight in reward_weights.items():
         term = terms[key] * float(weight)
         loss = term if loss is None else loss + term
     if loss is None:
@@ -406,102 +424,142 @@ def _score_from_terms(
     return -loss
 
 
-def _slice_qpos_padded(qpos: torch.Tensor, start: int, length: int) -> torch.Tensor:
-    start = int(start)
-    length = int(length)
-    out = qpos[start : start + length]
-    if out.shape[0] < length:
-        out = torch.cat([out, out[-1:].repeat(length - out.shape[0], 1)], dim=0)
-    return out.contiguous()
+def _zero_score_info(zeros: torch.Tensor) -> dict[str, torch.Tensor]:
+    keys = {
+        "root_pos_error",
+        "root_rot_error",
+        "joint_pos_error",
+        "body_global_pos_error",
+        "body_global_rot_error",
+        "ee_global_pos_error",
+        "ee_global_rot_error",
+        "ee_local_pos_error",
+        "ee_local_rot_error",
+        "hand_global_pos_error",
+        "hand_global_rot_error",
+        "hand_local_pos_error",
+        "hand_local_rot_error",
+        "body_local_pos_error",
+        "body_local_rot_error",
+        "contact_mismatch",
+        "contact_false_positive",
+        "contact_false_negative",
+        "contact_switch",
+        "contact_force_excess",
+        "contact_force_delta",
+        "bad_floor_contact",
+        "bad_floor_force_excess",
+        "action_delta",
+        "control_delta",
+        "joint_acc",
+        "joint_jerk",
+        "task_score",
+    }
+    return {key: zeros.clone() for key in keys}
 
 
-def _slice_motion_padded(motion: G1Motion, start: int, length: int) -> G1Motion:
-    start = int(start)
-    length = int(length)
+def _empty_trace() -> dict[str, list[torch.Tensor]]:
+    return {
+        "qpos": [],
+        "qvel": [],
+        "body_pos_w": [],
+        "body_quat_w": [],
+        "body_lin_vel_w": [],
+        "body_ang_vel_w": [],
+        "actions": [],
+        "controls": [],
+        "contact_indicator": [],
+        "contact_force": [],
+        "floor_contact_indicator": [],
+        "floor_contact_force": [],
+        "ref_indices": [],
+    }
 
-    def sl(value: torch.Tensor) -> torch.Tensor:
-        out = value[start : start + length]
-        if out.shape[0] < length:
-            repeats = [length - out.shape[0]] + [1] * (out.ndim - 1)
-            out = torch.cat([out, out[-1:].repeat(*repeats)], dim=0)
-        return out.contiguous()
 
-    return G1Motion(
-        path=motion.path,
-        motion_type=motion.motion_type,
-        fps=motion.fps,
-        joint_pos=sl(motion.joint_pos),
-        joint_vel=sl(motion.joint_vel),
-        body_pos_w=sl(motion.body_pos_w),
-        body_quat_w=sl(motion.body_quat_w),
-        body_lin_vel_w=sl(motion.body_lin_vel_w),
-        body_ang_vel_w=sl(motion.body_ang_vel_w),
-        contact=sl(motion.contact),
+def _append_backend_state(
+    trace: dict[str, list[torch.Tensor]],
+    state: RobotState,
+    floor_contact: torch.Tensor,
+    floor_force: torch.Tensor,
+    ref_indices: torch.Tensor,
+) -> None:
+    trace["qpos"].append(state.qpos.detach().clone())
+    trace["qvel"].append(state.qvel.detach().clone())
+    trace["body_pos_w"].append(state.body_pos_w.detach().clone())
+    trace["body_quat_w"].append(state.body_quat_w.detach().clone())
+    trace["body_lin_vel_w"].append(state.body_lin_vel_w.detach().clone())
+    trace["body_ang_vel_w"].append(state.body_ang_vel_w.detach().clone())
+    trace["contact_indicator"].append(floor_contact[:, :2].detach().clone())
+    trace["contact_force"].append(floor_force[:, :2].detach().clone())
+    trace["floor_contact_indicator"].append(floor_contact.detach().clone())
+    trace["floor_contact_force"].append(floor_force.detach().clone())
+    trace["ref_indices"].append(ref_indices.detach().clone())
+
+
+def _clone_trace(trace: dict[str, list[torch.Tensor]]) -> dict[str, list[torch.Tensor]]:
+    return {
+        key: [value.detach().clone() for value in values]
+        for key, values in trace.items()
+    }
+
+
+def _clone_task_context(context: dict[str, Any] | None) -> dict[str, Any] | None:
+    return None if context is None else dict(context)
+
+
+def _clone_optional_tensor(value: torch.Tensor | None) -> torch.Tensor | None:
+    return None if value is None else value.detach().clone()
+
+
+def _clone_robot_state(state: RobotState | None) -> RobotState | None:
+    if state is None:
+        return None
+    return RobotState(
+        qpos=state.qpos.detach().clone(),
+        qvel=state.qvel.detach().clone(),
+        body_pos_w=state.body_pos_w.detach().clone(),
+        body_quat_w=state.body_quat_w.detach().clone(),
+        body_lin_vel_w=state.body_lin_vel_w.detach().clone(),
+        body_ang_vel_w=state.body_ang_vel_w.detach().clone(),
+        base_ang_vel_b=_clone_optional_tensor(state.base_ang_vel_b),
     )
 
 
-def _floor_contact_indicator(rollout: RolloutResult) -> torch.Tensor:
-    if rollout.floor_contact_indicator is not None:
-        return rollout.floor_contact_indicator
-    other = torch.zeros(
-        *rollout.contact_indicator.shape[:-1],
-        1,
-        dtype=rollout.contact_indicator.dtype,
-        device=rollout.contact_indicator.device,
-    )
-    return torch.cat([rollout.contact_indicator, other], dim=-1)
-
-
-def _floor_contact_force(rollout: RolloutResult) -> torch.Tensor:
-    if rollout.floor_contact_force is not None:
-        return rollout.floor_contact_force
-    other = torch.zeros(
-        *rollout.contact_force.shape[:-1],
-        1,
-        dtype=rollout.contact_force.dtype,
-        device=rollout.contact_force.device,
-    )
-    return torch.cat([rollout.contact_force, other], dim=-1)
-
-
-def _joint_limits(
-    rollout_config: WbcRolloutConfig,
+def _batch_last_action(
+    value: torch.Tensor,
+    num_envs: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    model = load_wbc_model(rollout_config.model_path)
-    low = []
-    high = []
-    for joint_name in MUJOCO_JOINT_NAMES:
-        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
-        if joint_id < 0:
-            joint_id = mujoco.mj_name2id(
-                model, mujoco.mjtObj.mjOBJ_JOINT, f"robot/{joint_name}"
-            )
-        if joint_id < 0:
-            raise ValueError(f"G1 model is missing joint {joint_name}")
-        if int(model.jnt_limited[joint_id]):
-            low.append(float(model.jnt_range[joint_id, 0]))
-            high.append(float(model.jnt_range[joint_id, 1]))
+) -> torch.Tensor:
+    value = value.to(device, dtype=torch.float32)
+    if value.ndim == 1:
+        value = value.view(1, ACTION_DIM).expand(num_envs, ACTION_DIM)
+    if value.shape != (num_envs, ACTION_DIM):
+        if value.shape == (1, ACTION_DIM):
+            value = value.expand(num_envs, ACTION_DIM)
         else:
-            low.append(-float("inf"))
-            high.append(float("inf"))
-    return (
-        torch.tensor(low, dtype=torch.float32, device=device),
-        torch.tensor(high, dtype=torch.float32, device=device),
-    )
+            raise ValueError(
+                f"Expected last action {(num_envs, ACTION_DIM)}, got {value.shape}."
+            )
+    return value.contiguous()
 
 
 __all__ = [
     "G1CommandBatch",
     "G1Motion",
-    "G1WbcSamplingTask",
-    "G1WbcSpiderResult",
-    "G1WbcObjective",
-    "REWARD_WEIGHT_PRESETS",
+    "G1WbcBackend",
+    "G1WbcBackendState",
     "RolloutResult",
     "WbcActor",
     "WbcRolloutConfig",
-    "compute_rollout_metrics",
-    "load_reward_weights",
-    "reward_weights_for",
+    "copy_sample_state",
+    "get_reward",
+    "get_terminal_reward",
+    "get_terminate",
+    "get_trace",
+    "load_env_params",
+    "load_state",
+    "save_env_params",
+    "save_state",
+    "setup_env",
+    "step_env",
 ]

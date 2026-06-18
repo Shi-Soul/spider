@@ -11,21 +11,17 @@ from typing import Any
 import numpy as np
 import torch
 
-from spider.config import Config, build_sampling_mpc_config
-from spider.optimizers.receding import (
-    run_sampling_receding_mpc,
-    sampling_mpc_metadata,
-)
-from spider.tasks.g1_wbc.constants import POLICY_DT, QPOS_DIM, QVEL_DIM
+from spider.config import Config
+from spider.tasks.g1_wbc.constants import QPOS_DIM, QVEL_DIM
 from spider.tasks.g1_wbc.metrics import compute_rollout_metrics
-from spider.simulators.g1_wbc import (
+from spider.tasks.g1_wbc.spider_task import (
     G1WbcSamplingTask,
+    build_g1_wbc_sampling_config,
     load_reward_weights,
     reward_weights_for,
+    run_g1_wbc_sampling_mpc,
 )
 from spider.tasks.g1_wbc.motion import (
-    G1CommandBatch,
-    G1Motion,
     load_motion,
     validate_motion_dims,
 )
@@ -33,8 +29,6 @@ from spider.tasks.g1_wbc.policy import load_wbc_actor, resolve_checkpoint_path
 from spider.tasks.g1_wbc.rollout import (
     RolloutResult,
     WbcRolloutConfig,
-    command_batch_from_qpos_trajectory,
-    run_command_rollout,
     run_no_mpc_rollout,
     run_static_qpos_rollout,
 )
@@ -64,7 +58,14 @@ def main() -> None:
         sync_after_step=args.sync_after_step,
         forward_after_step=args.forward_after_step,
         use_cuda_graph=args.use_cuda_graph,
+        ls_parallel=args.ls_parallel,
+        serial_warp_launches=args.serial_warp_launches,
     )
+    execute_config = replace(
+        config,
+        use_cuda_graph=False,
+        serial_warp_launches=True,
+    ) if args.serial_execute_warp_launches else config
     mpc_payload = None
     mpc_result = None
     if args.method == "static_qpos":
@@ -76,28 +77,40 @@ def main() -> None:
         )
     elif args.method == "replay_command":
         assert actor is not None
-        command = _load_saved_command_batch(
+        qpos_trajectory, qvel_trajectory = _load_saved_command_trajectory(
             args.saved_command,
-            motion,
-            config,
             device=device,
         )
-        total_steps = command.num_frames - 1
+        total_steps = qpos_trajectory.shape[0] - 1
         if args.max_steps is not None:
             total_steps = min(total_steps, int(args.max_steps))
-        replay_config = replace(config, num_envs=command.num_envs, max_steps=total_steps)
-        rollout = run_command_rollout(
-            command,
+        control_steps = _resolve_replay_control_steps(args)
+        task = G1WbcSamplingTask(
+            motion,
             actor,
-            replay_config,
-            initial_qpos=motion.qpos()[0],
-            initial_qvel=motion.qvel()[0],
+            config,
+            mode=args.replay_task_mode,
+            execute_rollout_config=execute_config,
+        )
+        rollout = task.replay_qpos_command_sequence(
+            qpos_trajectory,
+            qvel_trajectory=(
+                qvel_trajectory if args.replay_use_saved_qvel else None
+            ),
+            control_steps=control_steps,
+            total_steps=total_steps,
         )
         mpc_payload = {
-            "backend": "spider.tasks.g1_wbc.rollout.run_command_rollout",
+            "backend": (
+                "spider.tasks.g1_wbc.spider_task."
+                "G1WbcSamplingTask.replay_qpos_command_sequence"
+            ),
             "saved_command": str(Path(args.saved_command).expanduser().resolve()),
-            "replay_mode": "full_sequence",
-            "num_command_frames": command.num_frames,
+            "replay_mode": "shared_execute_backend",
+            "control_steps": control_steps,
+            "use_saved_qvel": bool(args.replay_use_saved_qvel),
+            "serial_execute_warp_launches": bool(args.serial_execute_warp_launches),
+            "num_command_frames": int(qpos_trajectory.shape[0]),
             "num_replay_steps": total_steps,
         }
     elif args.method == "no_mpc":
@@ -113,23 +126,21 @@ def main() -> None:
             config,
             mode=args.method,
             reward_weights=reward_weights,
+            execute_rollout_config=execute_config,
         )
         total_steps = motion.num_frames - 1
         if args.max_steps is not None:
             total_steps = min(total_steps, int(args.max_steps))
-        receding_result = run_sampling_receding_mpc(
+        mpc_run = run_g1_wbc_sampling_mpc(
             spider_config,
             task,
             total_steps=total_steps,
         )
-        mpc_result = task.build_result(
-            receding_result.controls,
-            receding_result.infos,
-            total_steps=total_steps,
-        )
+        receding_result = mpc_run.receding
+        mpc_result = mpc_run.result
         rollout = mpc_result.rollout
         mpc_payload = {
-            **sampling_mpc_metadata(spider_config),
+            **mpc_run.metadata,
             "reward_weight_source": (
                 str(Path(args.mpc_reward_weights).expanduser().resolve())
                 if args.mpc_reward_weights is not None
@@ -140,6 +151,7 @@ def main() -> None:
             "final_scores_mean": _safe_tensor_stat(mpc_result.scores, "mean"),
             "final_scores_max": _safe_tensor_stat(mpc_result.scores, "max"),
             "num_windows": mpc_result.num_windows,
+            "serial_execute_warp_launches": bool(args.serial_execute_warp_launches),
         }
     metrics = compute_rollout_metrics(motion, rollout)
 
@@ -152,6 +164,7 @@ def main() -> None:
         "num_envs": args.num_envs,
         "max_steps": args.max_steps,
         "ref_offset": args.ref_offset,
+        "serial_warp_launches": bool(args.serial_warp_launches),
         "metrics": metrics,
     }
     if mpc_payload is not None:
@@ -240,6 +253,29 @@ def _parse_args() -> argparse.Namespace:
         default=WbcRolloutConfig.use_cuda_graph,
         help="Capture MuJoCo Warp step/forward/reset in CUDA graphs when available.",
     )
+    parser.add_argument(
+        "--ls-parallel",
+        action=argparse.BooleanOptionalAction,
+        default=WbcRolloutConfig.ls_parallel,
+        help="Use MuJoCo Warp parallel line search in the Newton solver.",
+    )
+    parser.add_argument(
+        "--serial-warp-launches",
+        action="store_true",
+        default=WbcRolloutConfig.serial_warp_launches,
+        help=(
+            "Diagnostic mode: serialize all regular Warp launches for every rollout. "
+            "This is very slow if used during MPC sampling."
+        ),
+    )
+    parser.add_argument(
+        "--serial-execute-warp-launches",
+        action="store_true",
+        help=(
+            "Diagnostic mode: serialize regular Warp launches only for MPC execute "
+            "and chunked replay physical rollouts."
+        ),
+    )
     parser.add_argument("--output-dir", default=None, help="Optional result directory.")
     parser.add_argument(
         "--saved-qpos",
@@ -255,6 +291,29 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Precomputed command NPZ for --method replay_command. "
             "Accepts .npz keys command_qpos_trajectory/refined_qpos/qpos."
+        ),
+    )
+    parser.add_argument(
+        "--replay-control-steps",
+        type=int,
+        default=None,
+        help=(
+            "Execute chunk size for --method replay_command. Defaults to the saved "
+            "MPC control_steps from metrics.json when available."
+        ),
+    )
+    parser.add_argument(
+        "--replay-task-mode",
+        default="g1_wbc_joint",
+        choices=("g1_wbc_ee", "g1_wbc_joint", "g1_wbc_joint_global"),
+        help="Task mode used to instantiate the shared MPC execute adapter.",
+    )
+    parser.add_argument(
+        "--replay-use-saved-qvel",
+        action="store_true",
+        help=(
+            "Diagnostic mode: use command_qvel_trajectory from the saved NPZ. "
+            "Default recomputes chunk-local qvel to match MPC execute."
         ),
     )
     parser.add_argument(
@@ -328,10 +387,7 @@ def _build_sampling_config(args: argparse.Namespace) -> Config:
     last_ctrl_noise_scale = (
         1.0 if args.mpc_last_ctrl_noise_scale is None else float(args.mpc_last_ctrl_noise_scale)
     )
-    return build_sampling_mpc_config(
-        robot_type="g1",
-        embodiment_type="humanoid",
-        simulator="g1_wbc",
+    return build_g1_wbc_sampling_config(
         device=args.device,
         num_samples=int(args.mpc_samples),
         rollout_batch_size=int(args.mpc_rollout_batch_size),
@@ -341,10 +397,6 @@ def _build_sampling_config(args: argparse.Namespace) -> Config:
         knot_count=int(args.mpc_knot_count),
         temperature=float(args.mpc_temperature),
         control_update_mode=args.mpc_control_update_mode,
-        sim_dt=POLICY_DT,
-        nq=QPOS_DIM,
-        nv=QVEL_DIM,
-        nu=QPOS_DIM - 1,
         pos_noise_scale=float(args.mpc_root_pos_sigma),
         rot_noise_scale=float(args.mpc_root_rot_sigma),
         joint_noise_scale=float(args.mpc_joint_sigma),
@@ -442,71 +494,6 @@ def _load_saved_qpos(path: str | None, *, device: str) -> torch.Tensor:
     return torch.tensor(qpos, dtype=torch.float32, device=device)
 
 
-def _load_saved_command_batch(
-    path: str | None,
-    template_motion: G1Motion,
-    config: WbcRolloutConfig,
-    *,
-    device: str,
-) -> G1CommandBatch:
-    if path is None:
-        raise ValueError("--method replay_command requires --saved-command.")
-    command_path = Path(path).expanduser().resolve()
-    with np.load(command_path) as data:
-        full_keys = (
-            "command_joint_pos",
-            "command_joint_vel",
-            "command_body_pos_w",
-            "command_body_quat_w",
-            "command_body_lin_vel_w",
-            "command_body_ang_vel_w",
-            "command_qpos_trajectory",
-            "command_qvel_trajectory",
-        )
-        if all(key in data.files for key in full_keys):
-            return G1CommandBatch(
-                path=template_motion.path,
-                motion_type=template_motion.motion_type,
-                fps=template_motion.fps,
-                joint_pos=_saved_command_tensor(data["command_joint_pos"], device=device),
-                joint_vel=_saved_command_tensor(data["command_joint_vel"], device=device),
-                body_pos_w=_saved_command_tensor(
-                    data["command_body_pos_w"], device=device
-                ),
-                body_quat_w=_saved_command_tensor(
-                    data["command_body_quat_w"], device=device
-                ),
-                body_lin_vel_w=_saved_command_tensor(
-                    data["command_body_lin_vel_w"], device=device
-                ),
-                body_ang_vel_w=_saved_command_tensor(
-                    data["command_body_ang_vel_w"], device=device
-                ),
-                qpos_trajectory=_saved_command_tensor(
-                    data["command_qpos_trajectory"], device=device
-                ),
-                qvel_trajectory=_saved_command_tensor(
-                    data["command_qvel_trajectory"], device=device
-                ),
-            )
-
-    qpos_trajectory, qvel_trajectory = _load_saved_command_trajectory(path, device=device)
-    return command_batch_from_qpos_trajectory(
-        template_motion,
-        qpos_trajectory,
-        config,
-        qvel_trajectory=qvel_trajectory,
-        preserve_template_first=False,
-    )
-
-
-def _saved_command_tensor(value: np.ndarray, *, device: str) -> torch.Tensor:
-    tensor = torch.tensor(value, dtype=torch.float32, device=device)
-    if tensor.ndim >= 2:
-        return tensor.contiguous()
-    raise ValueError(f"Expected saved command tensor to have at least 2 dims, got {value.shape}.")
-
-
 def _load_saved_command_trajectory(
     path: str | None,
     *,
@@ -540,6 +527,24 @@ def _load_saved_command_trajectory(
         else torch.tensor(qvel, dtype=torch.float32, device=device)
     )
     return qpos_tensor, qvel_tensor
+
+
+def _resolve_replay_control_steps(args: argparse.Namespace) -> int:
+    if args.replay_control_steps is not None:
+        return int(args.replay_control_steps)
+    if args.mpc_control_steps is not None:
+        return int(args.mpc_control_steps)
+    if args.saved_command is not None:
+        metrics_path = Path(args.saved_command).expanduser().resolve().parent / "metrics.json"
+        if metrics_path.exists():
+            try:
+                payload = json.loads(metrics_path.read_text())
+                control_steps = payload.get("mpc", {}).get("control_steps")
+                if control_steps is not None:
+                    return int(control_steps)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+    return 20
 
 
 def _cpu_np(value: torch.Tensor) -> np.ndarray:

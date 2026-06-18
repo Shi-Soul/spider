@@ -34,13 +34,12 @@ sys.path.insert(0, str(SPIDER_ROOT))
 
 from spider.tasks.g1_wbc.motion import load_motion
 from spider.tasks.g1_wbc.policy import load_wbc_actor
-from spider.config import build_sampling_mpc_config
-from spider.optimizers.receding import run_sampling_receding_mpc
-from spider.simulators.g1_wbc import (
+from spider.tasks.g1_wbc.spider_task import (
     G1WbcSamplingTask,
+    build_g1_wbc_sampling_config,
     load_reward_weights,
+    run_g1_wbc_sampling_mpc,
 )
-from spider.tasks.g1_wbc.constants import POLICY_DT, QPOS_DIM, QVEL_DIM
 from spider.tasks.g1_wbc.rollout import (
     WbcRolloutConfig,
     load_wbc_model,
@@ -331,10 +330,7 @@ def main():
             if args.mpc_reward_weights is None
             else load_reward_weights(args.mpc_reward_weights, method)
         )
-        spider_config = build_sampling_mpc_config(
-            robot_type="g1",
-            embodiment_type="humanoid",
-            simulator="g1_wbc",
+        spider_config = build_g1_wbc_sampling_config(
             device=args.device,
             num_samples=_required(args.mpc_samples, "--mpc-samples"),
             rollout_batch_size=int(args.mpc_rollout_batch_size),
@@ -347,10 +343,6 @@ def main():
             knot_count=_required(args.mpc_knot_count, "--mpc-knot-count"),
             temperature=_required(args.mpc_temperature, "--mpc-temperature"),
             control_update_mode=args.mpc_control_update_mode,
-            sim_dt=POLICY_DT,
-            nq=QPOS_DIM,
-            nv=QVEL_DIM,
-            nu=QPOS_DIM - 1,
             pos_noise_scale=_required(args.mpc_root_pos_sigma, "--mpc-root-pos-sigma"),
             rot_noise_scale=_required(args.mpc_root_rot_sigma, "--mpc-root-rot-sigma"),
             joint_noise_scale=_required(args.mpc_joint_sigma, "--mpc-joint-sigma"),
@@ -382,16 +374,12 @@ def main():
         total_steps = motion.num_frames - 1
         if args.max_steps is not None:
             total_steps = min(total_steps, int(args.max_steps))
-        receding = run_sampling_receding_mpc(
+        mpc_run = run_g1_wbc_sampling_mpc(
             spider_config,
             task,
             total_steps=total_steps,
         )
-        r = task.build_result(
-            receding.controls,
-            receding.infos,
-            total_steps=total_steps,
-        )
+        r = mpc_run.result
         return r.rollout.qpos[:, 0].cpu().numpy(), method
 
     saved_sims = load_saved_sims(
