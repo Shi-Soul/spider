@@ -495,13 +495,7 @@ class G1WbcMujocoWarpEnv:
                 nconmax=int(config.nconmax_per_env),
                 njmax=int(config.njmax_per_env),
             )
-            self.data_wp_prev = mjwarp.put_data(
-                self.model_cpu,
-                self.data_cpu,
-                nworld=self.num_envs,
-                nconmax=int(config.nconmax_per_env),
-                njmax=int(config.njmax_per_env),
-            )
+            self.data_wp_prev = None
             self.step_graph = None
             self.forward_graph = None
             self.reset_graph = None
@@ -620,17 +614,30 @@ class G1WbcMujocoWarpEnv:
         with wp.ScopedDevice(self.device), serial_warp_launches(
             self.config.serial_warp_launches
         ):
-            _copy_wbc_data_state(self.data_wp, self.data_wp_prev)
+            _copy_wbc_data_state(self.data_wp, self._ensure_data_wp_prev())
         if self.config.sync_after_step:
             wp.synchronize()
 
     def load_state(self) -> None:
+        if self.data_wp_prev is None:
+            raise RuntimeError("G1 WBC MuJoCo Warp state has not been saved.")
         with wp.ScopedDevice(self.device), serial_warp_launches(
             self.config.serial_warp_launches
         ):
             _copy_wbc_data_state(self.data_wp_prev, self.data_wp)
         if self.config.sync_after_step:
             wp.synchronize()
+
+    def _ensure_data_wp_prev(self):
+        if self.data_wp_prev is None:
+            self.data_wp_prev = mjwarp.put_data(
+                self.model_cpu,
+                self.data_cpu,
+                nworld=self.num_envs,
+                nconmax=int(self.config.nconmax_per_env),
+                njmax=int(self.config.njmax_per_env),
+            )
+        return self.data_wp_prev
 
     def _clear_reset_derived_buffers(self) -> None:
         """Clear derived solver/contact buffers before recomputing mj_forward."""
