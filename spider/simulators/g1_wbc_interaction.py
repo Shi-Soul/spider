@@ -17,8 +17,10 @@ from spider.tasks.g1_wbc.rollout import RolloutResult
 from spider.tasks.g1_wbc_interaction.layout import InteractionModelLayout
 from spider.tasks.g1_wbc_interaction.metrics import (
     InteractionScoreWeights,
+    RetargetScoreWeights,
     compute_interaction_rollout_metrics,
     compute_interaction_rollout_scores,
+    compute_retarget_rollout_scores,
 )
 from spider.tasks.g1_wbc_interaction.motion import (
     InteractionMotion,
@@ -54,7 +56,9 @@ class G1WbcInteractionSamplingTask:
         actor: WbcActor,
         rollout_config: InteractionRolloutConfig,
         *,
+        reward_mode: str = "interaction",
         score_weights: InteractionScoreWeights | None = None,
+        retarget_score_weights: RetargetScoreWeights | None = None,
     ) -> None:
         self.device = torch.device(rollout_config.device)
         self.motion = motion.to(self.device)
@@ -63,7 +67,11 @@ class G1WbcInteractionSamplingTask:
         self.layout = self.motion.layout
         self.actor = actor.to(self.device).eval()
         self.rollout_config = rollout_config
+        self.reward_mode = str(reward_mode)
+        if self.reward_mode not in {"interaction", "retarget"}:
+            raise ValueError(f"Unsupported reward_mode {self.reward_mode!r}.")
         self.score_weights = score_weights or InteractionScoreWeights()
+        self.retarget_score_weights = retarget_score_weights or RetargetScoreWeights()
         self.joint_low, self.joint_high = _joint_limits(
             rollout_config.model_path,
             self.device,
@@ -140,12 +148,20 @@ class G1WbcInteractionSamplingTask:
             initial_history_state=self.current_history_state,
             ref_start=start,
         )
-        scores, terms = compute_interaction_rollout_scores(
-            self.motion,
-            rollout,
-            layout=self.layout,
-            weights=self.score_weights,
-        )
+        if self.reward_mode == "retarget":
+            scores, terms = compute_retarget_rollout_scores(
+                self.motion,
+                rollout,
+                layout=self.layout,
+                weights=self.retarget_score_weights,
+            )
+        else:
+            scores, terms = compute_interaction_rollout_scores(
+                self.motion,
+                rollout,
+                layout=self.layout,
+                weights=self.score_weights,
+            )
         self._last_scores = scores.detach().clone()
         terminate = torch.zeros(int(config.num_samples), dtype=torch.bool, device=self.device)
         info = {key: value.detach() for key, value in terms.items()}
@@ -350,4 +366,5 @@ __all__ = [
     "G1WbcInteractionSamplingTask",
     "InteractionRolloutConfig",
     "InteractionScoreWeights",
+    "RetargetScoreWeights",
 ]

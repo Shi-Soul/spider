@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from spider.math import quat_sub
 from spider.tasks.g1_wbc.math_utils import quat_error_magnitude
 from spider.tasks.g1_wbc.metrics import compute_rollout_metrics, compute_rollout_scores
 from spider.tasks.g1_wbc.rollout import RolloutResult
@@ -52,6 +53,18 @@ class InteractionScoreWeights:
     object_vel: float = 0.5
 
 
+@dataclass(frozen=True)
+class RetargetScoreWeights:
+    """MJWP-style full-state retarget tracking weights."""
+
+    base_pos: float = 1.0
+    base_rot: float = 1.0
+    joint: float = 1.0
+    object_pos: float = 1.0
+    object_rot: float = 0.3
+    vel: float = 0.0
+
+
 def compute_interaction_rollout_metrics(
     motion: InteractionMotion,
     rollout: RolloutResult,
@@ -81,6 +94,135 @@ def compute_interaction_rollout_metrics(
     )
     metrics["success"] = success
     return metrics
+
+
+def compute_retarget_rollout_scores(
+    motion: InteractionMotion,
+    rollout: RolloutResult,
+    *,
+    layout: InteractionModelLayout,
+    weights: RetargetScoreWeights = RetargetScoreWeights(),
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Score rollouts with the MJWP humanoid_object qpos/qvel tracking reward."""
+
+    device = rollout.qpos.device
+    ref_indices = rollout.ref_indices.to(device).clamp(0, motion.num_frames - 1)
+    ref_indices = _post_step_ref_indices(
+        ref_indices,
+        rollout.qpos.shape[0],
+        motion.num_frames,
+    )
+    ref_qpos = motion.full_state_qpos().to(device)[ref_indices]
+    ref_qvel = motion.full_state_qvel().to(device)[ref_indices]
+    columns: list[torch.Tensor] = []
+    weights_cols: list[torch.Tensor] = []
+    root_pos_slice = slice(layout.root_qpos_adr, layout.root_qpos_adr + 3)
+    root_quat_slice = slice(layout.root_qpos_adr + 3, layout.root_qpos_adr + 7)
+    columns.append(rollout.qpos[..., root_pos_slice] - ref_qpos[..., root_pos_slice])
+    weights_cols.append(
+        torch.full(
+            columns[-1].shape,
+            float(weights.base_pos),
+            dtype=rollout.qpos.dtype,
+            device=device,
+        )
+    )
+    columns.append(
+        quat_error_vec(
+            rollout.qpos[..., root_quat_slice],
+            ref_qpos[..., root_quat_slice],
+        )
+    )
+    weights_cols.append(
+        torch.full(
+            columns[-1].shape,
+            float(weights.base_rot),
+            dtype=rollout.qpos.dtype,
+            device=device,
+        )
+    )
+    robot_joint_idx = torch.as_tensor(
+        layout.robot_joint_qpos_indices,
+        device=device,
+        dtype=torch.long,
+    )
+    columns.append(
+        rollout.qpos.index_select(-1, robot_joint_idx)
+        - ref_qpos.index_select(-1, robot_joint_idx)
+    )
+    weights_cols.append(
+        torch.full(
+            columns[-1].shape,
+            float(weights.joint),
+            dtype=rollout.qpos.dtype,
+            device=device,
+        )
+    )
+    for obj in layout.objects:
+        if obj.has_freejoint_pose:
+            columns.append(
+                rollout.qpos[..., obj.qpos_slice][..., :3]
+                - ref_qpos[..., obj.qpos_slice][..., :3]
+            )
+            weights_cols.append(
+                torch.full(
+                    columns[-1].shape,
+                    float(weights.object_pos),
+                    dtype=rollout.qpos.dtype,
+                    device=device,
+                )
+            )
+            columns.append(
+                quat_error_vec(
+                    rollout.qpos[..., obj.qpos_slice][..., 3:7],
+                    ref_qpos[..., obj.qpos_slice][..., 3:7],
+                )
+            )
+            weights_cols.append(
+                torch.full(
+                    columns[-1].shape,
+                    float(weights.object_rot),
+                    dtype=rollout.qpos.dtype,
+                    device=device,
+                )
+            )
+        elif obj.qpos_indices:
+            obj_idx = torch.as_tensor(obj.qpos_indices, device=device, dtype=torch.long)
+            columns.append(
+                rollout.qpos.index_select(-1, obj_idx)
+                - ref_qpos.index_select(-1, obj_idx)
+            )
+            weights_cols.append(
+                torch.full(
+                    columns[-1].shape,
+                    float(weights.object_pos),
+                    dtype=rollout.qpos.dtype,
+                    device=device,
+                )
+            )
+    qpos_diff = torch.cat(columns, dim=-1)
+    qpos_weight = torch.cat(weights_cols, dim=-1)
+    qvel_indices = list(layout.robot_qvel_indices)
+    for obj in layout.objects:
+        qvel_indices.extend(obj.qvel_indices)
+    qvel_idx = torch.as_tensor(
+        qvel_indices,
+        device=device,
+        dtype=torch.long,
+    )
+    sim_qvel = rollout.qvel.index_select(-1, qvel_idx)
+    target_qvel = ref_qvel.index_select(-1, qvel_idx)
+    qpos_dist = torch.linalg.norm(qpos_diff * qpos_weight, dim=-1)
+    qvel_dist = torch.linalg.norm(sim_qvel - target_qvel, dim=-1)
+    qpos_dist_score = _per_env_mean(qpos_dist)
+    qvel_dist_score = _per_env_mean(qvel_dist)
+    reward = -(qpos_dist_score + float(weights.vel) * qvel_dist_score)
+    terms = {
+        "retarget_qpos_dist": qpos_dist_score,
+        "retarget_qvel_dist": qvel_dist_score,
+        "retarget_reward": reward,
+    }
+    return reward, terms
 
 
 def compute_interaction_rollout_scores(
@@ -141,6 +283,11 @@ def compute_interaction_rollout_scores(
     terms = {f"robot_{key}": value for key, value in robot_terms.items()}
     terms.update(object_terms)
     return -loss, terms
+
+
+def quat_error_vec(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    shape = q1.shape[:-1]
+    return quat_sub(q1.reshape(-1, 4), q2.reshape(-1, 4)).reshape(shape + (3,))
 
 
 def compute_object_score_terms(
@@ -455,9 +602,11 @@ def _add_auc10_np(achieved: np.ndarray, target: np.ndarray) -> float:
 
 __all__ = [
     "InteractionScoreWeights",
+    "RetargetScoreWeights",
     "compute_interaction_rollout_metrics",
     "compute_interaction_rollout_scores",
     "compute_object_metrics",
     "compute_object_score_terms",
+    "compute_retarget_rollout_scores",
     "compute_retarget_object_metrics",
 ]

@@ -17,6 +17,7 @@ from spider.optimizers.receding import run_sampling_receding_mpc, sampling_mpc_m
 from spider.simulators.g1_wbc_interaction import (
     G1WbcInteractionSamplingTask,
     InteractionRolloutConfig,
+    RetargetScoreWeights,
 )
 from spider.tasks.g1_wbc.constants import ACTION_DIM, POLICY_DT, QPOS_DIM, QVEL_DIM
 from spider.tasks.g1_wbc.policy import load_wbc_actor, resolve_checkpoint_path
@@ -104,7 +105,9 @@ def main() -> None:
             motion,
             actor,
             rollout_config,
+            reward_mode=args.reward_mode,
             score_weights=_score_weights_from_args(args),
+            retarget_score_weights=_retarget_score_weights_from_args(args),
         )
         total_steps = motion.num_frames - 1
         if args.max_steps is not None:
@@ -126,7 +129,9 @@ def main() -> None:
             "final_scores_mean": _safe_tensor_stat(result.scores, "mean"),
             "final_scores_max": _safe_tensor_stat(result.scores, "max"),
             "num_windows": result.num_windows,
+            "reward_mode": args.reward_mode,
             "score_weights": _score_weights_from_args(args).__dict__,
+            "retarget_score_weights": _retarget_score_weights_from_args(args).__dict__,
         }
 
     metrics = compute_interaction_rollout_metrics(motion, rollout, layout=layout)
@@ -344,6 +349,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mpc-root-rot-sigma", type=float, default=None)
     parser.add_argument("--mpc-joint-sigma", type=float, default=None)
     parser.add_argument("--mpc-torch-compile", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--reward-mode",
+        choices=("interaction", "retarget"),
+        default="interaction",
+        help="MPC candidate reward: object-interaction task cost or MJWP retarget qpos/qvel cost.",
+    )
     parser.add_argument("--object-pos-weight", type=float, default=35.0)
     parser.add_argument("--object-rot-weight", type=float, default=4.0)
     parser.add_argument("--object-final-pos-weight", type=float, default=80.0)
@@ -378,6 +389,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--control-delta-weight", type=float, default=0.04)
     parser.add_argument("--object-pos-threshold", type=float, default=0.1)
     parser.add_argument("--object-quat-threshold", type=float, default=0.5)
+    parser.add_argument("--retarget-base-pos-weight", type=float, default=1.0)
+    parser.add_argument("--retarget-base-rot-weight", type=float, default=1.0)
+    parser.add_argument("--retarget-joint-weight", type=float, default=1.0)
+    parser.add_argument("--retarget-object-pos-weight", type=float, default=1.0)
+    parser.add_argument("--retarget-object-rot-weight", type=float, default=0.3)
+    parser.add_argument("--retarget-vel-weight", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
@@ -458,6 +475,17 @@ def _score_weights_from_args(args: argparse.Namespace) -> InteractionScoreWeight
         object_final_pos=float(args.object_final_pos_weight),
         object_final_rot=float(args.object_final_rot_weight),
         object_vel=float(args.object_vel_weight),
+    )
+
+
+def _retarget_score_weights_from_args(args: argparse.Namespace) -> RetargetScoreWeights:
+    return RetargetScoreWeights(
+        base_pos=float(args.retarget_base_pos_weight),
+        base_rot=float(args.retarget_base_rot_weight),
+        joint=float(args.retarget_joint_weight),
+        object_pos=float(args.retarget_object_pos_weight),
+        object_rot=float(args.retarget_object_rot_weight),
+        vel=float(args.retarget_vel_weight),
     )
 
 
