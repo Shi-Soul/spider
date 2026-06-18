@@ -228,4 +228,5 @@ tmp_datasets/
 .claude/
 
 sandbox/
-scripts/
+scripts/*
+!scripts/run_g1_wbc_bench_data_phase1.py
