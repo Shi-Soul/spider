@@ -271,15 +271,27 @@ def main() -> None:
         if args.save_video:
             render_interaction_comparison_video(
                 model_path=args.model_path,
-                rollout_qpos=rollout_qpos_np,
+                subject_qpos=rollout_qpos_np,
                 reference_qpos=rollout_ref_qpos,
-                baseline_qpos=baseline_video_qpos,
-                out_path=output_dir / "visualization_mpc_rl_object.mp4",
+                label="MPC+RL",
+                out_path=output_dir / "visualization_ours_reference.mp4",
                 fps=args.video_fps,
                 width=args.video_width,
                 height=args.video_height,
                 camera=args.video_camera,
             )
+            if baseline_video_qpos is not None:
+                render_interaction_comparison_video(
+                    model_path=args.model_path,
+                    subject_qpos=baseline_video_qpos,
+                    reference_qpos=rollout_ref_qpos,
+                    label="baseline",
+                    out_path=output_dir / "visualization_baseline_reference.mp4",
+                    fps=args.video_fps,
+                    width=args.video_width,
+                    height=args.video_height,
+                    camera=args.video_camera,
+                )
 
 
 def _parse_args() -> argparse.Namespace:

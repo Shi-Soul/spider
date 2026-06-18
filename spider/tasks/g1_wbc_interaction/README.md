@@ -52,4 +52,5 @@ Outputs:
 - `trajectory_mpc_rl_object.npz`: same trajectory under an explicit MPC+RL name.
 - `rollout.npz`: full native 50 Hz debug rollout tensors.
 - `mpc_command.npz`: optimized robot command/control trace.
-- `visualization_mpc_rl_object.mp4`: solid MPC+RL replay with cyan reference ghost and orange baseline ghost when a baseline is supplied.
+- `visualization_ours_reference.mp4`: solid MPC+RL replay with cyan reference ghost.
+- `visualization_baseline_reference.mp4`: solid baseline replay with cyan reference ghost when a baseline is supplied.

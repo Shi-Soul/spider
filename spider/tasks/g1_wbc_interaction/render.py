@@ -13,36 +13,30 @@ from spider.tasks.g1_wbc_interaction.layout import load_interaction_model
 
 
 CYAN_RGBA = np.array([0.0, 0.85, 1.0, 0.33], dtype=np.float32)
-BASELINE_RGBA = np.array([1.0, 0.58, 0.08, 0.30], dtype=np.float32)
 
 
 def render_interaction_comparison_video(
     *,
     model_path: str | Path,
-    rollout_qpos: np.ndarray,
+    subject_qpos: np.ndarray,
     reference_qpos: np.ndarray,
     out_path: str | Path,
-    baseline_qpos: np.ndarray | None = None,
+    label: str,
     fps: int = 30,
     width: int = 960,
     height: int = 720,
     camera: str = "auto",
 ) -> None:
-    """Render rollout with reference and optional baseline ghost overlays."""
+    """Render one solid trajectory with a cyan reference ghost overlay."""
 
     model = load_interaction_model(model_path)
-    rollout_qpos = _flat_qpos(rollout_qpos, model.nq)
+    subject_qpos = _flat_qpos(subject_qpos, model.nq)
     reference_qpos = _flat_qpos(reference_qpos, model.nq)
-    baseline = None if baseline_qpos is None else _flat_qpos(baseline_qpos, model.nq)
-    n = min(rollout_qpos.shape[0], reference_qpos.shape[0])
-    if baseline is not None:
-        n = min(n, baseline.shape[0])
+    n = min(subject_qpos.shape[0], reference_qpos.shape[0])
     if n <= 0:
         raise ValueError("Need at least one frame to render a video.")
-    rollout_qpos = rollout_qpos[:n]
+    subject_qpos = subject_qpos[:n]
     reference_qpos = reference_qpos[:n]
-    if baseline is not None:
-        baseline = baseline[:n]
 
     out_path = Path(out_path).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -50,14 +44,13 @@ def render_interaction_comparison_video(
     renderer = mujoco.Renderer(model, height=int(height), width=int(width))
     data = mujoco.MjData(model)
     ref_data = mujoco.MjData(model)
-    baseline_data = mujoco.MjData(model) if baseline is not None else None
     original_rgba = model.geom_rgba.copy()
     ghost_mask = _ghost_geom_mask(model)
-    cameras = _make_follow_cameras(rollout_qpos, reference_qpos, baseline)
+    cameras = _make_follow_cameras(subject_qpos, reference_qpos)
     frames: list[np.ndarray] = []
     try:
         for frame_idx in range(n):
-            data.qpos[:] = rollout_qpos[frame_idx]
+            data.qpos[:] = subject_qpos[frame_idx]
             ref_data.qpos[:] = reference_qpos[frame_idx]
             mujoco.mj_forward(model, data)
             mujoco.mj_forward(model, ref_data)
@@ -71,17 +64,8 @@ def render_interaction_comparison_video(
             ref_frame = renderer.render().copy()
             frame = cv2.addWeighted(frame, 0.68, ref_frame, 0.32, 0.0)
 
-            if baseline is not None and baseline_data is not None:
-                baseline_data.qpos[:] = baseline[frame_idx]
-                mujoco.mj_forward(model, baseline_data)
-                model.geom_rgba[:] = original_rgba
-                model.geom_rgba[ghost_mask, :] = BASELINE_RGBA
-                renderer.update_scene(baseline_data, camera=cam)
-                baseline_frame = renderer.render().copy()
-                frame = cv2.addWeighted(frame, 0.78, baseline_frame, 0.22, 0.0)
-
             model.geom_rgba[:] = original_rgba
-            frames.append(_label(frame, "cyan: reference  orange: baseline  solid: MPC+RL"))
+            frames.append(_label(frame, f"cyan: reference  solid: {label}"))
     finally:
         model.geom_rgba[:] = original_rgba
         renderer.close()
@@ -109,13 +93,10 @@ def _ghost_geom_mask(model: mujoco.MjModel) -> np.ndarray:
 
 
 def _make_follow_cameras(
-    rollout_qpos: np.ndarray,
+    subject_qpos: np.ndarray,
     reference_qpos: np.ndarray,
-    baseline_qpos: np.ndarray | None,
 ) -> list[mujoco.MjvCamera]:
-    columns = [rollout_qpos[:, :3], reference_qpos[:, :3]]
-    if baseline_qpos is not None:
-        columns.append(baseline_qpos[:, :3])
+    columns = [subject_qpos[:, :3], reference_qpos[:, :3]]
     roots = np.stack(columns, axis=0)
     cameras = []
     for frame_idx in range(roots.shape[1]):
