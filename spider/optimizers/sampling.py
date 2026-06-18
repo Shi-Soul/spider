@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from spider.config import Config
+from spider.interp import interp
 
 try:
     import loguru
@@ -73,8 +74,11 @@ def _sample_ctrls_impl(
         * config.noise_scale
         * global_noise_scale
     )
-    # Interpolate endpoint knots to the current dense horizon.
-    delta_ctrl_samples = _interpolate_knot_samples(knot_samples, ctrls.shape[0])
+    if int(getattr(config, "num_knot_points", 0)) > 0:
+        # Explicit endpoint knots are opt-in; legacy SPIDER configs use knot_steps.
+        delta_ctrl_samples = _interpolate_knot_samples(knot_samples, ctrls.shape[0])
+    else:
+        delta_ctrl_samples = interp(knot_samples, config.knot_steps)
     # add to ctrls
     ctrls_samples = ctrls + delta_ctrl_samples
     return ctrls_samples
@@ -265,10 +269,7 @@ def _compute_weights_impl(
     # Initialize weights as zeros and compute softmax only for top samples
     weights = torch.zeros_like(rews)
     top_rews = rews[top_indices]
-    top_rews_normalized = (
-        (top_rews - top_rews.mean())
-        / (top_rews.std(unbiased=False) + 1e-2)
-    )
+    top_rews_normalized = (top_rews - top_rews.mean()) / (top_rews.std() + 1e-2)
     top_weights = F.softmax(top_rews_normalized / temperature, dim=0)
     weights[top_indices] = top_weights
 

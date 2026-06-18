@@ -71,6 +71,7 @@ class Config:
     horizon: float = 1.6  # planning horizon
     knot_dt: float = 0.4  # knot point spacing
     num_knot_points: int = 0  # explicit sampled-MPC endpoint knots; 0 uses knot_dt
+    noise_component_layout: str = "legacy"  # "legacy" | "humanoid_root_joint"
     max_sim_steps: int = -1  # maximum simulation steps (-1 for unlimited)
     # Simulation constraints
     nconmax_per_env: int = 100  # max contacts per environment
@@ -358,31 +359,24 @@ def get_noise_scale(config: Config) -> torch.Tensor:
     Returns:
         Noise scale, shape (num_samples, num_knot_points, nu)
     """
-    num_samples = int(config.num_samples)
-    if num_samples < 1:
-        raise ValueError(f"num_samples must be positive, got {config.num_samples}.")
-    exploit_ratio = float(config.exploit_ratio)
-    if not 0.0 <= exploit_ratio <= 1.0:
-        raise ValueError(f"exploit_ratio must be in [0, 1], got {config.exploit_ratio}.")
     num_knot_points = int(config.num_knot_points)
     if num_knot_points > 0:
         if num_knot_points < 2:
             raise ValueError(
                 f"num_knot_points must be at least 2 when set, got {num_knot_points}."
             )
-        num_knot_intervals = num_knot_points - 1
     else:
-        num_knot_intervals = max(1, int(round(config.horizon / config.knot_dt)))
+        num_knot_points = int(round(config.horizon / config.knot_dt))
     noise_profile = torch.logspace(
         start=torch.log10(torch.tensor(config.first_ctrl_noise_scale)),
         end=torch.log10(torch.tensor(config.last_ctrl_noise_scale)),
-        steps=num_knot_intervals + 1,
+        steps=num_knot_points,
         device=config.device,
         base=10,
     )
     noise_scale = noise_profile[None, :, None]  # Shape: (1, num_knot_points, 1)
     noise_scale = noise_scale.repeat(1, 1, config.nu)
-    if config.embodiment_type == "humanoid":
+    if config.noise_component_layout == "humanoid_root_joint":
         noise_scale[:, :, :3] *= config.pos_noise_scale
         noise_scale[:, :, 3:6] *= config.rot_noise_scale
         noise_scale[:, :, 6:] *= config.joint_noise_scale
@@ -407,13 +401,12 @@ def get_noise_scale(config: Config) -> torch.Tensor:
         )
         noise_scale[:, :, object_ids] *= 0.0
     # repeat to match num_samples; same samples used across DR groups
-    noise_scale = noise_scale.repeat(num_samples, 1, 1)
+    noise_scale = noise_scale.repeat(config.num_samples, 1, 1)
     # set first sample to 0
     noise_scale[0] *= 0.0
     # set last few samples to exploit_noise_scale
-    num_exploit_samples = int(num_samples * exploit_ratio)
-    if num_exploit_samples > 0:
-        noise_scale[-num_exploit_samples:] *= config.exploit_noise_scale
+    num_exploit_samples = int(config.num_samples * config.exploit_ratio)
+    noise_scale[-num_exploit_samples:] *= config.exploit_noise_scale
     return noise_scale
 
 
@@ -502,6 +495,9 @@ def build_sampling_mpc_config(
         knot_dt=max(1, int(round(horizon_steps / max(knot_count - 1, 1))))
         * float(sim_dt),
         num_knot_points=knot_count,
+        noise_component_layout=(
+            "humanoid_root_joint" if embodiment_type == "humanoid" else "legacy"
+        ),
         num_samples=int(num_samples),
         rollout_batch_size=int(rollout_batch_size),
         max_num_iterations=int(max_num_iterations),
