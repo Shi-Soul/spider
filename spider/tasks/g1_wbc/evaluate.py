@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from spider.tasks.g1_wbc.metrics import compute_rollout_metrics
+from spider.tasks.g1_wbc.motion import load_motion, validate_motion_dims
 from spider.tasks.g1_wbc.mpc import (
     REWARD_WEIGHT_PRESETS,
     G1WbcMpcConfig,
@@ -17,10 +18,13 @@ from spider.tasks.g1_wbc.mpc import (
     mpc_config_from_preset,
     optimize_mpc_command,
 )
-from spider.tasks.g1_wbc.motion import load_motion, validate_motion_dims
 from spider.tasks.g1_wbc.policy import load_wbc_actor, resolve_checkpoint_path
-from spider.tasks.g1_wbc.rollout import RolloutResult, WbcRolloutConfig, run_no_mpc_rollout
-from spider.tasks.g1_wbc.rollout import run_static_qpos_rollout
+from spider.tasks.g1_wbc.rollout import (
+    RolloutResult,
+    WbcRolloutConfig,
+    run_no_mpc_rollout,
+    run_static_qpos_rollout,
+)
 
 
 def main() -> None:
@@ -72,6 +76,9 @@ def main() -> None:
             "control_steps": mpc_config.control_steps,
             "sampling_mode": mpc_config.sampling_mode,
             "knot_count": mpc_config.knot_count,
+            "use_warm_start": mpc_config.use_warm_start,
+            "warm_start_source": mpc_config.warm_start_source,
+            "warm_start_decay": mpc_config.warm_start_decay,
             "elite_frac": mpc_config.elite_frac,
             "temperature": mpc_config.temperature,
             "root_pos_sigma": mpc_config.root_pos_sigma,
@@ -245,6 +252,24 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mpc-sigma-decay", type=float, default=None)
     parser.add_argument("--mpc-smooth-passes", type=int, default=None)
     parser.add_argument(
+        "--mpc-warm-start",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Initialize each MPC window from the shifted previous window delta.",
+    )
+    parser.add_argument(
+        "--mpc-warm-start-source",
+        choices=("best", "mean"),
+        default=None,
+        help="Previous-window delta used for MPC warm start.",
+    )
+    parser.add_argument(
+        "--mpc-warm-start-decay",
+        type=float,
+        default=None,
+        help="Scale applied to the shifted warm-start delta.",
+    )
+    parser.add_argument(
         "--mpc-command-reg-weight",
         type=float,
         default=None,
@@ -324,6 +349,9 @@ def _build_mpc_config(args: argparse.Namespace) -> G1WbcMpcConfig:
         "joint_sigma": args.mpc_joint_sigma,
         "sigma_decay": args.mpc_sigma_decay,
         "smooth_passes": args.mpc_smooth_passes,
+        "use_warm_start": args.mpc_warm_start,
+        "warm_start_source": args.mpc_warm_start_source,
+        "warm_start_decay": args.mpc_warm_start_decay,
         "command_reg_weight": args.mpc_command_reg_weight,
         "command_smooth_weight": args.mpc_command_smooth_weight,
         "acceptance_gate": args.mpc_acceptance_gate,

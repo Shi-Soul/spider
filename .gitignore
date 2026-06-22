@@ -230,3 +230,6 @@ tmp_datasets/
 sandbox/
 scripts/*
 !scripts/run_g1_wbc_bench_data_phase1.py
+!scripts/run_g1_wbc_low_sample_sweep.py
+!scripts/profile_g1_wbc_mpc_phases.py
+!scripts/analyze_g1_wbc_sweep.py

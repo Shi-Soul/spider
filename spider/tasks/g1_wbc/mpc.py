@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
@@ -37,6 +38,7 @@ from spider.tasks.g1_wbc.rollout import (
 MpcMode = Literal["g1_wbc_ee", "g1_wbc_joint", "g1_wbc_joint_global"]
 MpcPreset = Literal["aggressive", "conservative", "explore", "rootrot", "wide"]
 MpcSamplingMode = Literal["full", "knot"]
+MpcWarmStartSource = Literal["best", "mean"]
 
 
 REWARD_WEIGHT_PRESETS: dict[MpcMode, dict[str, float]] = {
@@ -136,6 +138,9 @@ class G1WbcMpcConfig:
     acceptance_gate: bool = True
     seed: int | None = 0
     freeze_first_frame: bool = True
+    use_warm_start: bool = False
+    warm_start_source: MpcWarmStartSource = "best"
+    warm_start_decay: float = 1.0
 
 
 @dataclass
@@ -183,6 +188,7 @@ class G1WbcMpcResult:
 class _MpcWindowOptimizeResult:
     best_qpos: torch.Tensor
     best_delta: torch.Tensor
+    mean_delta: torch.Tensor
     scores: torch.Tensor
     history: list[MpcIterationInfo]
     best_is_template: bool
@@ -319,6 +325,12 @@ def optimize_mpc_command(
         )
     if mpc_config.knot_count < 2:
         raise ValueError("MPC knot_count must be at least 2.")
+    if mpc_config.warm_start_source not in ("best", "mean"):
+        raise ValueError(
+            f"Unsupported MPC warm_start_source: {mpc_config.warm_start_source!r}."
+        )
+    if not math.isfinite(float(mpc_config.warm_start_decay)):
+        raise ValueError("MPC warm_start_decay must be finite.")
 
     device = torch.device(rollout_config.device)
     motion = motion.to(device)
@@ -362,6 +374,8 @@ def optimize_mpc_command(
     sim_step = 0
     window_index = 0
     accepted_windows = 0
+    warm_start_delta: torch.Tensor | None = None
+    warm_start_execute_steps = 0
 
     while sim_step < total_steps:
         window_horizon = min(
@@ -383,6 +397,8 @@ def optimize_mpc_command(
             initial_history_state=current_history_state,
             joint_low=joint_low,
             joint_high=joint_high,
+            warm_start_delta=warm_start_delta if mpc_config.use_warm_start else None,
+            warm_start_execute_steps=warm_start_execute_steps,
             generator=generator,
             window_index=window_index,
         )
@@ -476,6 +492,13 @@ def optimize_mpc_command(
         )
         current_history_state = window_rollout.final_history_state
         accepted_windows += int(window_result.best_score >= window_result.zero_delta_score)
+        if mpc_config.use_warm_start:
+            warm_start_delta = (
+                window_result.mean_delta
+                if mpc_config.warm_start_source == "mean"
+                else window_result.best_delta
+            ).detach().clone()
+            warm_start_execute_steps = execute_steps
         sim_step = end
         window_index += 1
 
@@ -565,16 +588,25 @@ def _optimize_mpc_window(
     initial_history_state: dict | None,
     joint_low: torch.Tensor,
     joint_high: torch.Tensor,
-    generator: torch.Generator | None,
-    window_index: int,
+    warm_start_delta: torch.Tensor | None = None,
+    warm_start_execute_steps: int = 0,
+    generator: torch.Generator | None = None,
+    window_index: int = 0,
 ) -> _MpcWindowOptimizeResult:
     device = torch.device(rollout_config.device)
     window_motion = _slice_motion(motion, start, horizon)
     base_qpos = window_motion.qpos()[:horizon].contiguous()
     sample_parameter_steps = _sample_parameter_steps(horizon, mpc_config)
-    mean_delta = torch.zeros(
-        sample_parameter_steps, QPOS_DIM - 1, dtype=torch.float32, device=device
+    mean_delta = _warm_start_mean_delta(
+        warm_start_delta,
+        execute_steps=warm_start_execute_steps,
+        horizon=horizon,
+        config=mpc_config,
     )
+    if mean_delta is None:
+        mean_delta = torch.zeros(
+            sample_parameter_steps, QPOS_DIM - 1, dtype=torch.float32, device=device
+        )
     sigma = _initial_sigma(sample_parameter_steps, device, mpc_config)
     min_sigma = _min_sigma(sample_parameter_steps, device, mpc_config)
     guided_horizon_delta = _guided_delta_from_no_mpc(
@@ -663,7 +695,7 @@ def _optimize_mpc_window(
         if scores[iteration_best] > best_score:
             best_score = scores[iteration_best].detach().clone()
             best_qpos = candidates_qpos[:, iteration_best].detach().clone()
-            best_delta = candidates_delta[:, iteration_best]
+            best_delta = candidates_delta[:, iteration_best].detach().clone()
             best_is_template = bool(best_delta.abs().max().detach().cpu().item() < 1.0e-8)
 
         elite_count = max(1, int(round(mpc_config.num_samples * mpc_config.elite_frac)))
@@ -729,9 +761,15 @@ def _optimize_mpc_window(
                 ),
             )
         )
+    mean_delta_horizon = _sampling_parameters_to_horizon_delta(
+        mean_delta,
+        horizon,
+        mpc_config,
+    )
     return _MpcWindowOptimizeResult(
         best_qpos=best_qpos,
-        best_delta=best_delta,
+        best_delta=best_delta.detach().clone(),
+        mean_delta=mean_delta_horizon.detach().clone(),
         scores=final_scores,
         history=history,
         best_is_template=best_is_template,
@@ -792,6 +830,32 @@ def _sample_parameter_steps(horizon: int, config: G1WbcMpcConfig) -> int:
     return max(2, min(int(config.knot_count), int(horizon)))
 
 
+def _warm_start_mean_delta(
+    previous_delta: torch.Tensor | None,
+    *,
+    execute_steps: int,
+    horizon: int,
+    config: G1WbcMpcConfig,
+) -> torch.Tensor | None:
+    if previous_delta is None:
+        return None
+    if previous_delta.ndim != 2 or previous_delta.shape[1] != QPOS_DIM - 1:
+        raise ValueError(
+            "MPC warm start delta must have shape "
+            f"(steps, {QPOS_DIM - 1}), got {tuple(previous_delta.shape)}."
+        )
+
+    shifted = previous_delta[max(0, int(execute_steps)) :]
+    warm_start = previous_delta.new_zeros((int(horizon), previous_delta.shape[1]))
+    copy_steps = min(int(horizon), shifted.shape[0])
+    if copy_steps > 0:
+        warm_start[:copy_steps] = shifted[:copy_steps]
+    warm_start = warm_start * float(config.warm_start_decay)
+    if config.freeze_first_frame:
+        warm_start[0] = 0.0
+    return _delta_to_sampling_parameters(warm_start, horizon, config)
+
+
 def _sample_delta(
     mean_delta: torch.Tensor,
     sigma: torch.Tensor,
@@ -837,6 +901,19 @@ def _delta_to_sampling_parameters(
     knot_count = _sample_parameter_steps(horizon, config)
     idx = _knot_indices(horizon, knot_count, delta.device)
     return delta.index_select(0, idx)
+
+
+def _sampling_parameters_to_horizon_delta(
+    delta: torch.Tensor,
+    horizon: int,
+    config: G1WbcMpcConfig,
+) -> torch.Tensor:
+    if delta.ndim != 2:
+        raise ValueError(f"Expected 2D sampling delta, got {tuple(delta.shape)}.")
+    if config.sampling_mode == "full" or delta.shape[0] == horizon:
+        return delta
+    expanded = _expand_delta_to_horizon(delta[:, None, :], horizon, config)
+    return expanded[:, 0, :]
 
 
 def _expand_delta_to_horizon(
