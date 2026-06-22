@@ -173,3 +173,56 @@ main remaining issue is quality under low sample count, especially:
 
 Future reports should always include the full `metrics.json`, plus the primary
 metrics table above for quick comparison.
+
+## 2026-06-22 Local Upper-Bound Stage
+
+Goal: keep the current `best_s128` rollout budget fixed
+(`s128/i2/h40/c20/k8`, seed 0, 800 steps) and test whether stronger
+local/posture rewards can reveal a useful local frontier without giving up MPC
+acceptance, full-run coverage, or same-machine runtime.
+
+Runner/artifacts:
+
+- Design: `docs/superpowers/specs/2026-06-22-g1-wbc-local-upper-bound-design.md`
+- Plan: `docs/superpowers/plans/2026-06-22-g1-wbc-local-upper-bound-plan.md`
+- GPU rollout root: `/tmp/g1_wbc_local_upper_bound_gpu_20260622`
+- Frontier summary:
+  `/tmp/g1_wbc_local_upper_bound_gpu_20260622/frontier_summary.csv`
+
+Screening rules:
+
+- Hard constraints: MPC accepted, no baseline fallback, 40 accepted windows,
+  800 rollout steps, and runtime <= 1.10x the same-machine control candidate.
+- Relaxed exploration limits: score >= historical `best_s128` score - 0.25 and
+  max(root/body-global/ee-global ratio) <= 1.35x.
+- Frontier classes: `local_frontier` requires at least two local metrics improved
+  by 5%, or all three improved by 3%; `near_frontier` requires at least two local
+  metrics improved by 3%. Smooth/contact are recorded as diagnostics, not blockers
+  in this upper-bound stage.
+
+Top GPU rollout results on `jump`:
+
+| rank | candidate | class | local 3% | local 5% | local composite | score delta | max global ratio | contact delta | control delta reg. | joint acc reg. |
+|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | `jg_s128_L142_smooth005` | `local_frontier` | 3 | 3 | 0.0767 | +0.0623 | 0.8723 | +0.00375 | -0.0468 | -0.0194 |
+| 2 | `jg_s128_L148_posture` | `local_frontier` | 3 | 3 | 0.0665 | +0.1351 | 0.8420 | -0.00813 | -0.0603 | +0.00322 |
+| 3 | `jg_s128_L145_smooth005` | `local_frontier` | 3 | 1 | 0.0407 | +0.0885 | 0.9730 | -0.0175 | +0.0188 | +0.0202 |
+| 4 | `jg_s128_L155_posture` | `near_frontier` | 2 | 0 | 0.0311 | +0.1540 | 0.8493 | -0.0206 | -0.0587 | -0.00731 |
+| 5 | `jg_s128_L148_smooth005` | `near_frontier` | 2 | 0 | 0.0304 | -0.0748 | 1.0618 | +0.0181 | +0.00020 | +0.0117 |
+
+All 12 candidates completed with `status=ok`, `num_steps=800`,
+`mpc_accepted=true`, `accepted_windows=40`, and
+`mpc_used_baseline_fallback=false`. Candidate durations were 115.4-124.4 s, so
+the upper-bound sweep stayed within the intended inference-time envelope.
+
+Interpretation:
+
+- The stage did find a local/posture frontier without increasing the rollout
+  budget.
+- `jg_s128_L148_posture` is the best clean local-reward anchor: it improves all
+  three local metrics by at least 5%, improves score/global/contact, and only has
+  a small joint-acc regression.
+- `jg_s128_L142_smooth005` has the strongest local composite improvement and
+  improves smoothness, but slightly worsens contact.
+- `jg_s128_L145_smooth005` is more conservative and improves contact, but gives
+  less local gain and slightly worsens smoothness.
