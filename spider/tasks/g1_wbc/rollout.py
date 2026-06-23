@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -41,6 +42,58 @@ except RuntimeError:
     pass
 
 
+@contextmanager
+def serial_warp_launches(enabled: bool):
+    """Serialize Warp kernel launches for deterministic single-env diagnostics."""
+
+    if not enabled:
+        yield
+        return
+
+    original_launch = wp.launch
+
+    def launch(kernel, *args, **kwargs):
+        kwargs.setdefault("max_blocks", 1)
+        kwargs.setdefault("block_dim", 1)
+        return original_launch(kernel, *args, **kwargs)
+
+    wp.launch = launch
+    try:
+        yield
+    finally:
+        wp.launch = original_launch
+
+
+@wp.kernel
+def _clear_float_1d(values: wp.array[float]) -> None:
+    idx = wp.tid()
+    values[idx] = 0.0
+
+
+@wp.kernel
+def _clear_float_2d(values: wp.array2d[float]) -> None:
+    row, col = wp.tid()
+    values[row, col] = 0.0
+
+
+@wp.kernel
+def _fill_int_1d(values: wp.array[int], fill_value: int) -> None:
+    idx = wp.tid()
+    values[idx] = fill_value
+
+
+@wp.kernel
+def _fill_int_2d(values: wp.array2d[int], fill_value: int) -> None:
+    row, col = wp.tid()
+    values[row, col] = fill_value
+
+
+@wp.kernel
+def _fill_vec2i_1d(values: wp.array[wp.vec2i], x: int, y: int) -> None:
+    idx = wp.tid()
+    values[idx] = wp.vec2i(x, y)
+
+
 @dataclass
 class WbcRolloutConfig:
     """Configuration for batched G1 WBC rollouts."""
@@ -55,6 +108,9 @@ class WbcRolloutConfig:
     sync_after_step: bool = True
     forward_after_step: bool = True
     use_cuda_graph: bool = True
+    ls_parallel: bool = True
+    serial_warp_launches: bool = False
+    clear_reset_derived_buffers: bool = True
 
 
 @dataclass
@@ -390,6 +446,8 @@ class G1WbcMujocoWarpEnv:
     """Minimal standalone batched G1 simulator for WBC policy rollout."""
 
     def __init__(self, config: WbcRolloutConfig):
+        if config.serial_warp_launches and config.use_cuda_graph:
+            config = replace(config, use_cuda_graph=False)
         self.config = config
         self.device = str(config.device)
         self.torch_device = torch.device(config.device)
@@ -420,9 +478,15 @@ class G1WbcMujocoWarpEnv:
         )
 
         wp.set_device(self.device)
-        with wp.ScopedDevice(self.device):
+        with wp.ScopedDevice(self.device), serial_warp_launches(
+            self.config.serial_warp_launches
+        ):
             self.model_wp = mjwarp.put_model(self.model_cpu)
-            self.model_wp.opt.ls_parallel = True
+            self.model_wp.opt.ls_parallel = bool(config.ls_parallel)
+            if self.config.serial_warp_launches:
+                self.model_wp.opt.ls_parallel = False
+                if hasattr(self.model_wp.opt, "graph_conditional"):
+                    self.model_wp.opt.graph_conditional = False
             self.model_wp.opt.contact_sensor_maxmatch = 64
             self.data_wp = mjwarp.put_data(
                 self.model_cpu,
@@ -431,6 +495,7 @@ class G1WbcMujocoWarpEnv:
                 nconmax=int(config.nconmax_per_env),
                 njmax=int(config.njmax_per_env),
             )
+            self.data_wp_prev = None
             self.step_graph = None
             self.forward_graph = None
             self.reset_graph = None
@@ -518,7 +583,11 @@ class G1WbcMujocoWarpEnv:
         )
         ctrl = self._joint_order_to_model_ctrl(ctrl)
         zeros_time = torch.zeros(self.num_envs, dtype=torch.float32, device=self.torch_device)
-        with wp.ScopedDevice(self.device):
+        if self.config.serial_warp_launches and self.torch_device.type == "cuda":
+            torch.cuda.synchronize(self.torch_device)
+        with wp.ScopedDevice(self.device), serial_warp_launches(
+            self.config.serial_warp_launches
+        ):
             self._reset_mask.fill_(True)
             if self.reset_graph is not None:
                 wp.capture_launch(self.reset_graph)
@@ -532,12 +601,104 @@ class G1WbcMujocoWarpEnv:
             wp.copy(self.data_wp.qvel, wp.from_torch(qvel.contiguous()))
             wp.copy(self.data_wp.ctrl, wp.from_torch(ctrl.contiguous()))
             wp.copy(self.data_wp.time, wp.from_torch(zeros_time.contiguous()))
+            if self.config.clear_reset_derived_buffers:
+                self._clear_reset_derived_buffers()
             if self.forward_graph is not None:
                 wp.capture_launch(self.forward_graph)
             else:
                 mjwarp.forward(self.model_wp, self.data_wp)
         if self.config.sync_after_step:
             wp.synchronize()
+
+    def save_state(self) -> None:
+        with wp.ScopedDevice(self.device), serial_warp_launches(
+            self.config.serial_warp_launches
+        ):
+            _copy_wbc_data_state(self.data_wp, self._ensure_data_wp_prev())
+        if self.config.sync_after_step:
+            wp.synchronize()
+
+    def load_state(self) -> None:
+        if self.data_wp_prev is None:
+            raise RuntimeError("G1 WBC MuJoCo Warp state has not been saved.")
+        with wp.ScopedDevice(self.device), serial_warp_launches(
+            self.config.serial_warp_launches
+        ):
+            _copy_wbc_data_state(self.data_wp_prev, self.data_wp)
+        if self.config.sync_after_step:
+            wp.synchronize()
+
+    def _ensure_data_wp_prev(self):
+        if self.data_wp_prev is None:
+            self.data_wp_prev = mjwarp.put_data(
+                self.model_cpu,
+                self.data_cpu,
+                nworld=self.num_envs,
+                nconmax=int(self.config.nconmax_per_env),
+                njmax=int(self.config.njmax_per_env),
+            )
+        return self.data_wp_prev
+
+    def _clear_reset_derived_buffers(self) -> None:
+        """Clear derived solver/contact buffers before recomputing mj_forward."""
+
+        def launch(kernel, dim, inputs) -> None:
+            if isinstance(dim, int):
+                if dim <= 0:
+                    return
+            elif any(int(value) <= 0 for value in dim):
+                return
+            wp.launch(kernel, dim=dim, inputs=inputs)
+
+        # reset_data clears qpos/qvel/qacc/qacc_warmstart but leaves several
+        # derived solver/contact arrays as-is. Clear them before mj_forward so
+        # reset is independent of the previous rollout's constraint solution.
+        for field in (
+            "qacc_smooth",
+            "qfrc_constraint",
+            "qfrc_smooth",
+            "qfrc_actuator",
+        ):
+            if hasattr(self.data_wp, field):
+                array = getattr(self.data_wp, field)
+                launch(_clear_float_2d, array.shape, [array])
+
+        efc = self.data_wp.efc
+        for field in (
+            "pos",
+            "margin",
+            "D",
+            "vel",
+            "aref",
+            "frictionloss",
+            "force",
+            "Ma",
+        ):
+            if hasattr(efc, field):
+                array = getattr(efc, field)
+                launch(_clear_float_2d, array.shape, [array])
+        for field in ("type", "id", "state"):
+            if hasattr(efc, field):
+                array = getattr(efc, field)
+                launch(_fill_int_2d, array.shape, [array, 0])
+
+        contact = self.data_wp.contact
+        for field in ("dist", "includemargin"):
+            if hasattr(contact, field):
+                array = getattr(contact, field)
+                launch(_clear_float_1d, array.shape[0], [array])
+        for field in ("geom", "flex", "vert"):
+            if hasattr(contact, field):
+                array = getattr(contact, field)
+                launch(_fill_vec2i_1d, array.shape[0], [array, -1, -1])
+        if hasattr(contact, "efc_address"):
+            launch(_fill_int_2d, contact.efc_address.shape, [contact.efc_address, -1])
+        for field in ("worldid", "dim", "type", "geomcollisionid"):
+            if hasattr(contact, field):
+                array = getattr(contact, field)
+                launch(_fill_int_1d, array.shape[0], [array, 0])
+        if hasattr(self.data_wp, "nacon"):
+            launch(_fill_int_1d, self.data_wp.nacon.shape[0], [self.data_wp.nacon, 0])
 
     def _batch_state(self, value: torch.Tensor, dim: int) -> torch.Tensor:
         value = value.to(self.torch_device, dtype=torch.float32)
@@ -556,7 +717,11 @@ class G1WbcMujocoWarpEnv:
         if ctrl.shape != (self.num_envs, ACTION_DIM):
             raise ValueError(f"Expected ctrl {(self.num_envs, ACTION_DIM)}, got {ctrl.shape}")
         model_ctrl = self._joint_order_to_model_ctrl(ctrl)
-        with wp.ScopedDevice(self.device):
+        if self.config.serial_warp_launches and self.torch_device.type == "cuda":
+            torch.cuda.synchronize(self.torch_device)
+        with wp.ScopedDevice(self.device), serial_warp_launches(
+            self.config.serial_warp_launches
+        ):
             wp.copy(self.data_wp.ctrl, wp.from_torch(model_ctrl.contiguous()))
             for _ in range(DECIMATION):
                 if self.step_graph is not None:
@@ -638,9 +803,16 @@ class G1WbcMujocoWarpEnv:
         includemargin = wp.to_torch(contact.includemargin).to(self.torch_device)
         address = wp.to_torch(contact.efc_address).to(self.torch_device).long()[:, 0]
         efc_force = wp.to_torch(self.data_wp.efc.force).to(self.torch_device)
+        nacon = wp.to_torch(self.data_wp.nacon).to(self.torch_device).long()[0]
+        contact_ids = torch.arange(
+            worldid.shape[0],
+            dtype=torch.long,
+            device=self.torch_device,
+        )
 
         active_indicator = (
-            (worldid >= 0)
+            (contact_ids < nacon)
+            & (worldid >= 0)
             & (worldid < self.num_envs)
             & (geom[:, 0] >= 0)
             & (geom[:, 1] >= 0)
@@ -942,7 +1114,9 @@ def command_batch_from_qpos_trajectory(
     qpos_trajectory: torch.Tensor,
     config: WbcRolloutConfig,
     *,
+    qvel_trajectory: torch.Tensor | None = None,
     preserve_template_first: bool = False,
+    kinematics_batch_size: int = 128,
 ) -> G1CommandBatch:
     """Convert batched refined qpos trajectories into WBC command fields."""
 
@@ -958,29 +1132,70 @@ def command_batch_from_qpos_trajectory(
         )
 
     num_envs = int(qpos_trajectory.shape[1])
-    qvel_trajectory = qvel_from_qpos_trajectory(qpos_trajectory, dt=POLICY_DT)
-    kin_config = replace(config, num_envs=num_envs, max_steps=None)
+    if qvel_trajectory is None:
+        qvel_trajectory = qvel_from_qpos_trajectory(qpos_trajectory, dt=POLICY_DT)
+    else:
+        qvel_trajectory = qvel_trajectory.to(device, dtype=torch.float32)
+        if qvel_trajectory.ndim == 2:
+            qvel_trajectory = qvel_trajectory[:, None, :]
+        if qvel_trajectory.shape != qpos_trajectory.shape[:-1] + (QVEL_DIM,):
+            raise ValueError(
+                "Expected qvel trajectory shape "
+                f"{qpos_trajectory.shape[:-1] + (QVEL_DIM,)}, got {qvel_trajectory.shape}."
+            )
+
+    flat_count = int(qpos_trajectory.shape[0] * num_envs)
+    kin_batch_size = max(1, min(int(kinematics_batch_size), flat_count))
+    kin_config = replace(
+        config,
+        num_envs=kin_batch_size,
+        max_steps=None,
+        use_cuda_graph=False,
+        clear_reset_derived_buffers=False,
+    )
     env = G1WbcMujocoWarpEnv(kin_config)
 
     body_pos = []
     body_quat = []
     body_lin_vel = []
     body_ang_vel = []
+    qpos_flat = qpos_trajectory.reshape(flat_count, QPOS_DIM)
+    qvel_flat = qvel_trajectory.reshape(flat_count, QVEL_DIM)
     with torch.inference_mode():
-        for frame_idx in range(qpos_trajectory.shape[0]):
-            env.reset(qpos_trajectory[frame_idx], qvel_trajectory[frame_idx])
+        for start in range(0, flat_count, kin_batch_size):
+            end = min(start + kin_batch_size, flat_count)
+            count = end - start
+            qpos_chunk = qpos_flat[start:end]
+            qvel_chunk = qvel_flat[start:end]
+            if count < kin_batch_size:
+                pad_count = kin_batch_size - count
+                qpos_chunk = torch.cat(
+                    [qpos_chunk, qpos_chunk[-1:].expand(pad_count, -1)], dim=0
+                )
+                qvel_chunk = torch.cat(
+                    [qvel_chunk, qvel_chunk[-1:].expand(pad_count, -1)], dim=0
+                )
+            env.reset(qpos_chunk, qvel_chunk)
             state = env.robot_state()
-            body_pos.append(state.body_pos_w.detach().clone())
-            body_quat.append(state.body_quat_w.detach().clone())
-            body_lin_vel.append(state.body_lin_vel_w.detach().clone())
-            body_ang_vel.append(state.body_ang_vel_w.detach().clone())
+            body_pos.append(state.body_pos_w[:count].detach().clone())
+            body_quat.append(state.body_quat_w[:count].detach().clone())
+            body_lin_vel.append(state.body_lin_vel_w[:count].detach().clone())
+            body_ang_vel.append(state.body_ang_vel_w[:count].detach().clone())
 
     joint_pos = qpos_trajectory[..., 7:].contiguous()
     joint_vel = qvel_trajectory[..., 6:].contiguous()
-    body_pos_w = torch.stack(body_pos, dim=0)
-    body_quat_w = torch.stack(body_quat, dim=0)
-    body_lin_vel_w = torch.stack(body_lin_vel, dim=0)
-    body_ang_vel_w = torch.stack(body_ang_vel, dim=0)
+    body_pos_w = torch.cat(body_pos, dim=0).reshape(
+        qpos_trajectory.shape[0], num_envs, -1, 3
+    )
+    body_quat_w = torch.cat(body_quat, dim=0).reshape(
+        qpos_trajectory.shape[0], num_envs, -1, 4
+    )
+    body_lin_vel_w = torch.cat(body_lin_vel, dim=0).reshape(
+        qpos_trajectory.shape[0], num_envs, -1, 3
+    )
+    body_ang_vel_w = torch.cat(body_ang_vel, dim=0).reshape(
+        qpos_trajectory.shape[0], num_envs, -1, 3
+    )
 
     if preserve_template_first:
         frame_count = qpos_trajectory.shape[0]
@@ -1005,6 +1220,38 @@ def command_batch_from_qpos_trajectory(
         body_ang_vel_w=body_ang_vel_w,
         qpos_trajectory=qpos_trajectory.contiguous(),
         qvel_trajectory=qvel_trajectory.contiguous(),
+    )
+
+
+def _copy_wbc_data_state(src, dst):
+    """Copy all MuJoCo Warp array state fields between compatible Data objects."""
+
+    _copy_dataclass_array_fields(src, dst, skip={"contact", "efc"})
+    if hasattr(src, "contact") and hasattr(dst, "contact"):
+        _copy_dataclass_array_fields(src.contact, dst.contact)
+    if hasattr(src, "efc") and hasattr(dst, "efc"):
+        _copy_dataclass_array_fields(src.efc, dst.efc)
+    return dst
+
+
+def _copy_dataclass_array_fields(src, dst, *, skip: set[str] | None = None) -> None:
+    skip = skip or set()
+    fields = getattr(src, "__dataclass_fields__", {})
+    for field in fields:
+        if field in skip or not hasattr(dst, field):
+            continue
+        src_value = getattr(src, field)
+        dst_value = getattr(dst, field)
+        if _is_copyable_wp_array(src_value, dst_value):
+            wp.copy(dst_value, src_value)
+
+
+def _is_copyable_wp_array(src_value, dst_value) -> bool:
+    return (
+        hasattr(src_value, "shape")
+        and hasattr(dst_value, "shape")
+        and hasattr(src_value, "dtype")
+        and hasattr(dst_value, "dtype")
     )
 
 

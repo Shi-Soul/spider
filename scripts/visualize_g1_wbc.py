@@ -9,7 +9,7 @@ Modes:
   --method saved          : render --saved-rollout/--saved-command trajectories
   --method compare        : no-MPC + MPC joint/EE panels
 
-Usage (from tracking_bfm venv):
+Usage (from the SPIDER Python environment):
   python scripts/visualize_g1_wbc.py --motion MOTION.npz --method compare
   python scripts/visualize_g1_wbc.py --motion MOTION.npz --method saved \
     --saved-rollout no_mpc:/path/to/rollout.npz \
@@ -34,11 +34,11 @@ sys.path.insert(0, str(SPIDER_ROOT))
 
 from spider.tasks.g1_wbc.motion import load_motion
 from spider.tasks.g1_wbc.policy import load_wbc_actor
-from spider.tasks.g1_wbc.mpc import (
-    G1WbcMpcConfig,
+from spider.tasks.g1_wbc.spider_task import (
+    G1WbcSamplingTask,
+    build_g1_wbc_sampling_config,
     load_reward_weights,
-    mpc_config_from_preset,
-    optimize_mpc_command,
+    run_g1_wbc_sampling_mpc,
 )
 from spider.tasks.g1_wbc.rollout import (
     WbcRolloutConfig,
@@ -189,6 +189,12 @@ def compose_panels(panels, layout):
     raise ValueError(f"Unsupported panel layout: {layout}")
 
 
+def _required(value, flag):
+    if value is None:
+        raise ValueError(f"{flag} is required for live MPC visualization.")
+    return value
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--motion", required=True)
@@ -228,38 +234,31 @@ def main():
         help="Overlay per-frame root position error for each panel.",
     )
     p.add_argument("--ghost-alpha", type=float, default=float(GHOST_RGBA[3]))
-    p.add_argument(
-        "--mpc-preset",
-        default="aggressive",
-        choices=("aggressive", "conservative", "explore", "rootrot", "wide"),
-    )
     p.add_argument("--mpc-samples", type=int, default=None)
+    p.add_argument("--mpc-rollout-batch-size", type=int, default=0)
     p.add_argument("--mpc-iterations", type=int, default=None)
     p.add_argument("--mpc-planning-horizon-steps", type=int, default=None)
     p.add_argument("--mpc-control-steps", type=int, default=None)
-    p.add_argument("--mpc-sampling-mode", choices=("full", "knot"), default=None)
     p.add_argument("--mpc-knot-count", type=int, default=None)
-    p.add_argument("--mpc-elite-frac", type=float, default=None)
     p.add_argument("--mpc-temperature", type=float, default=None)
     p.add_argument(
-        "--mpc-command-reg-weight",
-        type=float,
-        default=None,
+        "--mpc-control-update-mode",
+        choices=("weighted_mean", "best"),
+        default="weighted_mean",
+        help="Generic sampled-MPC control update rule.",
     )
+    p.add_argument("--mpc-first-ctrl-noise-scale", type=float, default=None)
+    p.add_argument("--mpc-last-ctrl-noise-scale", type=float, default=None)
+    p.add_argument("--mpc-final-noise-scale", type=float, default=None)
     p.add_argument(
-        "--mpc-command-smooth-weight",
-        type=float,
-        default=None,
-    )
-    p.add_argument(
-        "--mpc-acceptance-gate",
+        "--mpc-torch-compile",
         action=argparse.BooleanOptionalAction,
-        default=None,
+        default=False,
+        help="Use torch.compile in SPIDER's generic sampling optimizer.",
     )
     p.add_argument("--mpc-root-pos-sigma", type=float, default=None)
     p.add_argument("--mpc-root-rot-sigma", type=float, default=None)
     p.add_argument("--mpc-joint-sigma", type=float, default=None)
-    p.add_argument("--mpc-smooth-passes", type=int, default=None)
     p.add_argument(
         "--mpc-reward-weights",
         default=None,
@@ -268,7 +267,7 @@ def main():
             "keyed by method name."
         ),
     )
-    p.add_argument("--seed", type=int, default=G1WbcMpcConfig.seed)
+    p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--saved-rollout",
         action="append",
@@ -326,31 +325,61 @@ def main():
         if method == "no_mpc":
             r = run_no_mpc_rollout(motion, actor, cfg)
             return r.qpos[:, 0].cpu().numpy(), method
-        mpc = mpc_config_from_preset(method, args.mpc_preset)
-        overrides = {
-            "num_samples": args.mpc_samples,
-            "num_iterations": args.mpc_iterations,
-            "planning_horizon_steps": args.mpc_planning_horizon_steps,
-            "control_steps": args.mpc_control_steps,
-            "sampling_mode": args.mpc_sampling_mode,
-            "knot_count": args.mpc_knot_count,
-            "elite_frac": args.mpc_elite_frac,
-            "temperature": args.mpc_temperature,
-            "command_reg_weight": args.mpc_command_reg_weight,
-            "command_smooth_weight": args.mpc_command_smooth_weight,
-            "acceptance_gate": args.mpc_acceptance_gate,
-            "root_pos_sigma": args.mpc_root_pos_sigma,
-            "root_rot_sigma": args.mpc_root_rot_sigma,
-            "joint_sigma": args.mpc_joint_sigma,
-            "smooth_passes": args.mpc_smooth_passes,
-            "seed": args.seed,
-        }
-        for name, value in overrides.items():
-            if value is not None:
-                setattr(mpc, name, value)
-        if args.mpc_reward_weights is not None:
-            mpc.reward_weights = load_reward_weights(args.mpc_reward_weights, method)
-        r = optimize_mpc_command(motion, actor, cfg, mpc)
+        reward_weights = (
+            None
+            if args.mpc_reward_weights is None
+            else load_reward_weights(args.mpc_reward_weights, method)
+        )
+        spider_config = build_g1_wbc_sampling_config(
+            device=args.device,
+            num_samples=_required(args.mpc_samples, "--mpc-samples"),
+            rollout_batch_size=int(args.mpc_rollout_batch_size),
+            max_num_iterations=_required(args.mpc_iterations, "--mpc-iterations"),
+            horizon_steps=_required(
+                args.mpc_planning_horizon_steps,
+                "--mpc-planning-horizon-steps",
+            ),
+            ctrl_steps=_required(args.mpc_control_steps, "--mpc-control-steps"),
+            knot_count=_required(args.mpc_knot_count, "--mpc-knot-count"),
+            temperature=_required(args.mpc_temperature, "--mpc-temperature"),
+            control_update_mode=args.mpc_control_update_mode,
+            pos_noise_scale=_required(args.mpc_root_pos_sigma, "--mpc-root-pos-sigma"),
+            rot_noise_scale=_required(args.mpc_root_rot_sigma, "--mpc-root-rot-sigma"),
+            joint_noise_scale=_required(args.mpc_joint_sigma, "--mpc-joint-sigma"),
+            first_ctrl_noise_scale=(
+                0.5
+                if args.mpc_first_ctrl_noise_scale is None
+                else args.mpc_first_ctrl_noise_scale
+            ),
+            last_ctrl_noise_scale=(
+                1.0
+                if args.mpc_last_ctrl_noise_scale is None
+                else args.mpc_last_ctrl_noise_scale
+            ),
+            final_noise_scale=(
+                0.1
+                if args.mpc_final_noise_scale is None
+                else args.mpc_final_noise_scale
+            ),
+            use_torch_compile=bool(args.mpc_torch_compile),
+            seed=args.seed,
+        )
+        task = G1WbcSamplingTask(
+            motion,
+            actor,
+            cfg,
+            mode=method,
+            reward_weights=reward_weights,
+        )
+        total_steps = motion.num_frames - 1
+        if args.max_steps is not None:
+            total_steps = min(total_steps, int(args.max_steps))
+        mpc_run = run_g1_wbc_sampling_mpc(
+            spider_config,
+            task,
+            total_steps=total_steps,
+        )
+        r = mpc_run.result
         return r.rollout.qpos[:, 0].cpu().numpy(), method
 
     saved_sims = load_saved_sims(

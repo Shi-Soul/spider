@@ -12,10 +12,7 @@ from pathlib import Path
 SPIDER_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SPIDER_ROOT))
 
-from spider.tasks.g1_wbc.mpc import G1WbcMpcConfig
 from spider.tasks.g1_wbc.rollout import WbcRolloutConfig
-
-TRACKING_BFM_PYTHON = str(SPIDER_ROOT.parent / "tracking_bfm" / ".venv" / "bin" / "python")
 
 DEFAULT_DATASETS = [
     "/home/bai/ARC/Dataset/LAFAN/G1-29dof-BYDnpz",
@@ -50,32 +47,33 @@ def run_eval(
     method: str,
     checkpoint: str,
     *,
+    python_executable: str = sys.executable,
     device: str = "cuda:0",
     max_steps: int = 250,
     nconmax_per_env: int = WbcRolloutConfig.nconmax_per_env,
     njmax_per_env: int = WbcRolloutConfig.njmax_per_env,
     mpc_samples: int | None = None,
+    mpc_rollout_batch_size: int | None = None,
     mpc_iterations: int | None = None,
     mpc_planning_horizon_steps: int | None = None,
     mpc_control_steps: int | None = None,
-    mpc_sampling_mode: str | None = None,
     mpc_knot_count: int | None = None,
-    mpc_elite_frac: float | None = None,
     mpc_temperature: float | None = None,
-    mpc_command_reg_weight: float | None = None,
-    mpc_command_smooth_weight: float | None = None,
-    mpc_acceptance_gate: bool | None = None,
+    mpc_control_update_mode: str | None = None,
+    mpc_first_ctrl_noise_scale: float | None = None,
+    mpc_last_ctrl_noise_scale: float | None = None,
+    mpc_final_noise_scale: float | None = None,
+    mpc_torch_compile: bool | None = None,
     mpc_root_pos_sigma: float | None = None,
     mpc_root_rot_sigma: float | None = None,
     mpc_joint_sigma: float | None = None,
-    mpc_smooth_passes: int | None = None,
     mpc_seed: int | None = None,
     mpc_reward_weights: Path | None = None,
-    mpc_preset: str = "aggressive",
+    timeout_sec: int | None = None,
     saved_qpos: Path | None = None,
 ) -> dict | None:
     cmd = [
-        TRACKING_BFM_PYTHON,
+        python_executable,
         "-m", "spider.tasks.g1_wbc.evaluate",
         "--motion", str(motion),
         "--motion-type", "isaaclab",
@@ -91,40 +89,39 @@ def run_eval(
             raise ValueError("static_qpos requires saved_qpos.")
         cmd += ["--saved-qpos", str(saved_qpos)]
     elif method != "no_mpc":
-        cmd += ["--mpc-preset", mpc_preset]
         if mpc_reward_weights is not None:
             cmd += ["--mpc-reward-weights", str(mpc_reward_weights)]
         optional_args = {
             "--mpc-samples": mpc_samples,
+            "--mpc-rollout-batch-size": mpc_rollout_batch_size,
             "--mpc-iterations": mpc_iterations,
             "--mpc-planning-horizon-steps": mpc_planning_horizon_steps,
             "--mpc-control-steps": mpc_control_steps,
-            "--mpc-sampling-mode": mpc_sampling_mode,
             "--mpc-knot-count": mpc_knot_count,
-            "--mpc-elite-frac": mpc_elite_frac,
             "--mpc-temperature": mpc_temperature,
-            "--mpc-command-reg-weight": mpc_command_reg_weight,
-            "--mpc-command-smooth-weight": mpc_command_smooth_weight,
-            "--mpc-acceptance-gate": mpc_acceptance_gate,
+            "--mpc-control-update-mode": mpc_control_update_mode,
+            "--mpc-first-ctrl-noise-scale": mpc_first_ctrl_noise_scale,
+            "--mpc-last-ctrl-noise-scale": mpc_last_ctrl_noise_scale,
+            "--mpc-final-noise-scale": mpc_final_noise_scale,
             "--mpc-root-pos-sigma": mpc_root_pos_sigma,
             "--mpc-root-rot-sigma": mpc_root_rot_sigma,
             "--mpc-joint-sigma": mpc_joint_sigma,
-            "--mpc-smooth-passes": mpc_smooth_passes,
             "--seed": mpc_seed,
         }
         for flag, value in optional_args.items():
             if value is not None:
-                if isinstance(value, bool):
-                    cmd.append(flag if value else f"--no-{flag[2:]}")
-                else:
-                    cmd += [flag, str(value)]
+                cmd += [flag, str(value)]
+        if mpc_torch_compile is not None:
+            cmd += [
+                "--mpc-torch-compile" if mpc_torch_compile else "--no-mpc-torch-compile"
+            ]
 
     proc = subprocess.run(
         cmd,
         cwd=str(SPIDER_ROOT),
         capture_output=True,
         text=True,
-        timeout=1200,
+        timeout=timeout_sec,
     )
     if proc.returncode != 0:
         print(f"ERROR [{method}/{checkpoint}] {motion.name}: {proc.stderr[:200]}", file=sys.stderr)
@@ -168,42 +165,38 @@ def main() -> None:
     parser.add_argument("--methods", nargs="*", default=DEFAULT_METHODS)
     parser.add_argument("--checkpoints", nargs="*", default=DEFAULT_CKPTS)
     parser.add_argument("--limit", type=int, default=None, help="Max motions per dataset.")
+    parser.add_argument(
+        "--python",
+        default=sys.executable,
+        help="Python executable used for per-motion evaluate.py subprocesses.",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-steps", type=int, default=250)
     parser.add_argument("--nconmax-per-env", type=int, default=WbcRolloutConfig.nconmax_per_env)
     parser.add_argument("--njmax-per-env", type=int, default=WbcRolloutConfig.njmax_per_env)
+    parser.add_argument("--mpc-samples", type=int, default=512)
+    parser.add_argument("--mpc-rollout-batch-size", type=int, default=0)
+    parser.add_argument("--mpc-iterations", type=int, default=2)
+    parser.add_argument("--mpc-planning-horizon-steps", type=int, default=80)
+    parser.add_argument("--mpc-control-steps", type=int, default=20)
+    parser.add_argument("--mpc-knot-count", type=int, default=8)
+    parser.add_argument("--mpc-temperature", type=float, default=0.7)
     parser.add_argument(
-        "--mpc-preset",
-        default="aggressive",
-        choices=("aggressive", "conservative", "explore", "rootrot", "wide"),
+        "--mpc-control-update-mode",
+        choices=("weighted_mean", "best"),
+        default="weighted_mean",
     )
-    parser.add_argument("--mpc-samples", type=int, default=None)
-    parser.add_argument("--mpc-iterations", type=int, default=None)
-    parser.add_argument("--mpc-planning-horizon-steps", type=int, default=None)
-    parser.add_argument("--mpc-control-steps", type=int, default=None)
-    parser.add_argument("--mpc-sampling-mode", choices=("full", "knot"), default=None)
-    parser.add_argument("--mpc-knot-count", type=int, default=None)
-    parser.add_argument("--mpc-elite-frac", type=float, default=None)
-    parser.add_argument("--mpc-temperature", type=float, default=None)
+    parser.add_argument("--mpc-first-ctrl-noise-scale", type=float, default=0.5)
+    parser.add_argument("--mpc-last-ctrl-noise-scale", type=float, default=1.0)
+    parser.add_argument("--mpc-final-noise-scale", type=float, default=0.1)
     parser.add_argument(
-        "--mpc-command-reg-weight",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--mpc-command-smooth-weight",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--mpc-acceptance-gate",
+        "--mpc-torch-compile",
         action=argparse.BooleanOptionalAction,
-        default=None,
+        default=False,
     )
-    parser.add_argument("--mpc-root-pos-sigma", type=float, default=None)
-    parser.add_argument("--mpc-root-rot-sigma", type=float, default=None)
-    parser.add_argument("--mpc-joint-sigma", type=float, default=None)
-    parser.add_argument("--mpc-smooth-passes", type=int, default=None)
+    parser.add_argument("--mpc-root-pos-sigma", type=float, default=0.08)
+    parser.add_argument("--mpc-root-rot-sigma", type=float, default=0.18)
+    parser.add_argument("--mpc-joint-sigma", type=float, default=0.28)
     parser.add_argument("--mpc-seed", type=int, default=None)
     parser.add_argument(
         "--mpc-reward-weights",
@@ -212,6 +205,12 @@ def main() -> None:
             "Optional JSON reward weights passed to evaluate.py. Accepts a flat "
             "mapping or a mapping keyed by method name."
         ),
+    )
+    parser.add_argument(
+        "--eval-timeout-sec",
+        type=int,
+        default=0,
+        help="Per-evaluation subprocess timeout. Use 0 to disable.",
     )
     parser.add_argument("--output", default=None, help="JSON output path.")
     args = parser.parse_args()
@@ -229,32 +228,37 @@ def main() -> None:
                     motion,
                     method=method,
                     checkpoint=ckpt,
+                    python_executable=args.python,
                     device=args.device,
                     max_steps=args.max_steps,
                     nconmax_per_env=args.nconmax_per_env,
                     njmax_per_env=args.njmax_per_env,
                     mpc_samples=args.mpc_samples,
+                    mpc_rollout_batch_size=args.mpc_rollout_batch_size,
                     mpc_iterations=args.mpc_iterations,
                     mpc_planning_horizon_steps=args.mpc_planning_horizon_steps,
                     mpc_control_steps=args.mpc_control_steps,
-                    mpc_sampling_mode=args.mpc_sampling_mode,
                     mpc_knot_count=args.mpc_knot_count,
-                    mpc_elite_frac=args.mpc_elite_frac,
                     mpc_temperature=args.mpc_temperature,
-                    mpc_command_reg_weight=args.mpc_command_reg_weight,
-                    mpc_command_smooth_weight=args.mpc_command_smooth_weight,
-                    mpc_acceptance_gate=args.mpc_acceptance_gate,
+                    mpc_control_update_mode=args.mpc_control_update_mode,
+                    mpc_first_ctrl_noise_scale=args.mpc_first_ctrl_noise_scale,
+                    mpc_last_ctrl_noise_scale=args.mpc_last_ctrl_noise_scale,
+                    mpc_final_noise_scale=args.mpc_final_noise_scale,
+                    mpc_torch_compile=args.mpc_torch_compile,
                     mpc_root_pos_sigma=args.mpc_root_pos_sigma,
                     mpc_root_rot_sigma=args.mpc_root_rot_sigma,
                     mpc_joint_sigma=args.mpc_joint_sigma,
-                    mpc_smooth_passes=args.mpc_smooth_passes,
                     mpc_seed=args.mpc_seed,
                     mpc_reward_weights=(
                         Path(args.mpc_reward_weights).expanduser()
                         if args.mpc_reward_weights is not None
                         else None
                     ),
-                    mpc_preset=args.mpc_preset,
+                    timeout_sec=(
+                        int(args.eval_timeout_sec)
+                        if int(args.eval_timeout_sec) > 0
+                        else None
+                    ),
                 )
                 if payload is None:
                     print("FAILED")
@@ -297,31 +301,28 @@ def _compact_mpc_payload(payload: dict | None) -> dict | None:
     if not payload:
         return None
     keys = (
-        "preset",
-        "accepted",
-        "final_candidate_score",
-        "final_baseline_score",
+        "backend",
+        "receding_backend",
         "final_scores_max",
         "num_samples",
+        "rollout_batch_size",
         "num_iterations",
         "planning_horizon_steps",
         "control_steps",
         "sampling_mode",
         "knot_count",
+        "temperature",
+        "control_update_mode",
+        "first_ctrl_noise_scale",
+        "last_ctrl_noise_scale",
+        "final_noise_scale",
+        "beta_traj",
         "num_windows",
-        "accepted_windows",
-        "used_baseline_fallback",
-        "acceptance_gate",
         "root_pos_sigma",
         "root_rot_sigma",
         "joint_sigma",
-        "min_root_pos_sigma",
-        "min_root_rot_sigma",
-        "min_joint_sigma",
-        "sigma_decay",
-        "smooth_passes",
-        "command_reg_weight",
-        "command_smooth_weight",
+        "exploit_ratio",
+        "exploit_noise_scale",
         "reward_weight_source",
     )
     return {

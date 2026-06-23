@@ -4,19 +4,30 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 
+from spider.config import Config
+from spider.tasks.g1_wbc.constants import QPOS_DIM, QVEL_DIM
 from spider.tasks.g1_wbc.metrics import compute_rollout_metrics
-from spider.tasks.g1_wbc.motion import load_motion, validate_motion_dims
 from spider.tasks.g1_wbc.mpc import (
-    REWARD_WEIGHT_PRESETS,
     G1WbcMpcConfig,
-    load_reward_weights,
     mpc_config_from_preset,
-    optimize_mpc_command,
+)
+from spider.tasks.g1_wbc.spider_task import (
+    G1WbcSamplingTask,
+    build_g1_wbc_sampling_config,
+    load_reward_weights,
+    reward_weights_for,
+    run_g1_wbc_sampling_mpc,
+)
+from spider.tasks.g1_wbc.motion import (
+    load_motion,
+    validate_motion_dims,
 )
 from spider.tasks.g1_wbc.policy import load_wbc_actor, resolve_checkpoint_path
 from spider.tasks.g1_wbc.rollout import (
@@ -51,7 +62,14 @@ def main() -> None:
         sync_after_step=args.sync_after_step,
         forward_after_step=args.forward_after_step,
         use_cuda_graph=args.use_cuda_graph,
+        ls_parallel=args.ls_parallel,
+        serial_warp_launches=args.serial_warp_launches,
     )
+    execute_config = replace(
+        config,
+        use_cuda_graph=False,
+        serial_warp_launches=True,
+    ) if args.serial_execute_warp_launches else config
     mpc_payload = None
     mpc_result = None
     if args.method == "static_qpos":
@@ -61,59 +79,83 @@ def main() -> None:
             config,
             max_steps=args.max_steps,
         )
+    elif args.method == "replay_command":
+        assert actor is not None
+        qpos_trajectory, qvel_trajectory = _load_saved_command_trajectory(
+            args.saved_command,
+            device=device,
+        )
+        total_steps = qpos_trajectory.shape[0] - 1
+        if args.max_steps is not None:
+            total_steps = min(total_steps, int(args.max_steps))
+        control_steps = _resolve_replay_control_steps(args)
+        task = G1WbcSamplingTask(
+            motion,
+            actor,
+            config,
+            mode=args.replay_task_mode,
+            execute_rollout_config=execute_config,
+        )
+        rollout = task.replay_qpos_command_sequence(
+            qpos_trajectory,
+            qvel_trajectory=(
+                qvel_trajectory if args.replay_use_saved_qvel else None
+            ),
+            control_steps=control_steps,
+            total_steps=total_steps,
+        )
+        mpc_payload = {
+            "backend": (
+                "spider.tasks.g1_wbc.spider_task."
+                "G1WbcSamplingTask.replay_qpos_command_sequence"
+            ),
+            "saved_command": str(Path(args.saved_command).expanduser().resolve()),
+            "replay_mode": "shared_execute_backend",
+            "control_steps": control_steps,
+            "use_saved_qvel": bool(args.replay_use_saved_qvel),
+            "serial_execute_warp_launches": bool(args.serial_execute_warp_launches),
+            "num_command_frames": int(qpos_trajectory.shape[0]),
+            "num_replay_steps": total_steps,
+        }
     elif args.method == "no_mpc":
         assert actor is not None
         rollout = run_no_mpc_rollout(motion, actor, config)
     else:
-        mpc_config = _build_mpc_config(args)
-        mpc_result = optimize_mpc_command(motion, actor, config, mpc_config)
+        assert actor is not None
+        spider_config = _build_sampling_config(args)
+        reward_weights = _load_method_reward_weights(args)
+        task = G1WbcSamplingTask(
+            motion,
+            actor,
+            config,
+            mode=args.method,
+            reward_weights=reward_weights,
+            execute_rollout_config=execute_config,
+        )
+        total_steps = motion.num_frames - 1
+        if args.max_steps is not None:
+            total_steps = min(total_steps, int(args.max_steps))
+        mpc_run = run_g1_wbc_sampling_mpc(
+            spider_config,
+            task,
+            total_steps=total_steps,
+        )
+        receding_result = mpc_run.receding
+        mpc_result = mpc_run.result
         rollout = mpc_result.rollout
         mpc_payload = {
-            "preset": args.mpc_preset,
-            "num_samples": mpc_config.num_samples,
-            "num_iterations": mpc_config.num_iterations,
-            "planning_horizon_steps": mpc_config.planning_horizon_steps,
-            "control_steps": mpc_config.control_steps,
-            "sampling_mode": mpc_config.sampling_mode,
-            "knot_count": mpc_config.knot_count,
-            "use_warm_start": mpc_config.use_warm_start,
-            "warm_start_source": mpc_config.warm_start_source,
-            "warm_start_decay": mpc_config.warm_start_decay,
-            "elite_frac": mpc_config.elite_frac,
-            "temperature": mpc_config.temperature,
-            "root_pos_sigma": mpc_config.root_pos_sigma,
-            "root_rot_sigma": mpc_config.root_rot_sigma,
-            "joint_sigma": mpc_config.joint_sigma,
-            "min_root_pos_sigma": mpc_config.min_root_pos_sigma,
-            "min_root_rot_sigma": mpc_config.min_root_rot_sigma,
-            "min_joint_sigma": mpc_config.min_joint_sigma,
-            "sigma_decay": mpc_config.sigma_decay,
-            "smooth_passes": mpc_config.smooth_passes,
-            "command_reg_weight": mpc_config.command_reg_weight,
-            "command_smooth_weight": mpc_config.command_smooth_weight,
+            **mpc_run.metadata,
             "reward_weight_source": (
                 str(Path(args.mpc_reward_weights).expanduser().resolve())
                 if args.mpc_reward_weights is not None
                 else "default"
             ),
-            "reward_weights": _effective_reward_weights(mpc_config),
-            "acceptance_gate": mpc_config.acceptance_gate,
-            "guided_candidate": mpc_config.use_guided_candidate,
-            "guided_root_pos_gain": mpc_config.guided_root_pos_gain,
-            "guided_root_rot_gain": mpc_config.guided_root_rot_gain,
-            "guided_joint_gain": mpc_config.guided_joint_gain,
-            "guided_root_pos_clip": mpc_config.guided_root_pos_clip,
-            "guided_root_rot_clip": mpc_config.guided_root_rot_clip,
-            "guided_joint_clip": mpc_config.guided_joint_clip,
-            "history": [vars(item) for item in mpc_result.history],
+            "reward_weights": _effective_reward_weights(args.method, reward_weights),
+            "history": _jsonable_infos(receding_result.infos),
             "final_scores_mean": _safe_tensor_stat(mpc_result.scores, "mean"),
             "final_scores_max": _safe_tensor_stat(mpc_result.scores, "max"),
-            "accepted": mpc_result.accepted,
-            "used_baseline_fallback": mpc_result.used_baseline_fallback,
             "num_windows": mpc_result.num_windows,
-            "accepted_windows": mpc_result.accepted_windows,
-            "final_candidate_score": mpc_result.final_candidate_score,
-            "final_baseline_score": mpc_result.final_baseline_score,
+            "serial_execute_warp_launches": bool(args.serial_execute_warp_launches),
         }
     metrics = compute_rollout_metrics(motion, rollout)
 
@@ -126,6 +168,7 @@ def main() -> None:
         "num_envs": args.num_envs,
         "max_steps": args.max_steps,
         "ref_offset": args.ref_offset,
+        "serial_warp_launches": bool(args.serial_warp_launches),
         "metrics": metrics,
     }
     if mpc_payload is not None:
@@ -165,6 +208,7 @@ def _parse_args() -> argparse.Namespace:
             "g1_wbc_ee",
             "g1_wbc_joint",
             "g1_wbc_joint_global",
+            "replay_command",
             "static_qpos",
         ),
         help="Evaluation method to run.",
@@ -213,6 +257,29 @@ def _parse_args() -> argparse.Namespace:
         default=WbcRolloutConfig.use_cuda_graph,
         help="Capture MuJoCo Warp step/forward/reset in CUDA graphs when available.",
     )
+    parser.add_argument(
+        "--ls-parallel",
+        action=argparse.BooleanOptionalAction,
+        default=WbcRolloutConfig.ls_parallel,
+        help="Use MuJoCo Warp parallel line search in the Newton solver.",
+    )
+    parser.add_argument(
+        "--serial-warp-launches",
+        action="store_true",
+        default=WbcRolloutConfig.serial_warp_launches,
+        help=(
+            "Diagnostic mode: serialize all regular Warp launches for every rollout. "
+            "This is very slow if used during MPC sampling."
+        ),
+    )
+    parser.add_argument(
+        "--serial-execute-warp-launches",
+        action="store_true",
+        help=(
+            "Diagnostic mode: serialize regular Warp launches only for MPC execute "
+            "and chunked replay physical rollouts."
+        ),
+    )
     parser.add_argument("--output-dir", default=None, help="Optional result directory.")
     parser.add_argument(
         "--saved-qpos",
@@ -223,29 +290,76 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--saved-command",
+        default=None,
+        help=(
+            "Precomputed command NPZ for --method replay_command. "
+            "Accepts .npz keys command_qpos_trajectory/refined_qpos/qpos."
+        ),
+    )
+    parser.add_argument(
+        "--replay-control-steps",
+        type=int,
+        default=None,
+        help=(
+            "Execute chunk size for --method replay_command. Defaults to the saved "
+            "MPC control_steps from metrics.json when available."
+        ),
+    )
+    parser.add_argument(
+        "--replay-task-mode",
+        default="g1_wbc_joint",
+        choices=("g1_wbc_ee", "g1_wbc_joint", "g1_wbc_joint_global"),
+        help="Task mode used to instantiate the shared MPC execute adapter.",
+    )
+    parser.add_argument(
+        "--replay-use-saved-qvel",
+        action="store_true",
+        help=(
+            "Diagnostic mode: use command_qvel_trajectory from the saved NPZ. "
+            "Default recomputes chunk-local qvel to match MPC execute."
+        ),
+    )
+    parser.add_argument(
         "--save-rollout",
         action="store_true",
         help="Save rollout tensors to rollout.npz when output-dir is set.",
     )
+    parser.add_argument("--mpc-samples", type=int, default=None)
+    parser.add_argument("--mpc-rollout-batch-size", type=int, default=0)
+    parser.add_argument("--mpc-iterations", type=int, default=None)
+    parser.add_argument("--mpc-planning-horizon-steps", type=int, default=None)
+    parser.add_argument("--mpc-control-steps", type=int, default=None)
+    parser.add_argument("--mpc-knot-count", type=int, default=None)
     parser.add_argument(
         "--mpc-preset",
         default="aggressive",
         choices=("aggressive", "conservative", "explore", "rootrot", "wide"),
-        help="Tuned MPC parameter preset. Explicit MPC flags override this.",
+        help="Legacy MPC preset accepted for compatibility with existing runners.",
     )
-    parser.add_argument("--mpc-samples", type=int, default=None)
-    parser.add_argument("--mpc-iterations", type=int, default=None)
-    parser.add_argument("--mpc-planning-horizon-steps", type=int, default=None)
-    parser.add_argument("--mpc-control-steps", type=int, default=None)
     parser.add_argument(
         "--mpc-sampling-mode",
         choices=("full", "knot"),
         default=None,
-        help="Sample full per-step deltas or knot deltas interpolated to the horizon.",
+        help="Legacy MPC sampling mode accepted for compatibility with existing runners.",
     )
-    parser.add_argument("--mpc-knot-count", type=int, default=None)
     parser.add_argument("--mpc-elite-frac", type=float, default=None)
     parser.add_argument("--mpc-temperature", type=float, default=None)
+    parser.add_argument(
+        "--mpc-control-update-mode",
+        choices=("weighted_mean", "best"),
+        default="weighted_mean",
+        help="Generic sampled-MPC control update rule.",
+    )
+    parser.add_argument("--mpc-first-ctrl-noise-scale", type=float, default=None)
+    parser.add_argument("--mpc-last-ctrl-noise-scale", type=float, default=None)
+    parser.add_argument("--mpc-final-noise-scale", type=float, default=None)
+    parser.add_argument(
+        "--mpc-torch-compile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use torch.compile in SPIDER's generic sampling optimizer.",
+    )
     parser.add_argument("--mpc-root-pos-sigma", type=float, default=None)
     parser.add_argument("--mpc-root-rot-sigma", type=float, default=None)
     parser.add_argument("--mpc-joint-sigma", type=float, default=None)
@@ -255,30 +369,40 @@ def _parse_args() -> argparse.Namespace:
         "--mpc-warm-start",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Initialize each MPC window from the shifted previous window delta.",
+        help="Legacy warm-start flag accepted for compatibility with existing runners.",
     )
     parser.add_argument(
         "--mpc-warm-start-source",
         choices=("best", "mean"),
         default=None,
-        help="Previous-window delta used for MPC warm start.",
+        help="Legacy warm-start source accepted for compatibility with existing runners.",
     )
     parser.add_argument(
         "--mpc-warm-start-decay",
         type=float,
         default=None,
-        help="Scale applied to the shifted warm-start delta.",
+        help="Legacy warm-start decay accepted for compatibility with existing runners.",
+    )
+    parser.add_argument("--mpc-command-reg-weight", type=float, default=None)
+    parser.add_argument("--mpc-command-smooth-weight", type=float, default=None)
+    parser.add_argument(
+        "--mpc-guided-candidate",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Legacy guided-candidate flag accepted for compatibility with existing runners.",
     )
     parser.add_argument(
-        "--mpc-command-reg-weight",
-        type=float,
+        "--mpc-acceptance-gate",
+        action=argparse.BooleanOptionalAction,
         default=None,
+        help="Legacy acceptance-gate flag accepted for compatibility with existing runners.",
     )
-    parser.add_argument(
-        "--mpc-command-smooth-weight",
-        type=float,
-        default=None,
-    )
+    parser.add_argument("--mpc-guided-root-pos-gain", type=float, default=None)
+    parser.add_argument("--mpc-guided-root-rot-gain", type=float, default=None)
+    parser.add_argument("--mpc-guided-joint-gain", type=float, default=None)
+    parser.add_argument("--mpc-guided-root-pos-clip", type=float, default=None)
+    parser.add_argument("--mpc-guided-root-rot-clip", type=float, default=None)
+    parser.add_argument("--mpc-guided-joint-clip", type=float, default=None)
     parser.add_argument(
         "--mpc-reward-weights",
         default=None,
@@ -287,53 +411,63 @@ def _parse_args() -> argparse.Namespace:
             "keyed by method name."
         ),
     )
-    parser.add_argument(
-        "--mpc-guided-candidate",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Include a no-MPC-error feedback candidate in the MPC sample batch.",
-    )
-    parser.add_argument(
-        "--mpc-acceptance-gate",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Fall back to the unmodified reference command when final MPC score is worse.",
-    )
-    parser.add_argument(
-        "--mpc-guided-root-pos-gain",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--mpc-guided-root-rot-gain",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--mpc-guided-joint-gain",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--mpc-guided-root-pos-clip",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--mpc-guided-root-rot-clip",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--mpc-guided-joint-clip",
-        type=float,
-        default=None,
-    )
-    parser.add_argument("--seed", type=int, default=G1WbcMpcConfig.seed)
+    parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
 
+def _build_sampling_config(args: argparse.Namespace) -> Config:
+    if args.mpc_samples is None:
+        raise ValueError("--mpc-samples is required.")
+    if args.mpc_iterations is None:
+        raise ValueError("--mpc-iterations is required.")
+    if args.mpc_planning_horizon_steps is None:
+        raise ValueError("--mpc-planning-horizon-steps is required.")
+    if args.mpc_control_steps is None:
+        raise ValueError("--mpc-control-steps is required.")
+    if args.mpc_knot_count is None:
+        raise ValueError("--mpc-knot-count is required.")
+    if args.mpc_temperature is None:
+        raise ValueError("--mpc-temperature is required.")
+    if args.mpc_root_pos_sigma is None:
+        raise ValueError("--mpc-root-pos-sigma is required.")
+    if args.mpc_root_rot_sigma is None:
+        raise ValueError("--mpc-root-rot-sigma is required.")
+    if args.mpc_joint_sigma is None:
+        raise ValueError("--mpc-joint-sigma is required.")
+    if args.mpc_final_noise_scale is None:
+        final_noise_scale = 0.1
+    else:
+        final_noise_scale = float(args.mpc_final_noise_scale)
+    first_ctrl_noise_scale = (
+        0.5 if args.mpc_first_ctrl_noise_scale is None else float(args.mpc_first_ctrl_noise_scale)
+    )
+    last_ctrl_noise_scale = (
+        1.0 if args.mpc_last_ctrl_noise_scale is None else float(args.mpc_last_ctrl_noise_scale)
+    )
+    return build_g1_wbc_sampling_config(
+        device=args.device,
+        num_samples=int(args.mpc_samples),
+        rollout_batch_size=int(args.mpc_rollout_batch_size),
+        max_num_iterations=int(args.mpc_iterations),
+        horizon_steps=int(args.mpc_planning_horizon_steps),
+        ctrl_steps=int(args.mpc_control_steps),
+        knot_count=int(args.mpc_knot_count),
+        temperature=float(args.mpc_temperature),
+        control_update_mode=args.mpc_control_update_mode,
+        pos_noise_scale=float(args.mpc_root_pos_sigma),
+        rot_noise_scale=float(args.mpc_root_rot_sigma),
+        joint_noise_scale=float(args.mpc_joint_sigma),
+        first_ctrl_noise_scale=first_ctrl_noise_scale,
+        last_ctrl_noise_scale=last_ctrl_noise_scale,
+        final_noise_scale=final_noise_scale,
+        use_torch_compile=bool(args.mpc_torch_compile),
+        seed=int(args.seed),
+    )
+
+
 def _build_mpc_config(args: argparse.Namespace) -> G1WbcMpcConfig:
+    """Build the legacy G1 WBC MPC config used by existing tests and runners."""
+
     config = mpc_config_from_preset(args.method, args.mpc_preset)
     overrides = {
         "num_samples": args.mpc_samples,
@@ -372,11 +506,34 @@ def _build_mpc_config(args: argparse.Namespace) -> G1WbcMpcConfig:
     return config
 
 
-def _effective_reward_weights(config: G1WbcMpcConfig) -> dict[str, float]:
-    weights = config.reward_weights
-    if weights is None:
-        weights = REWARD_WEIGHT_PRESETS[config.mode]
-    return {key: float(value) for key, value in weights.items()}
+def _load_method_reward_weights(args: argparse.Namespace) -> dict[str, float] | None:
+    if args.mpc_reward_weights is None:
+        return None
+    return load_reward_weights(args.mpc_reward_weights, args.method)
+
+
+def _effective_reward_weights(method: str, weights: dict[str, float] | None) -> dict[str, float]:
+    return {key: float(value) for key, value in reward_weights_for(method, weights).items()}
+
+
+def _jsonable_infos(infos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for info in infos:
+        row: dict[str, Any] = {}
+        for key, value in info.items():
+            if isinstance(value, torch.Tensor):
+                if value.ndim == 0:
+                    row[key] = float(value.detach().cpu().item())
+                else:
+                    row[key] = value.detach().cpu().numpy().tolist()
+            elif isinstance(value, np.ndarray):
+                row[key] = value.tolist()
+            elif isinstance(value, (int, float, bool, str)):
+                row[key] = value
+            else:
+                row[key] = str(value)
+        out.append(row)
+    return out
 
 
 def _save_rollout(path: Path, rollout: RolloutResult) -> None:
@@ -433,6 +590,59 @@ def _load_saved_qpos(path: str | None, *, device: str) -> torch.Tensor:
     if qpos.ndim != 2 or qpos.shape[-1] != 36:
         raise ValueError(f"Expected saved qpos shape (T,36) or (T,1,36), got {qpos.shape}.")
     return torch.tensor(qpos, dtype=torch.float32, device=device)
+
+
+def _load_saved_command_trajectory(
+    path: str | None,
+    *,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if path is None:
+        raise ValueError("--method replay_command requires --saved-command.")
+    command_path = Path(path).expanduser().resolve()
+    with np.load(command_path) as data:
+        for key in ("command_qpos_trajectory", "refined_qpos", "qpos"):
+            if key in data.files:
+                qpos = data[key]
+                break
+        else:
+            raise ValueError(
+                f"{command_path} is missing command_qpos_trajectory/refined_qpos/qpos."
+            )
+        qvel = (
+            data["command_qvel_trajectory"]
+            if "command_qvel_trajectory" in data.files
+            else None
+        )
+    if qpos.ndim not in (2, 3) or qpos.shape[-1] != QPOS_DIM:
+        raise ValueError(f"Expected saved command qpos shape (T,36), got {qpos.shape}.")
+    if qvel is not None and (qvel.ndim not in (2, 3) or qvel.shape[-1] != QVEL_DIM):
+        raise ValueError(f"Expected saved command qvel shape (T,35), got {qvel.shape}.")
+    qpos_tensor = torch.tensor(qpos, dtype=torch.float32, device=device)
+    qvel_tensor = (
+        None
+        if qvel is None
+        else torch.tensor(qvel, dtype=torch.float32, device=device)
+    )
+    return qpos_tensor, qvel_tensor
+
+
+def _resolve_replay_control_steps(args: argparse.Namespace) -> int:
+    if args.replay_control_steps is not None:
+        return int(args.replay_control_steps)
+    if args.mpc_control_steps is not None:
+        return int(args.mpc_control_steps)
+    if args.saved_command is not None:
+        metrics_path = Path(args.saved_command).expanduser().resolve().parent / "metrics.json"
+        if metrics_path.exists():
+            try:
+                payload = json.loads(metrics_path.read_text())
+                control_steps = payload.get("mpc", {}).get("control_steps")
+                if control_steps is not None:
+                    return int(control_steps)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+    return 20
 
 
 def _cpu_np(value: torch.Tensor) -> np.ndarray:

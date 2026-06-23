@@ -343,17 +343,15 @@ def get_noise_scale(config: Config) -> torch.Tensor:
         config: Config
 
     Returns:
-        Noise scale, shape (num_samples, num_knot_points, nu)
+        Noise scale, shape (num_samples, knot_steps, nu)
     """
-    num_knot_intervals = max(1, int(round(config.horizon / config.knot_dt)))
-    noise_profile = torch.logspace(
+    noise_scale = torch.logspace(
         start=torch.log10(torch.tensor(config.first_ctrl_noise_scale)),
         end=torch.log10(torch.tensor(config.last_ctrl_noise_scale)),
-        steps=num_knot_intervals + 1,
+        steps=int(round(config.horizon / config.knot_dt)),
         device=config.device,
         base=10,
-    )
-    noise_scale = noise_profile[None, :, None]  # Shape: (1, num_knot_points, 1)
+    )[None, :, None]  # Shape: (1, num_knot_steps, 1)
     noise_scale = noise_scale.repeat(1, 1, config.nu)
     if config.embodiment_type in ["bimanual", "right", "left"]:
         object_action_dims = max(int(config.object_action_dims), 0)

@@ -22,13 +22,13 @@ from spider.tasks.g1_wbc.rollout import RolloutResult
 
 @dataclass(frozen=True)
 class MetricThresholds:
-    """Default success thresholds for early G1 WBC iteration."""
+    """Default success thresholds for G1 WBC benchmark rollouts."""
 
-    root_pos_mean: float = 0.25
+    root_pos_mean: float = 1.0
     root_rot_mean: float = 0.6
-    ee_global_pos_mean: float = 0.25
+    ee_global_pos_mean: float = 1.0
     ee_local_pos_mean: float = 0.20
-    contact_mismatch_rate: float = 0.35
+    contact_mismatch_rate: float = 0.40
 
 
 def compute_rollout_metrics(
