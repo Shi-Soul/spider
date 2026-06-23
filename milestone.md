@@ -226,3 +226,199 @@ Interpretation:
   improves smoothness, but slightly worsens contact.
 - `jg_s128_L145_smooth005` is more conservative and improves contact, but gives
   less local gain and slightly worsens smoothness.
+
+## 2026-06-22 Local Frontier Visual Review Update
+
+Follow-up transfer/recovery and saved-rollout visualization runs were completed
+after the local upper-bound stage. The main visual-review candidate was
+`jg_s128_L145_smooth005`, because it was the only candidate that passed both
+`walk` and `qixing` transfer gates.
+
+New review artifacts:
+
+- Report:
+  `outputs/g1_wbc_l145_three_motion_20260622/report/README.md`
+- Metrics CSV:
+  `outputs/g1_wbc_l145_three_motion_20260622/report/metrics_summary.csv`
+- Videos:
+  `outputs/g1_wbc_l145_three_motion_20260622/videos/walk_l145_rollout.mp4`
+  `outputs/g1_wbc_l145_three_motion_20260622/videos/qixing_l145_rollout.mp4`
+  `outputs/g1_wbc_l145_three_motion_20260622/videos/jump_l145_rollout_failed.mp4`
+
+Saved rerun metrics for `jg_s128_L145_smooth005`:
+
+| run | motion | success | score | root | body global | ee global | ee local | contact mismatch | control delta | joint acc |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| saved_walk | walk | true | -1.1314 | 0.0625 | 0.0672 | 0.0690 | 0.0350 | 0.1350 | 0.2344 | 112.318 |
+| saved_qixing | qixing | true | -1.5123 | 0.0598 | 0.0662 | 0.0723 | 0.0467 | 0.2163 | 0.2333 | 94.262 |
+| saved_jump | jump | false | -2.3948 | 0.0925 | 0.0999 | 0.1101 | 0.0443 | 0.3681 | 0.4593 | 226.184 |
+| jump_repeat1 | jump | false | -2.7793 | 0.1817 | 0.1886 | 0.1956 | 0.0480 | 0.3625 | 0.4723 | 235.445 |
+
+Manual render review verdict:
+
+- The local-frontier stage did not produce a qualitative improvement over the
+  previous visualized `best_s128` results.
+- The metric gains in local/posture terms did not translate into better visual
+  motion quality. The reviewed local-frontier outputs are judged worse than the
+  previous `best_s128` experiment.
+- `jg_s128_L145_smooth005` should not be promoted as a three-motion solution:
+  `walk` and `qixing` are viable transfer checks, but `jump` is not stable under
+  saved reruns.
+
+Updated conclusion:
+
+- Treat the local upper-bound / transfer stage as a negative result for quality
+  improvement, even though it was useful diagnostically.
+- The next optimization stage should start from the previous `best_s128`
+  configuration and artifacts, not from the local-frontier variants.
+- Local-frontier candidates (`jg_s128_L142_smooth005`,
+  `jg_s128_L148_posture`, `jg_s128_L145_smooth005`) should remain diagnostic
+  ablations unless a later run clearly beats `best_s128` in both metrics and
+  rendered motion quality.
+
+## 2026-06-23 Fast-Quality Pareto Stage Plan
+
+Goal: determine whether the remaining gap to the packaged SPIDER
+`g1_wbc_joint_global` baseline is primarily a sample-budget limit, a
+repeatability/stability limit, or a reward/gating limit. This stage returns to
+the original v14 `best_s128` reward anchor rather than continuing from the
+local-frontier variants.
+
+Artifacts:
+
+- Design:
+  `docs/superpowers/specs/2026-06-23-g1-wbc-fast-quality-pareto-design.md`
+- Plan:
+  `docs/superpowers/plans/2026-06-23-g1-wbc-fast-quality-pareto-plan.md`
+- Default GPU output root:
+  `/tmp/g1_wbc_fast_quality_pareto_20260623`
+- Transfer output root, if budgets are promoted:
+  `/tmp/g1_wbc_fast_quality_pareto_transfer_20260623`
+- Decision report:
+  `pareto_decision.md`, written next to `pareto_summary.csv`
+
+Stage A repeatability matrix:
+
+```text
+candidate: jg_s128_v14_control
+motions: jump, walk, qixing
+samples: 128
+seeds: 0,1,2
+```
+
+Stage B jump sample-budget ladder:
+
+```text
+candidate: jg_s128_v14_control
+motion: jump
+samples: 64,96,128,192,256
+seeds: 0,1,2
+fixed MPC params: i2/h40/c20/k8, sigma 0.04/0.10/0.18, max_steps 800
+```
+
+Stage C transfer rule:
+
+- Promote the fastest `baseline_close` budget if one exists.
+- Otherwise promote up to two `promising_budget` rows.
+- If completed rows improve toward baseline but fail repeat hard constraints,
+  classify the bottleneck as stability/repeatability first.
+- If no `promising_budget` exists through `s256`, stop sample escalation and
+  design reward/gating repair from `best_s128`.
+- If promoted rows are `unstable`, run stability/acceptance repair before visual
+  review.
+
+Pareto result classes:
+
+- `baseline_close`: stable repeats, score within 0.25 of the SPIDER baseline,
+  and mean max-global ratio to SPIDER baseline <= 1.35.
+- `promising_budget`: stable repeats, score better than `best_s128`, and mean
+  max-global ratio to `best_s128` <= 1.00.
+- `stable_but_low_quality`: stable repeats but not enough quality gain.
+- `unstable`: at least one repeat is usable but hard constraints, expected seeds,
+  or required metrics are inconsistent.
+- `invalid`: no usable completed repeat exists for the group.
+
+The runner also writes `pareto_decision.md` with one of:
+`pending`, `sample_budget_likely`, `sample_budget_partial`,
+`stability_likely`, or `reward_gating_likely`.
+
+Expected interpretation:
+
+- A monotonic quality gain from `s128` to `s192/s256` means sample budget is a
+  likely bottleneck; promote the fastest stable budget to transfer and visual
+  review.
+- Little or no gain through `s256` means reward/gating/dynamics alignment is the
+  likely bottleneck; do not keep escalating samples.
+- Quality gains with missing/failed repeats mean stability is the bottleneck;
+  repair acceptance/repeatability before any visual promotion.
+
+### 2026-06-23 Fast-Quality Pareto Stage B Result
+
+Executed on GPU:
+
+```text
+output_root: /tmp/g1_wbc_fast_quality_pareto_20260623
+candidate: jg_s128_v14_control
+motion: jump
+samples: 64,96,128,192,256
+seeds: 0,1,2
+```
+
+Artifacts:
+
+- Raw sweep summary:
+  `/tmp/g1_wbc_fast_quality_pareto_20260623/candidates/jg_s128_v14_control/summary.csv`
+- Pareto summary:
+  `/tmp/g1_wbc_fast_quality_pareto_20260623/pareto_summary.csv`
+- Decision report:
+  `/tmp/g1_wbc_fast_quality_pareto_20260623/pareto_decision.md`
+
+Observed jump Pareto rows:
+
+| samples | class | success | score_mean | delta_vs_baseline | max_global_ratio_vs_baseline | duration_sec_mean |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| 64 | unstable | 2/3 | -2.304 | -0.226 | 2.166 | 110.5 |
+| 96 | unstable | 2/3 | -2.322 | -0.244 | 2.177 | 111.0 |
+| 128 | unstable | 1/3 | -2.239 | -0.161 | 1.718 | 115.1 |
+| 192 | unstable | 1/3 | -2.231 | -0.153 | 1.731 | 126.5 |
+| 256 | unstable | 1/3 | -2.143 | -0.065 | 1.343 | 141.5 |
+
+Decision:
+
+- `pareto_decision.md` conclusion: `stability_likely`.
+- `s256` is the strongest quality signal: mean score is within `0.065` of the
+  packaged SPIDER baseline and the mean max-global ratio to baseline is `1.343`,
+  inside the `1.35` threshold.
+- However, `s256` only succeeds on `1/3` seeds. All sample budgets fail
+  repeat-stability through `metric_success`, despite clean process completion,
+  `800` steps, accepted MPC, `40/40` accepted windows, and no baseline fallback.
+- Do not run walk/qixing transfer from this stage. The next experiment should
+  repair acceptance/repeatability around the `s256` budget before visual
+  promotion.
+
+`metric_success` definition:
+
+- `root_pos_error_mean < 0.25`
+- `root_rot_error_mean < 0.60`
+- `ee_global_pos_error_mean < 0.25`
+- `ee_local_pos_error_mean < 0.20`
+- `contact_mismatch_rate < 0.35`
+
+The `s256` seed-level hard-gate breakdown shows that the failures are contact
+threshold misses rather than root/EE tracking failures:
+
+| seed | success | score | root_pos | root_rot | ee_global | ee_local | contact_mismatch |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | false | -2.188 | 0.0549 | 0.1148 | 0.0750 | 0.0470 | 0.3594 |
+| 1 | true | -2.125 | 0.0652 | 0.1026 | 0.0811 | 0.0435 | 0.3400 |
+| 2 | false | -2.118 | 0.0510 | 0.1108 | 0.0681 | 0.0443 | 0.3525 |
+
+Current interpretation:
+
+- The continuous quality signal is real: `s256` is close to SPIDER baseline by
+  average score and global tracking ratio.
+- The repeatability failure is narrow: two failed seeds sit just above the
+  `contact_mismatch_rate < 0.35` hard gate.
+- The next experiment should diagnose contact false-positive/false-negative
+  timing for the failed seeds and repair contact/acceptance stability before
+  increasing samples further or doing walk/qixing transfer.
