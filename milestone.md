@@ -258,23 +258,41 @@ Manual render review verdict:
 
 - The local-frontier stage did not produce a qualitative improvement over the
   previous visualized `best_s128` results.
-- The metric gains in local/posture terms did not translate into better visual
-  motion quality. The reviewed local-frontier outputs are judged worse than the
-  previous `best_s128` experiment.
+- The L145 review is not a case where the metrics looked uniformly good but the
+  render looked bad. The five metric groups already expose the main visual
+  issues:
+  - On `jump`, L145 is worse than the packaged SPIDER `g1_wbc_joint_global`
+    baseline across aggregate/global/contact/smooth metrics. The saved run has
+    score `-2.3948` versus baseline `-2.0780`, root `0.0925` versus `0.0425`,
+    body global `0.0999` versus `0.0530`, ee global `0.1101` versus `0.0608`,
+    contact mismatch `0.3681` versus `0.3550`, and control delta `0.4593`
+    versus `0.3372`. `jump_repeat1` makes the root/global drift much worse.
+  - On `walk` and `qixing`, L145 remains successful and tracking/contact quality
+    is roughly competitive, but the smooth/control metrics reflect the visible
+    jitter. `walk` control delta is `0.2344` versus baseline `0.1489`, and joint
+    jerk is `130.4` versus `93.9`. `qixing` control delta is `0.2333` versus
+    `0.1862`, and joint jerk is `106.5` versus `76.3`.
+  - Some local/posture values improved relative to the low-sample search anchor,
+    but the full five-class metric view does not support promotion once baseline
+    smoothness and repeatability are considered.
 - `jg_s128_L145_smooth005` should not be promoted as a three-motion solution:
   `walk` and `qixing` are viable transfer checks, but `jump` is not stable under
   saved reruns.
 
 Updated conclusion:
 
-- Treat the local upper-bound / transfer stage as a negative result for quality
-  improvement, even though it was useful diagnostically.
+- Treat the local upper-bound / transfer stage as a negative promotion result,
+  even though it was useful diagnostically. The current five metric groups do
+  reflect the major L145 visual issues; the weakness was that the promotion gate
+  did not make baseline-relative smoothness and repeatability strong enough
+  blockers.
 - The next optimization stage should start from the previous `best_s128`
   configuration and artifacts, not from the local-frontier variants.
 - Local-frontier candidates (`jg_s128_L142_smooth005`,
   `jg_s128_L148_posture`, `jg_s128_L145_smooth005`) should remain diagnostic
-  ablations unless a later run clearly beats `best_s128` in both metrics and
-  rendered motion quality.
+  ablations unless a later run clearly beats `best_s128` in the five metric
+  groups, stays competitive with the packaged SPIDER baseline on smooth/control
+  metrics, passes repeatability checks, and matches rendered motion quality.
 
 ## 2026-06-23 Fast-Quality Pareto Stage Plan
 
