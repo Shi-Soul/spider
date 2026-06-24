@@ -43,12 +43,21 @@ python -m spider.tasks.g1_wbc_interaction.evaluate \
   --object-vel-weight 0.1
 ```
 
+Evaluation:
+
+The evaluator uses the reference `--motion` time grid as the standard HOI
+evaluation grid. The main trajectory and optional `--baseline` trajectory are
+both sampled on the same contiguous source-grid interval covered by all
+evaluated trajectories. The JSON `metrics` and `baseline.metrics` use the same
+metric key set; `comparison` contains scalar deltas. There is no bidirectional
+main-grid/baseline-grid resampling.
+
 Outputs:
 
-- `metrics.json`: robot metrics, object metrics, baseline object metrics, and deltas.
+- `metrics.json`: standardized robot/object metrics for the main trajectory,
+  optional baseline metrics with the same keys, and deltas.
 - `trajectory_mjwp.npz`: retarget-style `qpos/qvel/time/ctrl` export. When
-  a baseline is supplied, this is resampled onto the baseline `time` grid and
-  keeps the same windowed shape.
+  saved from this evaluator, this uses the standardized source time grid.
 - `trajectory_mpc_rl_object.npz`: same trajectory under an explicit MPC+RL name.
 - `rollout.npz`: full native 50 Hz debug rollout tensors.
 - `mpc_command.npz`: optimized robot command/control trace.

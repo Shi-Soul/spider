@@ -85,6 +85,10 @@ This code base provides the following pipeline from human video to robot actions
 
 ## Quickstart
 
+For the G1 humanoid-object workflows in this branch, see
+[G1 HOI Standard Usage](README_G1_HOI_USAGE.md). It documents the independent
+`g1 retarget hoi` and `g1 wbc mpc hoi` entrypoints.
+
 Clone example datasets:
 
 ```bash

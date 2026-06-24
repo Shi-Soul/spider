@@ -24,8 +24,6 @@ from spider.tasks.g1_wbc.policy import load_wbc_actor, resolve_checkpoint_path
 from spider.tasks.g1_wbc.rollout import RolloutResult
 from spider.tasks.g1_wbc_interaction.metrics import (
     InteractionScoreWeights,
-    compute_interaction_rollout_metrics,
-    compute_retarget_object_metrics,
 )
 from spider.tasks.g1_wbc_interaction.motion import load_interaction_motion, qvel_from_full_qpos
 from spider.tasks.g1_wbc_interaction.render import render_interaction_comparison_video
@@ -34,6 +32,14 @@ from spider.tasks.g1_wbc_interaction.rollout import (
     command_from_full_qpos_trajectory,
     load_interaction_model_and_layout,
     run_interaction_command_rollout,
+)
+from spider.tasks.g1_wbc_interaction.standard_eval import (
+    FullStateTrajectory,
+    evaluate_trajectory_on_reference_grid,
+    load_full_state_trajectory,
+    load_reference_motion_for_standard_eval,
+    restrict_reference_to_covered_time_grid,
+    trajectory_from_rollout,
 )
 
 
@@ -44,6 +50,13 @@ def main() -> None:
         raise RuntimeError(f"Requested {device}, but CUDA is not available.")
     model, layout = load_interaction_model_and_layout(args.model_path)
     source_dt = _resolve_source_dt(args.motion, args.source_dt)
+    eval_motion, eval_time_grid = load_reference_motion_for_standard_eval(
+        args.motion,
+        model=model,
+        layout=layout,
+        device=device,
+        source_dt=source_dt,
+    )
     motion = load_interaction_motion(
         args.motion,
         model=model,
@@ -51,7 +64,6 @@ def main() -> None:
         device=device,
         source_dt=source_dt,
     )
-    raw_ref_qpos = _load_raw_reference_qpos(args.motion, layout)
     checkpoint_path = None
     actor = None
     if args.method != "static_qpos":
@@ -73,10 +85,24 @@ def main() -> None:
     mpc_payload = None
     spider_config = None
     result = None
+    subject_trajectory = None
     if args.method == "static_qpos":
-        qpos = _load_saved_full_qpos(args.saved_qpos, layout, device=device)
+        if args.saved_qpos is None:
+            raise ValueError("--method static_qpos requires --saved-qpos.")
+        subject_trajectory = load_full_state_trajectory(
+            args.saved_qpos,
+            layout=layout,
+            fallback_dt=POLICY_DT,
+        )
+        qpos = torch.as_tensor(subject_trajectory.qpos, dtype=torch.float32, device=device)
         qvel = qvel_from_full_qpos(qpos, layout, dt=POLICY_DT)
         rollout = _static_rollout(qpos, qvel, motion, rollout_config)
+        if subject_trajectory.qvel is None:
+            subject_trajectory = FullStateTrajectory(
+                qpos=subject_trajectory.qpos,
+                qvel=_cpu_np(qvel),
+                time=subject_trajectory.time,
+            )
     elif args.method == "no_mpc":
         assert actor is not None
         command_qpos = motion.full_state_qpos()[:, None, :]
@@ -98,6 +124,7 @@ def main() -> None:
             initial_qpos=motion.full_state_qpos()[0],
             initial_qvel=motion.full_state_qvel()[0],
         )
+        subject_trajectory = trajectory_from_rollout(rollout)
     else:
         assert actor is not None
         spider_config = _build_sampling_config(args)
@@ -123,6 +150,7 @@ def main() -> None:
             total_steps=total_steps,
         )
         rollout = result.rollout
+        subject_trajectory = trajectory_from_rollout(rollout)
         mpc_payload = {
             **sampling_mpc_metadata(spider_config),
             "history": _jsonable_infos(receding_result.infos),
@@ -134,24 +162,34 @@ def main() -> None:
             "retarget_score_weights": _retarget_score_weights_from_args(args).__dict__,
         }
 
-    metrics = compute_interaction_rollout_metrics(motion, rollout, layout=layout)
-    rollout_qpos_np = _cpu_np(rollout.qpos[1:, 0])
-    rollout_times = (np.arange(rollout_qpos_np.shape[0], dtype=np.float64) + 1.0) * POLICY_DT
-    rollout_ref_qpos = _reference_qpos_at_times(
-        raw_ref_qpos,
-        layout,
-        source_dt,
-        rollout_times,
-    )
-    metrics.update(
-        compute_retarget_object_metrics(
-            rollout_qpos_np,
-            rollout_ref_qpos,
-            layout,
-            pos_threshold=args.object_pos_threshold,
-            quat_threshold=args.object_quat_threshold,
+    assert subject_trajectory is not None
+    baseline_trajectory = None
+    if args.baseline is not None:
+        baseline_trajectory = load_full_state_trajectory(
+            args.baseline,
+            layout=layout,
+            fallback_dt=args.baseline_dt,
         )
+    eval_trajectories = [subject_trajectory]
+    if baseline_trajectory is not None:
+        eval_trajectories.append(baseline_trajectory)
+    eval_motion, eval_time_grid = restrict_reference_to_covered_time_grid(
+        eval_motion,
+        eval_time_grid,
+        eval_trajectories,
     )
+    standardized_eval = evaluate_trajectory_on_reference_grid(
+        subject_trajectory,
+        reference_motion=eval_motion,
+        reference_time=eval_time_grid,
+        layout=layout,
+        rollout_config=rollout_config,
+        pos_threshold=args.object_pos_threshold,
+        quat_threshold=args.object_quat_threshold,
+    )
+    metrics = standardized_eval.metrics
+    rollout_qpos_np = standardized_eval.qpos
+    rollout_ref_qpos = standardized_eval.reference_qpos
     payload: dict[str, Any] = {
         "method": args.method,
         "motion": str(Path(args.motion).expanduser().resolve()),
@@ -163,77 +201,35 @@ def main() -> None:
         "num_envs": args.num_envs,
         "max_steps": args.max_steps,
         "objects": list(layout.object_names),
+        "evaluation": standardized_eval.metadata,
         "metrics": metrics,
     }
     baseline_metrics = None
-    baseline_qpos_np = None
     baseline_video_qpos = None
-    baseline_time_grid = None
-    if args.baseline is not None:
-        baseline_qpos_np, baseline_times = _load_saved_full_trajectory(
-            args.baseline,
-            layout,
-            fallback_dt=args.baseline_dt,
-        )
-        baseline_time_grid = _load_saved_time_grid(
-            args.baseline,
-            layout,
-            fallback_dt=args.baseline_dt,
-        )
-        baseline_ref_qpos_full = _reference_qpos_at_times(
-            raw_ref_qpos,
-            layout,
-            source_dt,
-            baseline_times,
-        )
-        retarget_grid_arrays = _retarget_style_arrays(
-            rollout,
+    if baseline_trajectory is not None:
+        baseline_eval = evaluate_trajectory_on_reference_grid(
+            baseline_trajectory,
+            reference_motion=eval_motion,
+            reference_time=eval_time_grid,
             layout=layout,
-            time_grid=baseline_time_grid,
-        )
-        retarget_grid_qpos = _flatten_qpos_np(retarget_grid_arrays["qpos"], layout.nq)
-        retarget_grid_metrics = compute_retarget_object_metrics(
-            retarget_grid_qpos,
-            baseline_ref_qpos_full,
-            layout,
+            rollout_config=rollout_config,
             pos_threshold=args.object_pos_threshold,
             quat_threshold=args.object_quat_threshold,
         )
-        baseline_full_metrics = compute_retarget_object_metrics(
-            baseline_qpos_np,
-            baseline_ref_qpos_full,
-            layout,
-            pos_threshold=args.object_pos_threshold,
-            quat_threshold=args.object_quat_threshold,
-        )
-        baseline_matched_qpos = _qpos_at_times(
-            baseline_qpos_np,
-            baseline_times,
-            layout,
-            rollout_times,
-        )
-        baseline_video_qpos = baseline_matched_qpos
-        baseline_metrics = compute_retarget_object_metrics(
-            baseline_matched_qpos,
-            rollout_ref_qpos,
-            layout,
-            pos_threshold=args.object_pos_threshold,
-            quat_threshold=args.object_quat_threshold,
-        )
+        baseline_metrics = baseline_eval.metrics
+        baseline_video_qpos = baseline_eval.qpos
+        metric_key_delta = set(metrics).symmetric_difference(baseline_metrics)
+        if metric_key_delta:
+            raise RuntimeError(
+                "Standard HOI evaluation produced mismatched metric keys: "
+                f"{sorted(metric_key_delta)}"
+            )
         payload["baseline"] = {
             "path": str(Path(args.baseline).expanduser().resolve()),
             "metrics": baseline_metrics,
-            "full_metrics": baseline_full_metrics,
-        }
-        payload["retarget_grid"] = {
-            "time_shape": list(baseline_time_grid.shape),
-            "metrics": retarget_grid_metrics,
+            "evaluation": baseline_eval.metadata,
         }
         payload["comparison"] = _comparison(metrics, baseline_metrics)
-        payload["retarget_grid_comparison"] = _comparison(
-            retarget_grid_metrics,
-            baseline_full_metrics,
-        )
     if mpc_payload is not None:
         payload["mpc"] = mpc_payload
     print(json.dumps(_jsonify(payload), indent=2, sort_keys=True))
@@ -253,14 +249,14 @@ def main() -> None:
                 output_dir / "trajectory_mjwp.npz",
                 rollout,
                 layout=layout,
-                time_grid=baseline_time_grid,
+                time_grid=eval_time_grid,
                 window_steps=window_steps,
             )
             _save_retarget_style(
                 output_dir / "trajectory_mpc_rl_object.npz",
                 rollout,
                 layout=layout,
-                time_grid=baseline_time_grid,
+                time_grid=eval_time_grid,
                 window_steps=window_steps,
             )
             if result is not None:
@@ -559,96 +555,19 @@ def _static_rollout(qpos: torch.Tensor, qvel: torch.Tensor, motion, config):
     )
 
 
-def _load_saved_full_qpos(path: str | None, layout, *, device: str) -> torch.Tensor:
-    if path is None:
-        raise ValueError("--method static_qpos requires --saved-qpos.")
-    qpos_path = Path(path).expanduser().resolve()
-    with np.load(qpos_path) as data:
-        for key in ("qpos", "refined_qpos", "command_qpos_trajectory"):
-            if key in data.files:
-                qpos = data[key]
-                break
-        else:
-            raise ValueError(f"{qpos_path} is missing qpos/refined_qpos/command_qpos_trajectory.")
-    if qpos.ndim == 3 and qpos.shape[1] == 1:
-        qpos = qpos[:, 0]
-    if qpos.ndim == 3:
-        qpos = qpos.reshape(-1, qpos.shape[-1])
-    if qpos.ndim != 2 or qpos.shape[-1] != layout.nq:
-        raise ValueError(f"Expected qpos shape (T,{layout.nq}), got {qpos.shape}.")
-    return torch.tensor(qpos, dtype=torch.float32, device=device)
-
-
-def _load_saved_full_trajectory(
-    path: str | Path,
-    layout,
-    *,
-    fallback_dt: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    traj_path = Path(path).expanduser().resolve()
-    with np.load(traj_path) as data:
-        for key in ("qpos", "refined_qpos", "command_qpos_trajectory"):
-            if key in data.files:
-                qpos = np.asarray(data[key])
-                break
-        else:
-            raise ValueError(f"{traj_path} is missing qpos/refined_qpos/command_qpos_trajectory.")
-        if "time" in data.files:
-            time = np.asarray(data["time"], dtype=np.float64).reshape(-1)
-        else:
-            count = int(np.prod(qpos.shape[:-1])) if qpos.ndim > 2 else int(qpos.shape[0])
-            time = np.arange(count, dtype=np.float64) * float(fallback_dt)
-    qpos = _flatten_qpos_np(qpos, layout.nq)
-    if time.shape[0] != qpos.shape[0]:
-        time = np.arange(qpos.shape[0], dtype=np.float64) * float(fallback_dt)
-    return qpos, time
-
-
-def _load_saved_time_grid(
-    path: str | Path,
-    layout,
-    *,
-    fallback_dt: float,
-) -> np.ndarray:
-    traj_path = Path(path).expanduser().resolve()
-    with np.load(traj_path) as data:
-        for key in ("qpos", "refined_qpos", "command_qpos_trajectory"):
-            if key in data.files:
-                qpos_shape = tuple(np.asarray(data[key]).shape)
-                break
-        else:
-            raise ValueError(
-                f"{traj_path} is missing qpos/refined_qpos/command_qpos_trajectory."
-            )
-        if not qpos_shape or qpos_shape[-1] != layout.nq:
-            raise ValueError(f"Expected qpos last dim {layout.nq}, got {qpos_shape}.")
-        time_shape = qpos_shape[:-1]
-        count = int(np.prod(time_shape))
-        if "time" in data.files:
-            time = np.asarray(data["time"], dtype=np.float64)
-        else:
-            time = np.arange(count, dtype=np.float64) * float(fallback_dt)
-        if time.shape == time_shape:
-            return np.ascontiguousarray(time)
-        if time.size != count:
-            raise ValueError(
-                f"Expected {count} timestamps for {traj_path}, got shape {time.shape}."
-            )
-        return np.ascontiguousarray(time.reshape(time_shape))
-
-
 def _comparison(metrics: dict[str, Any], baseline: dict[str, Any]) -> dict[str, float]:
     out = {}
-    for key in (
-        "obj_pos_err",
-        "obj_quat_err",
-        "obj_pos_err_mean",
-        "obj_quat_err_mean",
-        "add_auc10_mean",
-        "add_auc10",
-    ):
-        if key in metrics and key in baseline:
-            out[f"{key}_delta_vs_baseline"] = float(metrics[key]) - float(baseline[key])
+    for key, value in metrics.items():
+        if key not in baseline:
+            continue
+        if isinstance(value, bool) or isinstance(baseline[key], bool):
+            continue
+        if not isinstance(value, (int, float, np.integer, np.floating)):
+            continue
+        base_value = baseline[key]
+        if not isinstance(base_value, (int, float, np.integer, np.floating)):
+            continue
+        out[f"{key}_delta_vs_baseline"] = float(value) - float(base_value)
     return out
 
 
@@ -730,6 +649,17 @@ def _resolve_source_dt(motion_path: str | Path, explicit: float | None) -> float
         return float(explicit)
     path = Path(motion_path).expanduser().resolve()
     with np.load(path) as data:
+        if "time" in data.files:
+            time = np.asarray(data["time"], dtype=np.float64).reshape(-1)
+            if time.shape[0] >= 2:
+                dt = np.diff(time)
+                mean_dt = float(dt.mean())
+                if not np.allclose(dt, mean_dt, rtol=1.0e-4, atol=1.0e-7):
+                    raise ValueError(
+                        f"Motion {path} has a non-uniform time grid; "
+                        "standard HOI evaluation requires uniform source time."
+                    )
+                return mean_dt
         if "dt" in data.files:
             return float(np.asarray(data["dt"]).item())
         if "fps" in data.files:
@@ -748,40 +678,6 @@ def _candidate_config_paths(motion_path: Path) -> list[Path]:
     if task_dir.is_dir():
         candidates.extend(sorted(task_dir.glob("*/config.yaml")))
     return [path for path in candidates if path.is_file()]
-
-
-def _load_raw_reference_qpos(path: str | Path, layout) -> np.ndarray:
-    ref_path = Path(path).expanduser().resolve()
-    with np.load(ref_path) as data:
-        if "qpos" not in data.files:
-            raise ValueError(f"Reference motion {ref_path} is missing qpos.")
-        return _flatten_qpos_np(np.asarray(data["qpos"]), layout.nq)
-
-
-def _reference_qpos_at_times(
-    raw_qpos: np.ndarray,
-    layout,
-    source_dt: float,
-    times: np.ndarray,
-) -> np.ndarray:
-    raw_qpos = _flatten_qpos_np(raw_qpos, layout.nq)
-    times = np.asarray(times, dtype=np.float64)
-    if raw_qpos.shape[0] <= 1:
-        return np.repeat(raw_qpos[:1], times.shape[0], axis=0)
-    src_dt = float(source_dt)
-    src_duration = (raw_qpos.shape[0] - 1) * src_dt
-    u = np.clip(times, 0.0, src_duration) / src_dt
-    i0 = np.floor(u).astype(np.int64)
-    i1 = np.clip(i0 + 1, 0, raw_qpos.shape[0] - 1)
-    alpha = (u - i0.astype(np.float64))[:, None]
-    out = raw_qpos[i0] * (1.0 - alpha) + raw_qpos[i1] * alpha
-    for qpos_adr in _freejoint_qpos_addrs(layout):
-        out[:, qpos_adr + 3 : qpos_adr + 7] = _slerp_np(
-            raw_qpos[i0, qpos_adr + 3 : qpos_adr + 7],
-            raw_qpos[i1, qpos_adr + 3 : qpos_adr + 7],
-            alpha,
-        )
-    return out
 
 
 def _qpos_at_times(
