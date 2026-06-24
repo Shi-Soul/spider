@@ -788,7 +788,7 @@ def get_terminate(
         terminate = (obj_pos_error > config.object_pos_threshold) | (
             obj_quat_error > config.object_rot_threshold
         )
-    elif config.embodiment_type in ["humanoid", "humanoid_object"]:
+    elif config.embodiment_type == "humanoid":
         base_pos = qpos_sim[:, :3]
         base_pos_ref = qpos_ref[:3].unsqueeze(0)
         base_pos_error = torch.norm(base_pos - base_pos_ref, p=2, dim=1)
@@ -800,6 +800,37 @@ def get_terminate(
         terminate = (base_pos_error > config.base_pos_threshold) | (
             base_quat_error > config.base_rot_threshold
         )
+    elif config.embodiment_type == "humanoid_object":
+        base_pos = qpos_sim[:, :3]
+        base_pos_ref = qpos_ref[:3].unsqueeze(0)
+        base_pos_error = torch.norm(base_pos - base_pos_ref, p=2, dim=1)
+        base_quat = qpos_sim[:, 3:7]
+        base_quat_ref = qpos_ref[3:7].unsqueeze(0)
+        base_quat_error = torch.norm(
+            quat_sub(base_quat, base_quat_ref.repeat(qpos_sim.shape[0], 1)),
+            p=2,
+            dim=1,
+        )
+        terminate = (
+            (base_pos_error > config.base_pos_threshold)
+            | (base_quat_error > config.base_rot_threshold)
+        )
+        if config.terminate_on_object_threshold:
+            object_pos = qpos_sim[:, -7:-4]
+            object_pos_ref = qpos_ref[-7:-4].unsqueeze(0)
+            object_pos_error = torch.norm(object_pos - object_pos_ref, p=2, dim=1)
+            object_quat = qpos_sim[:, -4:]
+            object_quat_ref = qpos_ref[-4:].unsqueeze(0)
+            object_quat_error = torch.norm(
+                quat_sub(object_quat, object_quat_ref.repeat(qpos_sim.shape[0], 1)),
+                p=2,
+                dim=1,
+            )
+            terminate = (
+                terminate
+                | (object_pos_error > config.object_pos_threshold)
+                | (object_quat_error > config.object_rot_threshold)
+            )
     else:
         raise ValueError(f"Invalid embodiment_type: {config.embodiment_type}")
     return terminate

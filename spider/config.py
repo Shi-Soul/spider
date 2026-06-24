@@ -129,6 +129,7 @@ class Config:
     improvement_check_steps: int = 1
     # Termination parameters
     terminate_resample: bool = False
+    terminate_on_object_threshold: bool = False
     object_pos_threshold: float = 0.1
     object_rot_threshold: float = 0.3
     max_local_retries: int = 3

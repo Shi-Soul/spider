@@ -66,6 +66,7 @@ vel_rew_scale: 0.0001
 terminal_rew_scale: 1.0
 # Termination threshold
 terminate_resample: false
+terminate_on_object_threshold: false
 object_pos_threshold: 0.1 # meters
 object_rot_threshold: 0.3 # radians
 # Gibbs sampling
