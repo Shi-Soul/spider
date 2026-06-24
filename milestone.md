@@ -440,3 +440,241 @@ Current interpretation:
 - The next experiment should diagnose contact false-positive/false-negative
   timing for the failed seeds and repair contact/acceptance stability before
   increasing samples further or doing walk/qixing transfer.
+
+## 2026-06-24 Mechanism Quality-Speed Stage
+
+Maintenance note:
+
+- `spider/milestone.md` is the active source of truth for SPIDER G1 WBC
+  experiment milestones.
+- The workspace-root `../milestone.md` is now treated as a historical snapshot
+  and should not be maintained for new SPIDER G1 WBC conclusions.
+
+Goal: identify the core factors that control optimization quality and inference
+speed before running any full `bench_data` evaluation. The quality floor is the
+current acceptable `best_s128`; the long-term target is the packaged SPIDER
+`baseline_8192`.
+
+Primary metric groups:
+
+- global: `root_pos_error_mean`, `body_global_pos_error_mean`,
+  `ee_global_pos_error_mean`
+- local: `body_local_pos_error_mean`, `ee_local_pos_error_mean`
+- smooth: `control_delta_mean`, `joint_acc_mean`
+- contact: `contact_mismatch_rate`
+
+Artifacts:
+
+- Mechanism report:
+  `outputs/g1_wbc_mechanism_20260623/mechanism_report.md`
+- Stage A sample-budget summary:
+  `outputs/g1_wbc_mechanism_20260623/stage_a_budget_curve/summary.csv`
+- Jump repeat summary:
+  `outputs/g1_wbc_mechanism_20260623/stage_a_jump_repeats/summary.csv`
+- Stage B structure summaries:
+  `outputs/g1_wbc_mechanism_20260623/stage_b_structure/**/summary.csv`
+- Stage C mechanism summaries:
+  `outputs/g1_wbc_mechanism_20260623/stage_c_mechanisms/**/summary.csv`
+- Jump three-panel comparison video:
+  `outputs/g1_wbc_mechanism_20260623/videos/jump_sweetpoint_best_s128_spider_baseline_3panel.mp4`
+
+Completed experiment matrix:
+
+- Stage A: cross-motion sample-budget curve on `jump`, `walk`, `qixing`;
+  samples `64,96,128,192,256,512,1024,2048`; fixed
+  `i2/h40/c20/k8`, sigma `0.04/0.10/0.18`, seed 0.
+- Stage A repeat: jump `s128/s512/s2048`, seeds 1 and 2, merged with seed 0 for
+  three-seed statistics.
+- Stage B: jump structure probes at `s512`, including iterations, knot count,
+  and paired horizon/control variants.
+- Stage C: jump mechanism probes at `s128/s256/s512`, including warm start,
+  command regularization, and command smoothness.
+
+### Sample-Budget Result
+
+Jump three-seed statistics for the base configuration
+`i2/h40/c20/k8`, sigma `0.04/0.10/0.18`:
+
+| samples | success | score mean | global sum | local sum | contact | control delta | joint acc | duration mean |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 1/3 | -2.2193 | 0.2401 | 0.0716 | 0.3525 | 0.4540 | 225.1 | 115.1 s |
+| 512 | 2/3 | -2.0536 | 0.1863 | 0.0696 | 0.3346 | 0.4457 | 217.4 | 188.7 s |
+| 2048 | 2/3 | -2.1080 | 0.1770 | 0.0695 | 0.3533 | 0.4233 | 212.6 | 641.2 s |
+
+Interpretation:
+
+- `s512` is the current jump base sweetpoint: it is much better than `s128` on
+  average score/global/contact, while avoiding the high cost and variance of
+  `s2048`.
+- `s2048` mainly buys smoother control and slightly better global tracking, but
+  it is not a better score/contact Pareto point and costs roughly 3.4x the
+  `s512` wall clock.
+- `walk` does not justify high samples in this stage: `s128` is already near the
+  score/contact sweet spot, while `s2048` costs about 6x more for negligible
+  score gain.
+- `qixing` shows high-sample improvement on score/contact/smooth, but its global
+  tracking is non-monotonic. Its bottleneck should not be treated as pure sample
+  budget without more targeted diagnosis.
+
+Current jump sweetpoint configuration:
+
+```text
+method: g1_wbc_joint_global
+samples: 512
+iterations: 2
+planning_horizon_steps: 40
+control_steps: 20
+knot_count: 8
+sampling_mode: knot
+temperature: 0.7
+root_pos_sigma: 0.04
+root_rot_sigma: 0.10
+joint_sigma: 0.18
+smooth_passes: 0
+command_reg_weight: 0.0
+command_smooth_weight: 0.0
+guided_candidate: true
+acceptance_gate: true
+reward_weights: g1_wbc_reward_weights_method_specific_v14_20260612.json
+max_steps: 800
+```
+
+Observed jump sweetpoint wall clock:
+
+| seed | duration | score | contact |
+| ---: | ---: | ---: | ---: |
+| 0 | 203.488 s | -2.0607 | 0.3344 |
+| 1 | 184.931 s | -1.9850 | 0.3156 |
+| 2 | 177.787 s | -2.1152 | 0.3537 |
+
+Mean wall clock: `188.735 s` for 800 policy steps on the current 4070 Laptop
+environment.
+
+### Structure Factors
+
+Anchor: `s512/i2/h40/c20/k8`, score `-2.0607`, global sum `0.1947`,
+contact `0.3344`, control delta `0.4401`, joint acc `217.7`, duration
+`203.5 s`.
+
+| variant | score | global sum | local sum | contact | control delta | joint acc | duration | conclusion |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `i1` | -2.5858 | 0.4494 | 0.0845 | 0.3556 | 0.5078 | 244.7 | 117.4 s | Too little optimization depth. |
+| `i3` | -1.9812 | 0.1453 | 0.0639 | 0.3413 | 0.4163 | 212.6 | 276.9 s | Best quality ceiling found in this stage. |
+| `k4` | -2.6747 | 0.5538 | 0.0820 | 0.3419 | 0.3715 | 194.8 | 173.6 s | Smooth but under-expressive; tracking collapses. |
+| `k12` | -2.3972 | 0.3229 | 0.0710 | 0.3594 | 0.5639 | 249.6 | 182.5 s | Higher-dimensional search is worse at s512. |
+| `k16` | -2.8916 | 0.6371 | 0.0725 | 0.3587 | 0.6706 | 286.0 | 193.4 s | Not viable. |
+| `h20/c10` | -8.8669 | 4.5793 | 0.0609 | 0.3713 | 0.2516 | 148.4 | 314.8 s | Short lookahead fails jump. |
+| `h80/c20` | -2.1987 | 0.1638 | 0.0776 | 0.3662 | 0.4020 | 207.3 | 268.3 s | Better global, worse score/contact/local. |
+| `h80/c40` | -2.2804 | 0.1893 | 0.0853 | 0.3775 | 0.4127 | 210.6 | 136.7 s | Faster, but below the quality floor. |
+
+Interpretation:
+
+- `i2/h40/c20/k8` is the current structure anchor.
+- `i2` is the lowest acceptable optimization depth; `i3` is a quality-ceiling
+  upgrade, not the speed anchor.
+- `h40/c20` and `k8` are the tested-range sweetpoints. Nearby alternatives either
+  fail tracking/contact or do not preserve score.
+
+### Algorithm Mechanisms
+
+Best speed-quality mechanism found: `mpc_command_reg_weight=0.005`.
+
+| variant | samples | score | global sum | local sum | contact | control delta | joint acc | duration |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| base | 128 | -2.2037 | 0.2204 | 0.0727 | 0.3562 | 0.4553 | 230.2 | 120.2 s |
+| warm-best | 128 | -2.1205 | 0.1980 | 0.0724 | 0.3456 | 0.4496 | 226.9 | 113.5 s |
+| warm-best | 256 | -2.1024 | 0.1729 | 0.0719 | 0.3469 | 0.4604 | 228.4 | 138.5 s |
+| warm-best | 512 | -2.1267 | 0.2283 | 0.0775 | 0.3356 | 0.4501 | 222.1 | 198.3 s |
+| warm-mean-0.8 | 128 | -2.2597 | 0.2565 | 0.0746 | 0.3481 | 0.4890 | 227.9 | 111.3 s |
+| warm-mean-0.8 | 256 | -2.4045 | 0.2365 | 0.0715 | 0.4031 | 0.4543 | 225.0 | 133.9 s |
+| warm-mean-0.8 | 512 | -2.1043 | 0.1914 | 0.0688 | 0.3450 | 0.4281 | 216.3 | 192.8 s |
+| reg0.005 | 128 | -2.0561 | 0.1772 | 0.0681 | 0.3363 | 0.4372 | 221.1 | 112.0 s |
+| reg0.005 | 256 | -2.0628 | 0.1804 | 0.0697 | 0.3381 | 0.4438 | 220.0 | 139.1 s |
+| reg0.005 | 512 | -2.0562 | 0.2030 | 0.0671 | 0.3312 | 0.4300 | 216.1 | 184.9 s |
+| smooth0.0001 | 128 | -2.1820 | 0.2150 | 0.0698 | 0.3519 | 0.4675 | 225.0 | 112.4 s |
+| smooth0.0001 | 256 | -2.2210 | 0.2103 | 0.0701 | 0.3681 | 0.4397 | 221.5 | 135.9 s |
+| smooth0.0001 | 512 | -2.0563 | 0.1798 | 0.0708 | 0.3400 | 0.4412 | 220.3 | 175.4 s |
+
+Packaged jump `baseline_8192` reference:
+
+```text
+score: -2.0780
+global sum: 0.1563
+contact mismatch: 0.3550
+control delta: 0.3372
+joint acc: 191.9
+```
+
+Key comparison:
+
+- `reg0.005/s128` reaches score `-2.0561` in `112.0 s`, beating the packaged
+  baseline score and clearly improving over base `s128` on global/local/contact
+  and smooth metrics. It is the strongest current speed-quality candidate.
+- `i3/s512` reaches score `-1.9812` and global sum `0.1453`, beating the
+  packaged baseline on score/global/contact. It is the strongest current quality
+  candidate, but costs `276.9 s`.
+- Both `reg0.005/s128` and `i3/s512` still lag the packaged baseline on smooth:
+  control delta and joint acceleration remain higher than baseline.
+- `warm-best` helps low samples but regresses at `s512`; it is a secondary
+  low-sample assist, not the main solution.
+- `warm-mean-0.8` is not recommended.
+- `command_smooth_weight=0.0001` did not cleanly improve smoothness and can hurt
+  contact/score at low samples.
+
+Current factor ranking:
+
+1. `command_reg_weight=0.005`: strongest quality-per-second lever.
+2. `mpc_num_iterations`: `i2 -> i3` is the best quality lever and more efficient
+   than increasing samples to `s2048`.
+3. `mpc_num_samples`: useful up to `s512` on jump, weak/non-monotonic beyond.
+4. `horizon/control`: sensitive; keep `h40/c20` as anchor.
+5. `knot_count`: keep `k8`; `k4` under-expresses and `k12/k16` dilute search.
+6. `warm_start`: `best` helps low samples only; `mean/0.8` is not reliable.
+7. `command_smooth_weight=0.0001`: not a strong mechanism as configured.
+
+### Video And Repeatability Notes
+
+Three-panel jump comparison video:
+
+```text
+outputs/g1_wbc_mechanism_20260623/videos/jump_sweetpoint_best_s128_spider_baseline_3panel.mp4
+```
+
+Video panels:
+
+1. `sweetpoint_s512_i2_h40_c20_k8_seed1`
+2. `best_s128`
+3. `spider_baseline_8192`
+
+Metrics for the rendered trajectories:
+
+| trajectory | score | root | body global | ee global | contact mismatch | control delta | joint acc | success |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| sweetpoint s512 seed1 saved rollout | -2.0799 | 0.0568 | 0.0647 | 0.0722 | 0.3356 | 0.4359 | 215.6 | true |
+| best_s128 visualized rerun | -2.2657 | 0.0801 | 0.0872 | 0.0935 | 0.3537 | 0.4710 | 223.2 | false |
+| spider baseline 8192 | -2.0780 | 0.0425 | 0.0530 | 0.0608 | 0.3550 | 0.3372 | 191.9 | false |
+
+Important repeatability finding:
+
+- The same configuration on the same `jump` motion can produce different rollout
+  results across seeds and even across saved reruns.
+- Example: Stage A `s512 seed0` had score `-2.0607`, but a later saved-rollout
+  rerun with the same explicit configuration produced score `-2.2609`.
+- A later saved `s512 seed1` rerun produced score `-2.0799`, close to the
+  sweetpoint and suitable for video review.
+- Therefore, single rollout comparisons are not sufficient for configuration
+  promotion. Future comparisons must use multi-seed or repeated runs and should
+  report mean/std/min/max plus success rate across score/global/local/smooth/contact
+  groups.
+
+Recommended next experiments:
+
+1. Repeat `reg0.005/s128` and `reg0.005/s256` on seeds 1 and 2, then transfer to
+   `walk` and `qixing` only if jump repeatability holds.
+2. Sweep command regularization around the discovered point:
+   `0.001, 0.002, 0.005, 0.01`.
+3. Test `reg0.005 + i3/s512` as a quality-ceiling candidate after the reg repeat
+   check.
+4. If smooth remains the main gap, test smaller command-smooth weights such as
+   `0.00002` and `0.00005`; do not continue with `0.0001` as the default smooth
+   penalty.

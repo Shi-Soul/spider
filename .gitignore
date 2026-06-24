@@ -234,3 +234,7 @@ scripts/*
 !scripts/profile_g1_wbc_mpc_phases.py
 !scripts/analyze_g1_wbc_sweep.py
 !scripts/run_g1_wbc_local_first_stage.py
+
+# Local agent planning artifacts
+AGENTS.md
+docs/superpowers/
