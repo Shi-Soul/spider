@@ -184,6 +184,10 @@ def main() -> None:
             _save_rollout(output_dir / "rollout.npz", rollout)
             if mpc_result is not None:
                 _save_mpc_result(output_dir / "mpc_command.npz", mpc_result)
+                _save_tracking_bfm_motion(
+                    output_dir / "mpc_motion.npz",
+                    mpc_result.command,
+                )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -566,8 +570,35 @@ def _save_mpc_result(path: Path, result) -> None:
         "command_joint_vel": _cpu_np(result.command.joint_vel),
         "command_body_pos_w": _cpu_np(result.command.body_pos_w),
         "command_body_quat_w": _cpu_np(result.command.body_quat_w),
+        "command_body_lin_vel_w": _cpu_np(result.command.body_lin_vel_w),
+        "command_body_ang_vel_w": _cpu_np(result.command.body_ang_vel_w),
         "command_qpos_trajectory": _cpu_np(result.command.qpos_trajectory),
         "command_qvel_trajectory": _cpu_np(result.command.qvel_trajectory),
+    }
+    np.savez_compressed(path, **arrays)
+
+
+def _save_tracking_bfm_motion(path: Path, command) -> None:
+    if int(command.num_envs) != 1:
+        raise ValueError(
+            "Expected single-env command for tracking-bfm export, "
+            f"got {command.num_envs}."
+        )
+    arrays = {
+        "fps": np.array(float(command.fps), dtype=np.float32),
+        "joint_pos": _cpu_np(command.joint_pos[:, 0]).astype(np.float32, copy=False),
+        "joint_vel": _cpu_np(command.joint_vel[:, 0]).astype(np.float32, copy=False),
+        "body_pos_w": _cpu_np(command.body_pos_w[:, 0]).astype(np.float32, copy=False),
+        "body_quat_w": _cpu_np(command.body_quat_w[:, 0]).astype(
+            np.float32, copy=False
+        ),
+        "body_lin_vel_w": _cpu_np(command.body_lin_vel_w[:, 0]).astype(
+            np.float32, copy=False
+        ),
+        "body_ang_vel_w": _cpu_np(command.body_ang_vel_w[:, 0]).astype(
+            np.float32, copy=False
+        ),
+        "motion_type": np.array("mujoco"),
     }
     np.savez_compressed(path, **arrays)
 
