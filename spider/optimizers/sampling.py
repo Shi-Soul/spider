@@ -265,7 +265,9 @@ def _compute_weights_impl(
     # Initialize weights as zeros and compute softmax only for top samples
     weights = torch.zeros_like(rews)
     top_rews = rews[top_indices]
-    top_rews_normalized = (top_rews - top_rews.mean()) / (top_rews.std() + 1e-2)
+    top_rews_normalized = (top_rews - top_rews.mean()) / (
+        top_rews.std(unbiased=False) + 1e-2
+    )
     top_weights = F.softmax(top_rews_normalized / temperature, dim=0)
     weights[top_indices] = top_weights
 
