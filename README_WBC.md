@@ -195,10 +195,10 @@ Runtime summary:
 
 Full tables:
 
-- `/home/bai/MPC-RL/spider_retarget_work_20260611/eval_reward_method_spider_native_current_knotfix_v14_20260617_local4090/spider_native_3method_vs_v14_score_summary.csv`
-- `/home/bai/MPC-RL/spider_retarget_work_20260611/eval_reward_method_spider_native_current_knotfix_v14_20260617_local4090/spider_native_3method_vs_v14_full_delta.csv`
-- `/home/bai/MPC-RL/spider_retarget_work_20260611/eval_reward_method_spider_native_current_knotfix_v14_20260617_local4090/spider_native_3method_vs_v14_speed.csv`
-- `/home/bai/MPC-RL/spider_retarget_work_20260611/eval_reward_method_spider_native_current_knotfix_v14_20260617_local4090/spider_native_3method_vs_v14_summary.md`
+- `/home/bai/MPC-RL/legacy_hoi_workflow/experiments/spider_retarget_work_20260611/eval_reward_method_spider_native_current_knotfix_v14_20260617_local4090/spider_native_3method_vs_v14_score_summary.csv`
+- `/home/bai/MPC-RL/legacy_hoi_workflow/experiments/spider_retarget_work_20260611/eval_reward_method_spider_native_current_knotfix_v14_20260617_local4090/spider_native_3method_vs_v14_full_delta.csv`
+- `/home/bai/MPC-RL/legacy_hoi_workflow/experiments/spider_retarget_work_20260611/eval_reward_method_spider_native_current_knotfix_v14_20260617_local4090/spider_native_3method_vs_v14_speed.csv`
+- `/home/bai/MPC-RL/legacy_hoi_workflow/experiments/spider_retarget_work_20260611/eval_reward_method_spider_native_current_knotfix_v14_20260617_local4090/spider_native_3method_vs_v14_summary.md`
 
 ## Videos
 
@@ -207,7 +207,7 @@ Old-vs-Spider videos were rendered from saved rollouts, without rerunning MPC. T
 Output directory in the local workspace:
 
 ```text
-/home/bai/MPC-RL/spider_retarget_work_20260611/eval_reward_method_spider_native_current_knotfix_v14_20260617_local4090/videos_old_vs_spider_same_setting
+/home/bai/MPC-RL/legacy_hoi_workflow/experiments/spider_retarget_work_20260611/eval_reward_method_spider_native_current_knotfix_v14_20260617_local4090/videos_old_vs_spider_same_setting
 ```
 
 Each rendered video has:
